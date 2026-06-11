@@ -1,0 +1,21 @@
+{
+  "name": "session-indexer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "bin": {
+    "session-indexer": "bin/session-indexer.js",
+    "session-indexer-mcp": "bin/session-indexer-mcp.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check bin/*.js && node --check src/*.js src/adapters/*.js src/index/*.js src/providers/*.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/aws-sdk": "^0.3.1",
+    "@aws-sdk/client-bedrock-runtime": "^3.1062.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "chokidar": "^4.0.3",
+    "rxjs": "^7.8.2"
+  }
+}

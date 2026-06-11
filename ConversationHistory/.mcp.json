@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "conversation_history": {
+      "command": "node",
+      "args": [
+        "bin/session-indexer-mcp.js"
+      ],
+      "cwd": ".",
+      "env": {
+        "SESSION_INDEXER_DEPLOY_TARGET": "codex-plugin"
+      }
+    }
+  }
+}

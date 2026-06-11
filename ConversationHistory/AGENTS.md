@@ -1,0 +1,67 @@
+# conversation_history Development Notes
+
+conversation_history is the portable coding-session indexing skill repo. It must stay agent-independent at the IR layer while preserving model-family-specific transcript details for OpenAI, Anthropic, Google, and other providers.
+
+## Transcript And Compaction Model
+
+- The immutable raw transcript is the source of truth. Do not rewrite or discard raw events unless the user explicitly edits or deletes a session source.
+- Search summaries are navigation records, not evidence. Facts, tool arguments, tool results, signatures, identifiers, quoted phrases, and raw JSON must be retrieved through `openLink`; treat the render as exact only when `isVerbatim` is true and `omittedTokenCount` is zero.
+- If a session has no compaction record, there is no dropped context to recover yet. The current model already has the transcript in context, so search should not pretend that a compacted-span index is needed.
+- When a compaction record appears, the searchable hierarchy is for the turns before that compaction boundary. The compaction record itself is a boundary marker, not part of the span being summarized. Residual turns after the boundary remain in the live transcript context and should not be mixed into the compacted-prefix search hierarchy.
+- For multiple compactions, build each compacted-away span from the raw transcript around its boundary. Do not summarize provider compaction records as substitutes for the raw span unless explicitly comparing provider compaction behavior.
+
+## MIP Summary Planning
+
+- Build MIP data eagerly in the background when possible so enabling the skill after compaction does not force the user/model to wait on fresh summarizer inference.
+- The summarization planner consumes ordered transcript events until the configured input-token budget is reached, then creates one summary request for that contiguous span. It repeats until the compaction boundary.
+- After the first summary level completes, feed those summary nodes into the same process to build the next level, and continue recursively until the top level is small enough to navigate directly.
+- Inner nodes hold a generated `summary`, a one- or two-word `breadcrumb`, and `topics`, where each topic has `{ one_word, one_line }`. Topics describe what is beneath the node.
+- Indexing is makefile-like. Each summary target is content-addressed from the compacted source span plus summary options. Store completed targets in the per-session summary-target store and reuse them on later passes.
+- Storage must be safe across separate Codex windows/processes. JSON writes are atomic, manifest/job/summary-target read-modify-write sections use lock directories, and model calls only run after a target has been claimed in the shared target store. Another process's active claim must report as in progress rather than triggering duplicate inference.
+- `indexStatus` is the read-only dependency/status surface: it reports compact operational state, target counts, claims, stale claims, tokens summarized, and reuse/skipped counts. It must not start indexing or summarization.
+- `indexStatus` must also report active or failed rebuild jobs for a session before that session has a published manifest record. If a reset/rebuild has imported IR or claimed/completed summary targets but publishing has not happened yet, status should still return a row with the job, source path, target counts, and current phase/error.
+- Background workers should emit JSONL progress to stdout and update job-state `progress` during import, summary target planning/claiming, individual model calls, summary commit, document collection, and errors. Silent long-running model calls are a bug because agents should not need to inspect processes or files to know whether indexing is moving.
+- Codex session files are JSONL and can be hundreds of MB. Import/fingerprint code must stream lines; do not read an entire live session into one string, split it into all lines, or retain parsed row arrays before building IR events. Watcher-triggered indexing must be single-flight/coalesced so a file change queues the next pass instead of overlapping another full import while summary calls from the active pass are still live.
+- Current-session discovery uses literal markers like `conversation_history-session-{guid}`. `start_indexing_session` first scans recent Codex JSONL files for an existing marker. If none exists, it generates a marker, returns it in the MCP result, starts a pending worker, and the worker polls the transcript until Codex writes that marker into the JSONL. The marker must appear in the Codex JSONL session file before import begins. Do not use natural-language user-message matching to infer "this chat".
+- Model summarization has a hard budget guard. `--summary-max-budget-usd` defaults to `5`; if pricing cannot be resolved or the estimate exceeds the cap, fail before calling a model.
+- Non-batch model summarization defaults to `--summary-concurrency 16`. This only parallelizes independent summary calls within a pass; it must not change the recursive summary hierarchy.
+- Do not put child handles into generated text when they can be computed from the tree. Handles and resource links belong in structured fields.
+- Keep generated summaries compact. Search nodes should route the model to useful children; they should not become giant surrogate transcripts.
+
+## Search And OpenLink
+
+- The agent-facing interface is MCP tools, not manual shell commands. The CLI is runtime plumbing and test harness.
+- Typesense is the search index. Do not persist flattened `*.docs.json` sidecars and do not implement hidden "restore from docs" repair paths. The raw transcript is the source of truth; if the Typesense index is missing or stale, reindexing must be an explicit/user-directed indexing operation, not a search-time side effect.
+- Keep the Typesense schema lean. Only fields used for exact filters, ordering, or `query_by` should be indexed. Store exact leaf source in a stored-only `content` field; do not store duplicate whole-document `payload` blobs or persist `.tree.json` as a normal read path. JSON metadata blobs, links, timestamps, navigation metadata, usage, metrics, and raw content must be `index: false`.
+- Persist transcript-derived record collections as JSONL, not JSON arrays or giant JSON objects. Current durable examples are `sessions/*.ir.jsonl`, `sessions/*.summary-targets.jsonl`, and Typesense newline-JSON imports. Do not reintroduce `sessions/*.ir.json`, `sessions/*.summary-targets.json`, or manifest `summaryJobs`/`compactions`/`summaryIndex.compactionLog` arrays. Small control files like `manifest.json`, job state, plugin manifests, and provider/API payloads may remain normal single-record JSON.
+- Store and return compact `summaryMeta` only. Do not repeat heavyweight compaction logs on every Typesense document or child/search result; manifest/index status is the place for compaction accounting.
+- Typesense import responses are not always JSONL strings; a one-document import can return a single JSON object. Import parsing must handle object, array, and JSONL response shapes.
+- Typesense document imports use newline-JSON `/documents/import?action=upsert` in batches. The CLI/debug knob is `--typesense-import-chunk-size`, default `500`. Full publishes must report per-chunk progress such as `index:documents:import:chunk` so long imports are visible through job status/logs.
+- While model summaries are incomplete and the same source has already been published, indexing passes must defer the document import and keep the previous Typesense docs live/searchable. Repeated partial passes should emit `index:documents:deferred`, not delete/re-upsert the full document set. This includes failed summary targets; a model-call failure is not a reason to churn the published Typesense docs. Publish again when the source is not previously published or when the summary tree is ready.
+- `conversation_index_status` returns only indexed session statuses and requires `start_at` and `limit`.
+- `search` and `browse` must not index on demand. They read the existing Typesense index for retrieval and should fail clearly if requested indexed content is missing.
+- `search` and `browse` must not embed `indexStatus`, backend config, readiness envelopes, usage accounting, or summary-target bookkeeping. Use `conversation_index_status` for operational state; use `search` and `browse` only for retrieval/navigation.
+- Search and `openLink` responses must stay bounded. Do not return unbounded descendant `resourceLinks` arrays from search hits or large opened nodes; one direct `link`, capped resource links, and paged `browse` children are the navigation surface.
+- A normal retrieval question should search the existing index first, even if the index is slightly stale. Do not start or stop background indexing as cleanup for a one-off lookup.
+- `start_indexing_session` and `stop_indexing_session` are user-directed indexing controls. `start_indexing_session` starts a watcher running in the background indexing new turns as they occur, so that upon compaction the user and model do not experience reindexing latency. Use them only when the user explicitly asks to index, refresh, watch, or stop, or after permission when the needed index is missing.
+- `reset_session_index` is a user-directed test/rebuild control. It removes persisted index artifacts for the selected session(s); never call it for normal retrieval.
+- `redeploy_session_index_mcp` refreshes the plugin installation only. It cannot restart the already-running MCP process, so callers should expect a host reload before newly registered tools are visible. The plugin target is decided by the running install context, never by the caller: each plugin's MCP launch config injects `SESSION_INDEXER_DEPLOY_TARGET` (the Claude plugin sets `claude-plugin`), and the CLI reads that env. It is not a model-facing argument.
+- Search results should report where they landed in the hierarchy and provide links that can be opened with `openLink`.
+- `openLink` must resolve both generated summary handles and raw transcript handles from Typesense by exact handle lookup. Inner nodes render from stored summaries plus paged child lookups by `parentHandle`; raw leaves render from stored-only `content`.
+- `openLink` is a bounded renderer. For very large raw leaves it may return an excerpt with `isVerbatim: false` and a positive `omittedTokenCount`; callers that need exact text should reopen the same link with a larger budget.
+- Tool calls and tool results should cross-reference each other in search metadata so either side can lead to the other, while `openLink` returns a bounded render of the linked source record.
+
+## Source Adapters And Plugin Deployment
+
+- Source adapters live in `src/adapters/` and register through `src/adapters/index.js` against one contract: `files`, `latestFile`, `resolveCurrentSessionFile`, `importFile`. Keep adapters provider-specific only at parse time; everything downstream consumes the shared IR.
+- The `claude` adapter reads `~/.claude/projects/<slug>/<uuid>.jsonl`. It maps user/assistant/tool_use/tool_result/thinking/usage records to the IR, preserves thinking signatures, annotates Task sidechains, drops noisy diagnostic `system` rows, and skips the `<synthetic>` placeholder model. Claude sessions default to summarizing through `claude -p` unless `--summary-provider` is set.
+- `deploy --target claude-plugin` installs the repo as a Claude Code plugin under `~/.claude/plugins` and writes a Claude marketplace entry; `codex` and `codex-plugin` targets are unchanged.
+- Development must not require host restarts for normal fixes. The MCP server is a thin wrapper that spawns the CLI fresh per tool call, so symlink-deployed code changes to adapters/indexing/store/summarizer/CLI take effect on the next call. Only changes to the MCP tool surface in `src/mcpServer.js` (tool names, input schemas, argument mapping) require reloading the plugin host.
+
+## Provider And Cost Constraints
+
+- Prefer cheap adequate summarizer models through low-latency providers. Use Codex Responses for OpenAI summaries and `claude -p` for Anthropic summaries when local auth is available. Batch APIs are only for background jobs where latency is acceptable.
+- OpenAI/Codex summarization defaults to low reasoning effort. Keep that setting visible in CLI options, worker state, summary metadata, and tests.
+- Cache shared summarizer system prompts when the provider supports it.
+- Do not embed personal credential-helper paths in repo code. Tests may set normal environment variables from local helper scripts, but shipped code reads environment variables or explicit options only.
+- Preserve encrypted reasoning/thought/signature blocks in IR and transcript storage. Do not parse, mutate, summarize as evidence, or drop them.

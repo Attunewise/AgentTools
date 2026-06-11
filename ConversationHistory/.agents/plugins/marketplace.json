@@ -1,0 +1,21 @@
+{
+  "name": "conversation_history",
+  "interface": {
+    "displayName": "conversation_history"
+  },
+  "plugins": [
+    {
+      "name": "conversation-history",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/unktomi/ConversationHistory.git",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

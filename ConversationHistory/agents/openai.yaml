@@ -1,0 +1,4 @@
+interface:
+  display_name: "Conversation History"
+  short_description: "Hierarchical, paged, lossless transcript recovery."
+  default_prompt: "Recover relevant prior conversation context incrementally, opening exact source only when needed."

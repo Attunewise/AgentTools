@@ -1,0 +1,35 @@
+{
+  "name": "conversation-history",
+  "version": "0.1.0+codex.20260611071503",
+  "description": "Conversation History recovers prior conversation context from a hierarchical, paged, lossless transcript index.",
+  "author": {
+    "name": "Conversation History"
+  },
+  "license": "UNLICENSED",
+  "keywords": [
+    "conversation-history",
+    "transcripts",
+    "compaction",
+    "paging",
+    "coding-agents"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Conversation History",
+    "shortDescription": "Hierarchical, paged, lossless transcript recovery.",
+    "longDescription": "Recover prior conversation context incrementally through search, hierarchy browsing, and token-budgeted source opening.",
+    "developerName": "Conversation History",
+    "category": "Productivity",
+    "capabilities": [
+      "Search",
+      "Browse",
+      "Transcript Recovery"
+    ],
+    "defaultPrompt": [
+      "Recover the prior context for this thread.",
+      "Find the exact earlier tool result.",
+      "Browse the conversation history around this topic."
+    ]
+  }
+}
