@@ -1,6 +1,6 @@
 # Agent Tools Expect
 
-Standalone Expect-style PTY runner for agent skills.
+Standalone Expect-style PTY runner for agent skills, to automate TUI's and other terminal interactions with minimal token use.
 
 ```bash
 npm install
