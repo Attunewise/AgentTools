@@ -1,3 +1,3 @@
 # AgentTools
 
-Agent coding tools designed around minimizing context to prevent confabulation and minimize token costs.
+Agent coding tools designed around minimizing context to economize token use, while simultaneously inhibiting confabulation. 
