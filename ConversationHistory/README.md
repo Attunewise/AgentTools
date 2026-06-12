@@ -34,9 +34,9 @@ node bin/session-indexer.js inspect --source codex --latest
 node bin/session-indexer.js search_server_status
 node bin/session-indexer.js start_indexing_session --scope this_session_only --this-chat --session-marker conversation_history-session-... --timeout-ms 30000
 node bin/session-indexer.js search --query "emergency handoff"
-node bin/session-indexer.js browse --session-id ...
-node bin/session-indexer.js browse --session-id ... --topic-id topic:v1:... --zoom in
-node bin/session-indexer.js openLink --link 'tool:conversation_history://open?sessionId=...&handle=...'
+node bin/session-indexer.js browse --index-id ...
+node bin/session-indexer.js browse --index-id ... --topic-id topic:v1:... --zoom in
+node bin/session-indexer.js openLink --link 'tool:conversation_history://open?indexId=...&handle=...'
 node bin/session-indexer.js stop_indexing_session --scope this_session_only --this-chat --session-marker conversation_history-session-... --timeout-ms 30000
 node bin/session-indexer.js list_models --filter gpt --limit 10
 node bin/session-indexer.js get_pricing --model-id openai/gpt-4o-2024-08-06
@@ -63,7 +63,7 @@ MCP tools:
 
 Token usage is normalized to the models.dev pricing fields: `input`, `output`, `cache_read`, `cache_write`, `reasoning`, and `total`.
 
-Local runtime state defaults to a shared user-level directory: `$SESSION_INDEXER_STATE_DIR`, or otherwise `$XDG_DATA_HOME/session-indexer/.session-indexer` / `~/.local/share/session-indexer/.session-indexer`. That keeps one managed conversation_history Typesense server and collection for all plugin copies and all supported agents on the host. Every indexed record carries facetable `sessionId` and `agent` fields, and publish/delete paths use them to avoid cross-agent churn; `--index-dir` is a development/test override. `deploy --target codex` installs the repo as a direct Codex skill. `deploy --target codex-plugin` installs the repo as a local Codex plugin and updates the personal plugin marketplace unless `--no-marketplace` is passed. `deploy --target claude-plugin` installs the repo as a Claude Code plugin under `~/.claude/plugins` and writes a Claude marketplace entry; the deploy output prints the `claude plugin marketplace add` / `claude plugin install` commands to finish installation.
+Local runtime state defaults to a shared user-level directory: `$SESSION_INDEXER_STATE_DIR`, or otherwise `$XDG_DATA_HOME/session-indexer/.session-indexer` / `~/.local/share/session-indexer/.session-indexer`. That keeps one managed conversation_history Typesense server and collection for all plugin copies and all supported agents on the host. Every indexed record carries a definitive facetable `indexId`, plus facetable `sessionId` and `agent` visibility/filter fields; `--index-dir` is a development/test override. `deploy --target codex` installs the repo as a direct Codex skill. `deploy --target codex-plugin` installs the repo as a local Codex plugin and updates the personal plugin marketplace unless `--no-marketplace` is passed. `deploy --target claude-plugin` installs the repo as a Claude Code plugin under `~/.claude/plugins` and writes a Claude marketplace entry; the deploy output prints the `claude plugin marketplace add` / `claude plugin install` commands to finish installation.
 
 For team distribution through Codex, the public repo at `https://github.com/unktomi/ConversationHistory` includes a Git-backed marketplace at `.agents/plugins/marketplace.json`. Teammates can install from the repo rather than from a local path:
 

@@ -17,7 +17,9 @@ const {
 const {
   applyCompactionSearchScope,
   buildMipTree,
-  collectIndexDocuments
+  compactedRetrievalHandles,
+  collectIndexDocuments,
+  indexIdForIR
 } = require('./mip.js')
 const {
   DEFAULT_SUMMARY_MODE,
@@ -656,6 +658,7 @@ const sessionIndexStatus = ({
     })
     return {
       sessionId,
+      indexId: sessionId,
       indexed: false,
       state: op.state,
       ...(op.errorMessage ? { errorMessage: op.errorMessage } : {}),
@@ -688,6 +691,7 @@ const sessionIndexStatus = ({
   })
   return {
     sessionId,
+    indexId: session.indexId || session.sessionId,
     title: session.title,
     indexed: true,
     state: op.state,
@@ -919,12 +923,14 @@ const resetSessionIndexWithBackend = async ({
 }
 
 const writeSessionIndex = ({ root = DEFAULT_INDEX_DIR, ir }) => {
+  ir.indexId = indexIdForIR(ir)
   const tree = buildMipTree(ir)
   applyCompactionSearchScope(tree)
   const docs = collectIndexDocuments(tree)
   const now = new Date().toISOString()
   const sessionRecord = {
     sessionId: ir.session.id,
+    indexId: ir.indexId,
     title: ir.session.title,
     agent: ir.session.agent,
     sourceKind: ir.source.kind,
@@ -949,6 +955,7 @@ const writeSessionIndex = ({ root = DEFAULT_INDEX_DIR, ir }) => {
   })
   return {
     sessionId: ir.session.id,
+    indexId: ir.indexId,
     title: ir.session.title,
     sourcePath: ir.source.path,
     sourceFingerprint: ir.source.fingerprint,
@@ -959,6 +966,18 @@ const writeSessionIndex = ({ root = DEFAULT_INDEX_DIR, ir }) => {
     usage: tree.root.usage,
     readiness: sessionIndexReadiness({ root, sessionRecord })
   }
+}
+
+const collectPublishedDocuments = ({ tree, sourceTree }) => {
+  const docsById = new Map()
+  for (const doc of collectIndexDocuments(tree)) docsById.set(doc.id, doc)
+  const visibleHandles = compactedRetrievalHandles(sourceTree)
+  for (const doc of collectIndexDocuments(sourceTree, {
+    retrievalVisible: node => visibleHandles.has(node.handle)
+  })) {
+    if (!docsById.has(doc.id)) docsById.set(doc.id, doc)
+  }
+  return [...docsById.values()]
 }
 
 const writeSessionIndexWithBackend = async ({
@@ -991,8 +1010,10 @@ const writeSessionIndexWithBackend = async ({
   ...backendOpts
 }) => {
   if (searchBackend !== 'typesense') throw new Error('--search-backend must be typesense')
+  ir.indexId = indexIdForIR(ir)
   const ownerId = summaryOwnerId()
   const previousSummaryJobs = completedSummaryJobs({ root, sessionId: ir.session.id })
+  const sourceTree = buildMipTree(ir)
   const tree = summaryBatchId
     ? readSessionTree({ root, sessionId: ir.session.id, fallbackIR: ir })
     : buildMipTree(ir)
@@ -1065,6 +1086,7 @@ const writeSessionIndexWithBackend = async ({
   const typeOpts = { root, indexDir: root, ...backendOpts }
   const sessionRecord = {
     sessionId: ir.session.id,
+    indexId: ir.indexId,
     title: ir.session.title,
     agent: ir.session.agent,
     sourceKind: ir.source.kind,
@@ -1103,7 +1125,7 @@ const writeSessionIndexWithBackend = async ({
       })
     }
   } else {
-    const docs = collectIndexDocuments(tree)
+    const docs = collectPublishedDocuments({ tree, sourceTree })
     sessionRecord.docCount = docs.length
     if (typeof onProgress === 'function') {
       onProgress({
@@ -1145,6 +1167,7 @@ const writeSessionIndexWithBackend = async ({
   })
   return {
     sessionId: ir.session.id,
+    indexId: ir.indexId,
     title: ir.session.title,
     sourcePath: ir.source.path,
     sourceFingerprint: ir.source.fingerprint,
@@ -1177,6 +1200,7 @@ const readSessionTree = ({ root = DEFAULT_INDEX_DIR, sessionId, fallbackIR }) =>
 }
 
 const browseIndexWithBackend = async ({
+  indexId,
   sessionId,
   agent,
   handle,
@@ -1191,6 +1215,7 @@ const browseIndexWithBackend = async ({
 }) => {
   if (searchBackend !== 'typesense') throw new Error('--search-backend must be typesense')
   const result = await browseTypesense({
+    indexId,
     sessionId,
     agent,
     handle,
@@ -1221,6 +1246,7 @@ const browseIndexWithBackend = async ({
 
 const openLinkWithBackend = async ({
   link,
+  indexId,
   sessionId,
   agent,
   budgetTokens,
@@ -1230,6 +1256,7 @@ const openLinkWithBackend = async ({
   if (searchBackend !== 'typesense') throw new Error('--search-backend must be typesense')
   const result = await openLinkTypesense({
     link,
+    indexId,
     sessionId,
     agent,
     budgetTokens,
@@ -1254,6 +1281,7 @@ const openLinkWithBackend = async ({
 
 const searchIndexWithBackend = async ({
   query,
+  indexId,
   sessionId,
   agent,
   within,
@@ -1267,6 +1295,7 @@ const searchIndexWithBackend = async ({
   if (searchBackend !== 'typesense') throw new Error('--search-backend must be typesense')
   const search = () => searchTypesense({
     query,
+    indexId,
     sessionId,
     agent,
     within,

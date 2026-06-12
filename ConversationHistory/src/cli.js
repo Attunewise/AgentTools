@@ -62,9 +62,9 @@ const usage = () => `
 Usage:
   session-indexer inspect --source codex|claude [--this-chat --session-marker id|--latest|--session path]
   session-indexer index --source codex|claude [--this-chat --session-marker id|--latest|--all|--session path]
-  session-indexer search [--query text] [--topic text] [--filter json] [--session-id id] [--within handle] [--start-at 0] [--limit 10]
-  session-indexer browse --session-id id [--topic-id id] [--zoom children|in|out|siblings] [--start 0] [--limit 20]
-  session-indexer openLink --link tool:conversation_history://open?sessionId=...&handle=...
+  session-indexer search [--query text] [--topic text] [--filter json] [--session-id id] [--index-id id] [--within handle] [--start-at 0] [--limit 10]
+  session-indexer browse --index-id id [--session-id filter] [--topic-id id] [--zoom children|in|out|siblings] [--start 0] [--limit 20]
+  session-indexer openLink --link tool:conversation_history://open?indexId=...&handle=...
   session-indexer index_status --start-at n --limit n [--session-id id]
   session-indexer start_indexing_session [--scope this_session_only|all] [--this-chat --session-marker id|--latest|--session path] [--timeout-ms 30000]
   session-indexer stop_indexing_session [--scope this_session_only|all] [--this-chat --session-marker id|--latest|--session path] [--timeout-ms 30000]
@@ -129,7 +129,8 @@ Options:
   --topic-id id          Browse topic id returned by a previous browse response.
   --zoom mode            Browse mode: children, in, out, or siblings. Defaults to children, or in when --topic-id is set.
   --agent name           Optional indexed agent filter, e.g. codex or claude.
-  --filter json          Exact search filters: agent, messageId, inReplyToMessageId, toolCallId, role, mip, mipLevel.
+  --filter json          Exact search filters: agent, sessionId/session_id, indexId/index_id, messageId, inReplyToMessageId, toolCallId, role, mip, mipLevel.
+  --index-id id          Definitive indexed content id for browse/open/search narrowing.
   --message-id id        Exact messageId filter.
   --in-reply-to-message-id id Exact inReplyToMessageId filter.
   --tool-call-id id      Exact toolCallId filter.
@@ -239,6 +240,7 @@ const parseArgs = argv => {
     marketplace: true,
     installDependencies: process.env.SESSION_INDEXER_DEPLOY_INSTALL_DEPS !== '0',
     force: false,
+    indexId: '',
     sessionId: '',
     handle: '',
     within: '',
@@ -340,6 +342,7 @@ const parseArgs = argv => {
     else if (arg === '--topic') opts.topic = next()
     else if (arg === '--topic-id' || arg === '--topic_id' || arg === '--topicId') opts.topicId = next()
     else if (arg === '--zoom') opts.zoom = next()
+    else if (arg === '--index-id' || arg === '--index_id') opts.indexId = next()
     else if (arg === '--session-id') opts.sessionId = next()
     else if (arg === '--handle') opts.handle = next()
     else if (arg === '--within') opts.within = next()
@@ -396,10 +399,10 @@ const parseArgs = argv => {
   if (!opts.summaryProviderSet && opts.source === 'claude') opts.summaryProvider = 'claude'
   if (!['this_session_only', 'all'].includes(opts.scope)) throw new Error('--scope must be this_session_only or all')
   if (opts.mip !== undefined && (!Number.isInteger(opts.mip) || opts.mip < 0)) throw new Error('--mip must be zero or greater')
-  if (opts.command === 'search' && !opts.query && !opts.topic && !opts.agent && !opts.filter && !opts.messageId && !opts.inReplyToMessageId && !opts.toolCallId && !opts.role && opts.mip === undefined && !opts.mipLevel) {
+  if (opts.command === 'search' && !opts.query && !opts.topic && !opts.agent && !opts.indexId && !opts.sessionId && !opts.filter && !opts.messageId && !opts.inReplyToMessageId && !opts.toolCallId && !opts.role && opts.mip === undefined && !opts.mipLevel) {
     throw new Error('search requires --query, --topic, or a filter')
   }
-  if (opts.command === 'browse' && !opts.sessionId) throw new Error('browse requires --session-id')
+  if (opts.command === 'browse' && !opts.indexId && !opts.sessionId) throw new Error('browse requires --index-id')
   if (opts.command === 'openLink' && !opts.link) throw new Error('openLink requires --link')
   if (['get_pricing', 'getPricing', 'get_cost', 'getCost'].includes(opts.command) && !opts.modelId) throw new Error(`${opts.command} requires --model-id`)
   if (['get_cost', 'getCost'].includes(opts.command) && !opts.usage && !opts.usageFile && !opts.sessionId) {
@@ -468,6 +471,7 @@ const parseSearchFilter = opts => {
   }
   return {
     ...filter,
+    ...(opts.indexId ? { indexId: opts.indexId } : {}),
     ...(opts.messageId ? { messageId: opts.messageId } : {}),
     ...(opts.inReplyToMessageId ? { inReplyToMessageId: opts.inReplyToMessageId } : {}),
     ...(opts.toolCallId ? { toolCallId: opts.toolCallId } : {}),
@@ -561,6 +565,7 @@ const search = async opts => {
   const result = await searchIndexWithBackend({
     root: opts.indexDir,
     query: opts.query,
+    indexId: opts.indexId || undefined,
     sessionId: opts.sessionId || undefined,
     agent: opts.agent || undefined,
     within: opts.within || undefined,
@@ -575,6 +580,7 @@ const search = async opts => {
     schema: 'session-indexer.search.v1',
     ...(opts.query ? { query: opts.query } : {}),
     ...(opts.agent ? { agent: opts.agent } : {}),
+    ...(opts.indexId ? { index_id: opts.indexId } : {}),
     ...(opts.topic ? { topic: opts.topic } : {}),
     ...(hasFilter ? { filter } : {}),
     ...(opts.startAt ? { startAt: opts.startAt } : {}),
@@ -584,6 +590,7 @@ const search = async opts => {
 
 const browse = async opts => {
   const browsed = await browseIndexWithBackend({
+    indexId: opts.indexId || undefined,
     sessionId: opts.sessionId,
     agent: opts.agent || undefined,
     handle: opts.handle || undefined,
@@ -604,17 +611,24 @@ const browse = async opts => {
   }
 }
 
-const sessionIdFromLink = link => {
+const idsFromLink = link => {
   const match = String(link || '').match(/^tool:(?:conversation_history|ConversationHistory):\/\/open\?(.+)$/)
-  if (!match) return ''
-  return new URLSearchParams(match[1]).get('sessionId') || ''
+  if (!match) return {}
+  const params = new URLSearchParams(match[1])
+  return {
+    indexId: params.get('indexId') || params.get('index_id') || '',
+    sessionId: params.get('sessionId') || ''
+  }
 }
 
 const open = async opts => {
-  const sessionId = opts.sessionId || sessionIdFromLink(opts.link)
-  if (!sessionId) throw new Error('openLink needs a sessionId in the link or --session-id')
+  const linkIds = idsFromLink(opts.link)
+  const indexId = opts.indexId || linkIds.indexId
+  const sessionId = opts.sessionId || linkIds.sessionId
+  if (!indexId && !sessionId) throw new Error('openLink needs an indexId in the link or --index-id')
   const opened = await openLinkWithBackend({
     link: opts.link,
+    indexId,
     sessionId,
     agent: opts.agent || undefined,
     budgetTokens: opts.budgetTokens || 1200,
@@ -1016,14 +1030,31 @@ const summaryOptionsMatch = (session, opts) => {
   return true
 }
 
-const statusReadiness = status => ({
-  ready: status && status.state === 'ready',
-  pendingTargetCount: Number(status && status.indexingStats && status.indexingStats.pendingTargetCount || 0),
-  completedTargetCount: Number(status && status.indexingStats && status.indexingStats.completedTargetCount || 0),
-  claimedTargetCount: Number(status && status.summaryTargetStore && status.summaryTargetStore.currentStoredClaimedTargetCount || 0),
-  failedTargetCount: Number(status && status.indexingStats && status.indexingStats.failedTargetCount || 0) +
-    Number(status && status.summaryTargetStore && status.summaryTargetStore.currentStoredFailedTargetCount || 0)
-})
+const statusReadiness = status => {
+  const stats = status && status.indexingStats || {}
+  const store = status && status.summaryTargetStore || {}
+  const storePendingTargetCount = Math.max(0,
+    Number(store.currentTargetCount || 0) -
+    Number(store.currentStoredCompletedTargetCount || 0) -
+    Number(store.currentStoredFailedTargetCount || 0)
+  )
+  const pendingTargetCount = Math.max(
+    Number(stats.pendingTargetCount || 0),
+    storePendingTargetCount
+  )
+  const completedTargetCount = Number(stats.completedTargetCount || 0)
+  const claimedTargetCount = Number(store.currentStoredClaimedTargetCount || 0)
+  const failedTargetCount = Number(stats.failedTargetCount || 0) +
+    Number(store.currentStoredFailedTargetCount || 0) +
+    Number(store.currentStoredStaleClaimCount || 0)
+  return {
+    ready: Boolean(status && status.indexed !== false && pendingTargetCount === 0 && claimedTargetCount === 0 && failedTargetCount === 0),
+    pendingTargetCount,
+    completedTargetCount,
+    claimedTargetCount,
+    failedTargetCount
+  }
+}
 
 const reusableIndexedSession = ({ adapter, file, opts }) => {
   if (!adapter.sourceFingerprint) return null

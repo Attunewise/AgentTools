@@ -9,9 +9,10 @@ const {
 const DEFAULT_TYPESENSE_API_KEY = DEFAULT_MANAGED_TYPESENSE_API_KEY
 const DEFAULT_TYPESENSE_COLLECTION = process.env.TYPESENSE_COLLECTION || 'session_indexer_docs'
 
-const sessionLink = ({ sessionId, handle }) => {
+const sessionLink = ({ indexId, sessionId, handle }) => {
   const params = new URLSearchParams()
-  params.set('sessionId', sessionId)
+  if (indexId) params.set('indexId', indexId)
+  else if (sessionId) params.set('sessionId', sessionId)
   params.set('handle', handle)
   return `tool:conversation_history://open?${params.toString()}`
 }
@@ -23,6 +24,7 @@ const parseSessionLink = link => {
   if (!match) return null
   const params = new URLSearchParams(match[1])
   return {
+    indexId: params.get('indexId') || params.get('index_id') || undefined,
     sessionId: params.get('sessionId') || undefined,
     handle: params.get('handle') || undefined
   }
@@ -58,6 +60,7 @@ const requireStringField = (value, field, context) => {
   return text
 }
 
+const requireIndexId = (indexId, context) => requireStringField(indexId, 'indexId', context)
 const requireSessionId = (sessionId, context) => requireStringField(sessionId, 'sessionId', context)
 const requireAgent = (agent, context) => requireStringField(agent, 'agent', context)
 
@@ -134,6 +137,7 @@ const isCollectionNotFoundError = err => {
 const collectionSchema = collection => ({
   name: collection,
   fields: [
+    { name: 'indexId', type: 'string', facet: true, optional: true },
     { name: 'sessionId', type: 'string', facet: true },
     { name: 'agent', type: 'string', facet: true },
     { name: 'sourceKind', type: 'string', facet: true, optional: true },
@@ -147,6 +151,7 @@ const collectionSchema = collection => ({
     { name: 'depth', type: 'int32', facet: true },
     { name: 'kind', type: 'string', facet: true },
     { name: 'mipLevel', type: 'string', facet: true },
+    { name: 'retrievalVisible', type: 'bool', facet: true, optional: true },
     { name: 'isVerbatim', type: 'bool', facet: true },
     { name: 'at', type: 'string', optional: true, index: false },
     { name: 'timeRangeStart', type: 'string', optional: true, index: false },
@@ -194,6 +199,46 @@ const collectionNeedsRecreate = (existing, schema) => {
   return false
 }
 
+const parseJsonlText = text => String(text || '').split('\n')
+  .map(line => line.trim())
+  .filter(Boolean)
+  .map(line => {
+    try {
+      return JSON.parse(line)
+    } catch (_err) {
+      return null
+    }
+  })
+  .filter(Boolean)
+
+const patchExistingIndexIds = async config => {
+  const params = new URLSearchParams()
+  params.set('include_fields', 'id,indexId,sessionId')
+  const exported = await request(config, 'GET', `/collections/${encodeURIComponent(config.collection)}/documents/export?${params.toString()}`)
+  const docs = parseJsonlText(exported)
+  const patchDocs = docs
+    .filter(doc => doc && doc.id && !doc.indexId && doc.sessionId)
+    .map(doc => ({ id: doc.id, indexId: doc.sessionId }))
+  if (!patchDocs.length) {
+    return {
+      backend: 'typesense',
+      collection: config.collection,
+      patched: 0
+    }
+  }
+  const body = patchDocs.map(doc => JSON.stringify(doc)).join('\n')
+  const result = await request(config, 'POST', `/collections/${encodeURIComponent(config.collection)}/documents/import?action=update`, {
+    contentType: 'text/plain',
+    body
+  })
+  return {
+    backend: 'typesense',
+    collection: config.collection,
+    patched: patchDocs.length,
+    result: importRows(result)
+  }
+}
+
 const ensureCollection = async (config, opts = {}) => {
   await ensureManagedTypesense(config, opts)
   const schema = collectionSchema(config.collection)
@@ -208,9 +253,11 @@ const ensureCollection = async (config, opts = {}) => {
     const existingNames = new Set((existing.fields || []).map(field => field.name))
     const missingFields = schema.fields.filter(field => !existingNames.has(field.name))
     if (missingFields.length) {
-      return request(config, 'PATCH', `/collections/${encodeURIComponent(config.collection)}`, {
+      const patched = await request(config, 'PATCH', `/collections/${encodeURIComponent(config.collection)}`, {
         body: JSON.stringify({ fields: missingFields })
       })
+      if (missingFields.some(field => field.name === 'indexId')) await patchExistingIndexIds(config)
+      return patched
     }
     return existing
   } catch (err) {
@@ -222,6 +269,7 @@ const ensureCollection = async (config, opts = {}) => {
 }
 
 const docForTypesense = doc => {
+  const indexId = requireIndexId(doc.indexId || doc.index_id, 'Typesense document')
   const sessionId = requireSessionId(doc.sessionId, 'Typesense document')
   const agent = requireAgent(doc.agent, 'Typesense document')
   const navigation = doc.navigation || {}
@@ -230,12 +278,13 @@ const docForTypesense = doc => {
   const resourceLinks = doc.resourceLinks || []
   return {
     id: String(doc.id),
+    indexId,
     sessionId,
     agent,
     sourceKind: doc.sourceKind || '',
     handle: String(doc.handle || ''),
     parentHandle: doc.parentHandle || '',
-    link: doc.link || (doc.sessionId && doc.handle ? sessionLink({ sessionId: doc.sessionId, handle: doc.handle }) : ''),
+    link: doc.link || (indexId && doc.handle ? sessionLink({ indexId, handle: doc.handle }) : ''),
     messageId: doc.messageId || '',
     inReplyToMessageId: doc.inReplyToMessageId || '',
     toolCallId: doc.toolCallId || '',
@@ -243,6 +292,7 @@ const docForTypesense = doc => {
     depth: Number(doc.depth || 0),
     kind: String(doc.kind || ''),
     mipLevel: String(doc.mipLevel || ''),
+    retrievalVisible: doc.retrievalVisible !== false,
     isVerbatim: Boolean(doc.isVerbatim),
     at: doc.at || '',
     timeRangeStart: timeRange.start || '',
@@ -280,6 +330,25 @@ const docForTypesense = doc => {
 }
 
 const filterValue = value => `\`${String(value).replace(/\\/g, '\\\\').replace(/`/g, '\\`')}\``
+
+const exactFilterValues = value => {
+  if (value === undefined || value === null || value === '') return []
+  if (Array.isArray(value)) return value.flatMap(exactFilterValues)
+  if (typeof value === 'object') {
+    if (Array.isArray(value.filter)) return value.filter.flatMap(exactFilterValues)
+    if (value.eq !== undefined) return exactFilterValues(value.eq)
+    if (value.equals !== undefined) return exactFilterValues(value.equals)
+    if (value.value !== undefined) return exactFilterValues(value.value)
+  }
+  return [String(value)]
+}
+
+const exactFilter = (field, value) => {
+  const values = exactFilterValues(value)
+  if (!values.length) return ''
+  if (values.length === 1) return `${field}:=${filterValue(values[0])}`
+  return `(${values.map(item => `${field}:=${filterValue(item)}`).join(' || ')})`
+}
 
 const importChunkSize = opts => Math.max(1, Number(opts.typesenseImportChunkSize || opts.importChunkSize || 500))
 
@@ -325,13 +394,18 @@ const deleteSessionDocuments = async ({ sessionId, agent, ...opts }) => {
 
 const importDocuments = async ({ docs, sessionId, agent, onProgress, ...opts }) => {
   const config = typesenseConfig(opts)
+  const expectedIndexId = opts.indexId || opts.index_id || null
   const expectedSessionId = sessionId ? requireSessionId(sessionId, 'Typesense import session') : null
   const expectedAgent = expectedSessionId
     ? requireAgent(agent, 'Typesense import session')
     : agent ? requireAgent(agent, 'Typesense import agent') : null
   for (let index = 0; index < docs.length; index++) {
+    const docIndexId = requireIndexId(docs[index] && (docs[index].indexId || docs[index].index_id), `Typesense import doc ${index}`)
     const docSessionId = requireSessionId(docs[index] && docs[index].sessionId, `Typesense import doc ${index}`)
     const docAgent = requireAgent(docs[index] && docs[index].agent, `Typesense import doc ${index}`)
+    if (expectedIndexId && docIndexId !== expectedIndexId) {
+      throw new Error(`Typesense import doc ${index} indexId ${JSON.stringify(docIndexId)} does not match import indexId ${JSON.stringify(expectedIndexId)}`)
+    }
     if (expectedSessionId && docSessionId !== expectedSessionId) {
       throw new Error(`Typesense import doc ${index} sessionId ${JSON.stringify(docSessionId)} does not match import sessionId ${JSON.stringify(expectedSessionId)}`)
     }
@@ -431,22 +505,28 @@ const importDocuments = async ({ docs, sessionId, agent, onProgress, ...opts }) 
 const buildFilter = opts => {
   const filters = []
   const filter = opts.filter || {}
-  if (opts.sessionId) filters.push(`sessionId:=${filterValue(opts.sessionId)}`)
-  if (opts.agent || filter.agent) filters.push(`agent:=${filterValue(opts.agent || filter.agent)}`)
-  if (opts.within) filters.push(`parentHandle:=${filterValue(opts.within)}`)
+  const indexId = opts.indexId || opts.index_id || filter.indexId || filter.index_id
+  const sessionId = opts.sessionId || opts.session_id || filter.sessionId || filter.session_id
+  const indexFilter = exactFilter('indexId', indexId)
+  const sessionFilter = exactFilter('sessionId', sessionId)
+  if (indexFilter) filters.push(indexFilter)
+  if (sessionFilter) filters.push(sessionFilter)
+  if (opts.agent || filter.agent) filters.push(exactFilter('agent', opts.agent || filter.agent))
+  if (opts.within) filters.push(exactFilter('parentHandle', opts.within))
+  filters.push('retrievalVisible:=true')
   const messageId = opts.messageId || filter.messageId
   const inReplyToMessageId = opts.inReplyToMessageId || filter.inReplyToMessageId || filter.in_reply_to_message_id
   const toolCallId = opts.toolCallId || filter.toolCallId || filter.tool_call_id
   const role = opts.role || filter.role
   const mip = opts.mip !== undefined ? opts.mip : filter.mip
   const mipLevel = opts.mipLevel || filter.mipLevel || filter.mip_level
-  if (messageId) filters.push(`messageId:=${filterValue(messageId)}`)
-  if (inReplyToMessageId) filters.push(`inReplyToMessageId:=${filterValue(inReplyToMessageId)}`)
-  if (toolCallId) filters.push(`toolCallId:=${filterValue(toolCallId)}`)
-  if (role) filters.push(`role:=${filterValue(role)}`)
+  if (messageId) filters.push(exactFilter('messageId', messageId))
+  if (inReplyToMessageId) filters.push(exactFilter('inReplyToMessageId', inReplyToMessageId))
+  if (toolCallId) filters.push(exactFilter('toolCallId', toolCallId))
+  if (role) filters.push(exactFilter('role', role))
   if (mip !== undefined && Number(mip) === 0) filters.push('isVerbatim:=true')
   else if (mip !== undefined) filters.push(`depth:=${Number(mip)}`)
-  if (mipLevel) filters.push(`mipLevel:=${filterValue(mipLevel)}`)
+  if (mipLevel) filters.push(exactFilter('mipLevel', mipLevel))
   return filters.join(' && ')
 }
 
@@ -469,10 +549,11 @@ const docRef = ({ doc, score } = {}) => {
   const summaryMeta = compactSummaryMeta(parseJsonField(doc.summaryMetaJson, {}, 'summaryMetaJson', doc.id))
   return {
     ...(score === undefined ? {} : { score }),
+    index_id: doc.indexId,
     handle: doc.handle,
     agent: doc.agent,
     sourceKind: doc.sourceKind,
-    link: doc.link || (doc.sessionId && doc.handle ? sessionLink({ sessionId: doc.sessionId, handle: doc.handle }) : undefined),
+    link: doc.link || (doc.indexId && doc.handle ? sessionLink({ indexId: doc.indexId, handle: doc.handle }) : undefined),
     parentHandle: doc.parentHandle,
     at: doc.at,
     timeRange,
@@ -508,6 +589,7 @@ const includeFields = fields => fields.join(',')
 
 const commonFields = [
   'id',
+  'indexId',
   'sessionId',
   'agent',
   'sourceKind',
@@ -557,13 +639,15 @@ const pageWindow = ({ startAt = 0, limit = 20 }) => {
   return { start, requestedLimit, perPage, page, offset }
 }
 
-const exactDocument = async ({ sessionId, agent, handle, ...opts }) => {
+const exactDocument = async ({ indexId, sessionId, agent, handle, ...opts }) => {
   const config = typesenseConfig(opts)
   await ensureManagedTypesense(config, opts)
   const filters = [
-    sessionId ? `sessionId:=${filterValue(sessionId)}` : '',
-    agent ? `agent:=${filterValue(agent)}` : '',
-    `handle:=${filterValue(handle)}`
+    exactFilter('indexId', indexId || opts.index_id),
+    exactFilter('sessionId', sessionId),
+    exactFilter('agent', agent),
+    handle ? exactFilter('handle', handle) : '',
+    handle ? '' : 'depth:=0'
   ].filter(Boolean).join(' && ')
   const params = new URLSearchParams()
   params.set('q', '*')
@@ -575,13 +659,18 @@ const exactDocument = async ({ sessionId, agent, handle, ...opts }) => {
   return result.hits && result.hits[0] && result.hits[0].document || null
 }
 
-const childDocuments = async ({ sessionId, agent, parentHandle, startAt = 0, limit = 20, topic, ...opts }) => {
+const childDocuments = async ({ indexId, sessionId, agent, parentHandle, startAt = 0, limit = 20, topic, ...opts }) => {
   const config = typesenseConfig(opts)
   await ensureManagedTypesense(config, opts)
   const window = pageWindow({ startAt, limit })
-  const filters = [`parentHandle:=${filterValue(parentHandle)}`]
-  if (sessionId) filters.push(`sessionId:=${filterValue(sessionId)}`)
-  if (agent) filters.push(`agent:=${filterValue(agent)}`)
+  const filters = [exactFilter('parentHandle', parentHandle)]
+  filters.push('retrievalVisible:=true')
+  const indexFilter = exactFilter('indexId', indexId || opts.index_id)
+  if (indexFilter) filters.push(indexFilter)
+  const sessionFilter = exactFilter('sessionId', sessionId)
+  if (sessionFilter) filters.push(sessionFilter)
+  const agentFilter = exactFilter('agent', agent)
+  if (agentFilter) filters.push(agentFilter)
   const query = topic ? compactText(topic) : '*'
   const params = new URLSearchParams()
   params.set('q', query || '*')
@@ -642,7 +731,7 @@ const renderTypesenseNode = async ({ doc, sourceLink, budgetTokens = 1200, ...op
   let spent = estimateTokens(lines.join('\n'))
   const childLimit = Math.min(100, Math.max(20, Math.ceil(budget / 20)), Math.max(1, Number(metrics.childCount || 0)))
   const childResult = await childDocuments({
-    sessionId: doc.sessionId,
+    indexId: doc.indexId,
     agent: doc.agent,
     parentHandle: doc.handle,
     startAt: 0,
@@ -681,6 +770,7 @@ const openLinkTypesense = async ({ link, budgetTokens, sessionId, agent, ...opts
     throw new Error(`link targets session ${parsed.sessionId}, loaded session is ${sessionId}`)
   }
   const doc = await exactDocument({
+    indexId: opts.indexId || opts.index_id || parsed.indexId,
     sessionId: sessionId || parsed.sessionId,
     agent,
     handle: parsed.handle,
@@ -730,6 +820,7 @@ const browseRef = ref => {
   const topics = browseTopics([ref])
   return {
     topic_id: topicIdForHandle({ handle: ref.handle }),
+    index_id: ref.index_id,
     agent: ref.agent,
     sourceKind: ref.sourceKind,
     link: ref.link,
@@ -749,6 +840,7 @@ const searchRef = ref => {
   const topics = Array.isArray(ref.topics) && ref.topics.length ? ref.topics : undefined
   return {
     score: ref.score,
+    index_id: ref.index_id,
     handle: ref.handle,
     agent: ref.agent,
     sourceKind: ref.sourceKind,
@@ -780,6 +872,7 @@ const browseDocForTopicId = async ({ topicId, sessionId, agent, ...opts }) => {
   const parsed = parseTopicId(topicId)
   if (!parsed) throw new Error(`Invalid browse topic_id: ${topicId}`)
   const doc = await exactDocument({
+    indexId: opts.indexId || opts.index_id,
     sessionId,
     agent,
     handle: parsed.handle,
@@ -792,6 +885,7 @@ const browseDocForTopicId = async ({ topicId, sessionId, agent, ...opts }) => {
 const parentDocument = async ({ doc, sessionId, agent, ...opts }) => {
   if (!doc || !doc.parentHandle) return null
   return exactDocument({
+    indexId: opts.indexId || opts.index_id || doc.indexId,
     sessionId: sessionId || doc.sessionId,
     agent: agent || doc.agent,
     handle: doc.parentHandle,
@@ -799,11 +893,12 @@ const parentDocument = async ({ doc, sessionId, agent, ...opts }) => {
   })
 }
 
-const browseTypesense = async ({ sessionId, agent, handle, topicId, zoom, start, startAt = 0, limit = 20, topic, ...opts }) => {
+const browseTypesense = async ({ indexId, sessionId, agent, handle, topicId, zoom, start, startAt = 0, limit = 20, topic, ...opts }) => {
+  indexId = indexId || opts.index_id
   topicId = normalizeBrowseTopicId(topicId)
   const resolvedStart = start !== undefined ? start : startAt
   const resolvedZoom = normalizeBrowseZoom({ zoom, topicId })
-  let targetHandle = handle || `session/${sessionId}`
+  let targetHandle = handle || (sessionId ? `session/${sessionId}` : '')
   let selectedTopicId = topicId || undefined
   let doc
 
@@ -818,6 +913,7 @@ const browseTypesense = async ({ sessionId, agent, handle, topicId, zoom, start,
     targetHandle = doc.handle
   } else {
     doc = await exactDocument({
+      indexId,
       sessionId,
       agent,
       handle: targetHandle,
@@ -826,9 +922,11 @@ const browseTypesense = async ({ sessionId, agent, handle, topicId, zoom, start,
   }
 
   if (!doc) throw new Error(`Unknown session browse target`)
+  if (!targetHandle) targetHandle = doc.handle
   if (resolvedZoom === 'out' || resolvedZoom === 'siblings') {
     const parent = await parentDocument({
       doc,
+      indexId: indexId || doc.indexId,
       sessionId,
       agent,
       ...opts
@@ -845,6 +943,7 @@ const browseTypesense = async ({ sessionId, agent, handle, topicId, zoom, start,
 
   const ref = docRef({ doc })
   const childResult = await childDocuments({
+    indexId: doc.indexId,
     sessionId,
     agent: agent || doc.agent,
     parentHandle: targetHandle,
@@ -923,6 +1022,7 @@ module.exports = {
   importDocuments,
   isCollectionNotFoundError,
   openLinkTypesense,
+  patchExistingIndexIds,
   resolveTypesenseConfig,
   searchTypesense,
   typesenseConfig,

@@ -13,7 +13,9 @@ const { createSessionIR, textBlock } = require('../src/ir.js')
 const {
   buildMipTree,
   collectIndexDocuments,
+  compactedRetrievalHandles,
   hydrateMipTree,
+  indexIdForIR,
   openLink,
   sessionLink
 } = require('../src/mip.js')
@@ -635,6 +637,7 @@ test('encrypted reasoning is replay-only and never model-facing', () => {
 
 test('Typesense schema supports exact conversation filters', () => {
   const fields = new Map(collectionSchema('test_docs').fields.map(field => [field.name, field]))
+  assert.equal(fields.get('indexId').facet, true)
   assert.equal(fields.get('sessionId').facet, true)
   assert.equal(fields.get('agent').facet, true)
   assert.equal(fields.get('agent').optional, undefined)
@@ -656,10 +659,11 @@ test('Typesense schema supports exact conversation filters', () => {
 
   const stored = docForTypesense({
     id: 'doc-1',
+    indexId: 'idx-mini',
     sessionId: 'mini-session',
     agent: 'codex',
     handle: 'session/mini-session/event/1',
-    link: 'tool:conversation_history://open?sessionId=mini-session&handle=session%2Fmini-session%2Fevent%2F1',
+    link: 'tool:conversation_history://open?indexId=idx-mini&handle=session%2Fmini-session%2Fevent%2F1',
     parentHandle: 'session/mini-session',
     index: '1/2',
     zoom: '2/3',
@@ -690,6 +694,7 @@ test('Typesense schema supports exact conversation filters', () => {
     ts: 1
   })
   assert.equal(stored.payload, undefined)
+  assert.equal(stored.indexId, 'idx-mini')
   assert.equal(stored.agent, 'codex')
   assert.equal(stored.content, 'exact source text')
   assert.equal(stored.nodeIndex, '1/2')
@@ -703,7 +708,19 @@ test('Typesense schema supports exact conversation filters', () => {
 
 test('Typesense docs require a session id for shared-backend filtering', () => {
   assert.throws(() => docForTypesense({
+    id: 'missing-index',
+    sessionId: 'mini-session',
+    agent: 'codex',
+    handle: 'session/mini-session',
+    depth: 0,
+    kind: 'session',
+    mipLevel: 'root',
+    isVerbatim: false
+  }), /requires indexId/)
+
+  assert.throws(() => docForTypesense({
     id: 'missing-session',
+    indexId: 'idx-mini',
     handle: 'session/missing',
     depth: 0,
     kind: 'session',
@@ -713,6 +730,7 @@ test('Typesense docs require a session id for shared-backend filtering', () => {
 
   const stored = docForTypesense({
     id: 'with-session',
+    indexId: 'idx-mini',
     sessionId: 'mini-session',
     agent: 'codex',
     handle: 'session/mini-session',
@@ -722,10 +740,12 @@ test('Typesense docs require a session id for shared-backend filtering', () => {
     isVerbatim: false
   })
   assert.equal(stored.sessionId, 'mini-session')
+  assert.equal(stored.indexId, 'idx-mini')
   assert.equal(stored.agent, 'codex')
 
   assert.throws(() => docForTypesense({
     id: 'missing-agent',
+    indexId: 'idx-mini',
     sessionId: 'mini-session',
     handle: 'session/mini-session',
     depth: 0,
@@ -749,6 +769,7 @@ test('Typesense imports reject cross-session records before backend startup', as
     agent: 'codex',
     docs: [{
       id: 'wrong-session',
+      indexId: 'idx-other',
       sessionId: 'other-session',
       agent: 'codex',
       handle: 'session/other-session',
@@ -766,6 +787,7 @@ test('Typesense imports reject cross-session records before backend startup', as
     agent: 'codex',
     docs: [{
       id: 'wrong-agent',
+      indexId: 'idx-mini',
       sessionId: 'mini-session',
       agent: 'claude',
       handle: 'session/mini-session',
@@ -872,6 +894,15 @@ test('CLI accepts filter-only paged search requests', () => {
   assert.throws(() => parseArgs(['search', '--query', 'x', '--search-backend', 'json']), /search-backend must be typesense/)
 })
 
+test('CLI accepts index id as the definitive browse/search id', () => {
+  const search = parseArgs(['search', '--index-id', 'idx-abc'])
+  assert.equal(search.indexId, 'idx-abc')
+
+  const browse = parseArgs(['browse', '--index-id', 'idx-abc'])
+  assert.equal(browse.indexId, 'idx-abc')
+  assert.equal(browse.sessionId, '')
+})
+
 test('Typesense search failures reject instead of returning empty hits', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-typesense-error-'))
   await assert.rejects(() => searchIndexWithBackend({
@@ -882,7 +913,7 @@ test('Typesense search failures reject instead of returning empty hits', async (
   }), /managed Typesense is not installed/)
 })
 
-test('Typesense backend imports a single no-compaction root document', async () => {
+test('Typesense backend imports no-compaction docs but hides live context from retrieval', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-typesense-single-doc-'))
   const typesenseCollection = `session_indexer_single_${process.pid}_${Date.now()}`
   const sessionFile = path.join(root, 'single-session.jsonl')
@@ -892,7 +923,7 @@ test('Typesense backend imports a single no-compaction root document', async () 
     events: [{
       type: 'message',
       role: 'user',
-      content: [textBlock('single backend import probe')]
+      content: [textBlock('zzzz_live_probe_9482')]
     }]
   })
   const indexed = await writeSessionIndexWithBackend({
@@ -903,16 +934,15 @@ test('Typesense backend imports a single no-compaction root document', async () 
   })
   assert.equal(indexed.sessionId, 'single-session')
   assert.equal(indexed.serverIndex.status, 'ready')
-  assert.equal(indexed.serverIndex.result.imported, 1)
-  assert.equal(indexed.docCount, 1)
+  assert.equal(indexed.serverIndex.result.imported, 3)
+  assert.equal(indexed.docCount, 3)
   const codexSearch = await searchIndexWithBackend({
     root,
-    query: 'single backend import probe',
+    query: 'zzzz_live_probe_9482',
     agent: 'codex',
     typesenseCollection
   })
-  assert.equal(codexSearch.hits.length, 1)
-  assert.equal(codexSearch.hits[0].agent, 'codex')
+  assert.equal(codexSearch.hits.length, 0)
   const claudeSearch = await searchIndexWithBackend({
     root,
     query: 'single backend import probe',
@@ -1036,6 +1066,8 @@ test('search documents preserve searchable navigation metadata', () => {
   assert.equal(fs.existsSync(path.join(root, 'index', 'mini-session.docs.json')), false)
   const docs = collectIndexDocuments(readSessionTree({ root, sessionId: 'mini-session' }))
   const rootDoc = docs.find(doc => doc.handle === 'session/mini-session')
+  assert.equal(rootDoc.indexId, indexIdForIR(ir))
+  assert.match(rootDoc.link, /indexId=/)
   assert.equal(rootDoc.usage.cache_read, 70)
   assert.equal(rootDoc.index, '1/1')
   assert.match(rootDoc.zoom, /^1\/\d+$/)
@@ -1157,6 +1189,30 @@ test('summary planner batches only the compacted-away prefix before a compaction
   assert.match(prompt, /beta_before_compact/)
   assert.doesNotMatch(prompt, /provider compact marker/)
   assert.doesNotMatch(prompt, /gamma_after_compact_live_tail/)
+})
+
+test('retrieval visibility keeps live tail indexed but hidden from search and browse', () => {
+  const ir = createSessionIR({
+    source: { kind: 'test', path: 'visibility-compact.jsonl' },
+    session: { id: 'visibility-compact', agent: 'codex', title: 'Visibility compact' },
+    events: [
+      { type: 'message', role: 'user', content: [textBlock('alpha_before_compact_visible')] },
+      { type: 'compaction', title: 'compact boundary', content: [textBlock('provider compact marker')] },
+      { type: 'message', role: 'user', content: [textBlock('omega_after_compact_hidden')] }
+    ]
+  })
+  const tree = buildMipTree(ir)
+  const visibleHandles = compactedRetrievalHandles(tree)
+  const docs = collectIndexDocuments(tree, {
+    retrievalVisible: node => visibleHandles.has(node.handle)
+  })
+
+  const before = docs.find(doc => /alpha_before_compact_visible/.test(doc.searchText))
+  const after = docs.find(doc => /omega_after_compact_hidden/.test(doc.searchText))
+  assert.ok(before)
+  assert.ok(after)
+  assert.equal(before.retrievalVisible, true)
+  assert.equal(after.retrievalVisible, false)
 })
 
 test('pending summary nodes do not match descendant raw search terms', () => {
@@ -3325,6 +3381,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     ir,
     summaryMode: 'off'
   })
+  const indexId = indexIdForIR(ir)
 
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -3382,6 +3439,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.ok(searchTool.inputSchema.properties.filter.properties.agent)
     const browseTool = listed.tools.find(tool => tool.name === 'conversation_browse')
     assert.ok(browseTool.inputSchema.properties.agent)
+    assert.ok(browseTool.inputSchema.properties.index_id)
     assert.ok(browseTool.inputSchema.properties.topic_id)
     assert.ok(browseTool.inputSchema.properties.zoom)
     assert.ok(browseTool.inputSchema.properties.start)
@@ -3412,6 +3470,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     const browsed = await client.callTool({
       name: 'conversation_browse',
       arguments: {
+        index_id: indexId,
         session_id: 'mini-session',
         limit: 1
       }
@@ -3436,6 +3495,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     const rootTopicBrowse = (await client.callTool({
       name: 'conversation_browse',
       arguments: {
+        index_id: indexId,
         session_id: 'mini-session',
         topic_id: 'root',
         limit: 1
@@ -3447,6 +3507,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     const browseSecondPage = (await client.callTool({
       name: 'conversation_browse',
       arguments: {
+        index_id: indexId,
         session_id: 'mini-session',
         start: 1,
         limit: 1
@@ -3459,6 +3520,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     const zoomedBrowse = (await client.callTool({
       name: 'conversation_browse',
       arguments: {
+        index_id: indexId,
         session_id: 'mini-session',
         topic_id: browseResult.children[0].topic_id,
         zoom: 'in',
@@ -3486,6 +3548,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.equal(Object.hasOwn(statusResult.sessions[0], 'staleByMs'), false)
     assert.equal(Object.hasOwn(statusResult.sessions[0], 'sourceUpdatedAt'), false)
     assert.equal(Object.hasOwn(statusResult.sessions[0], 'sourceUpdatedAgo'), false)
+    assert.equal(statusResult.sessions[0].indexId, indexId)
     assert.equal(Object.hasOwn(statusResult.sessions[0].indexingStats, 'summaryUsageBasis'), false)
     assert.equal(Object.hasOwn(statusResult.sessions[0], 'compactions'), false)
     if (statusResult.sessions[0].indexingJob) {
@@ -3510,6 +3573,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.equal(Object.hasOwn(searchResult, 'indexDir'), false)
     assert.equal(Object.hasOwn(searchResult, 'filter'), false)
     assert.equal(searchResult.hits.length, 1)
+    assert.equal(searchResult.hits[0].index_id, indexId)
     assert.equal(Object.hasOwn(searchResult.hits[0], 'head'), false)
     assert.equal(Object.hasOwn(searchResult.hits[0], 'excerpt'), false)
     assert.equal(Object.hasOwn(searchResult.hits[0], 'navigation'), false)
@@ -3544,12 +3608,13 @@ test('MCP server exposes native conversation search and openLink tools', async (
     const missingBrowse = await client.callTool({
       name: 'conversation_browse',
       arguments: {
+        index_id: indexId,
         session_id: 'mini-session',
         limit: 1
       }
     })
     assert.equal(missingBrowse.isError, true)
-    assert.match(missingBrowse.content[0].text, /session is not indexed: mini-session|conversation_history CLI failed/)
+    assert.match(missingBrowse.content[0].text, /Unknown session browse target|conversation_history CLI failed/)
   } finally {
     await client.close()
   }

@@ -313,19 +313,21 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
       query: z.string().optional().describe('Search query. Use this for old transcript facts, tool calls, and tool results.'),
       topic: z.string().optional().describe('Optional natural-language generated topic filter. Do not use the session title as a topic.'),
       agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
-      session_id: z.string().optional().describe('Optional indexed session id. Omit to search all indexed sessions.'),
+      session_id: z.string().optional().describe('Optional visibility filter. Omit to search all indexed sessions.'),
+      index_id: z.string().optional().describe('Optional definitive indexed-content id. Use to narrow search to one index.'),
       within: z.string().optional().describe('Optional exact parent handle returned by search; search only one level within that node.'),
       filter: searchFilterShape.describe('Structured exact filters such as {agent:"codex"}, {messageId}, {inReplyToMessageId}, {toolCallId}, {role:"assistant"}, {mip:0}, or {mipLevel:"leaf"}. Avoid exact filters for broad semantic search.'),
       ...commonSearchShape
     }
   }, async args => {
     lifecycle.rememberIndexRoot()
-    if (!stringArg(args.query) && !stringArg(args.topic) && !stringArg(args.agent) && !args.filter) throw new Error('conversation_search requires query, topic, agent, or filter')
+    if (!stringArg(args.query) && !stringArg(args.topic) && !stringArg(args.agent) && !stringArg(args.session_id) && !stringArg(args.index_id) && !args.filter) throw new Error('conversation_search requires query, topic, agent, index_id, session_id, or filter')
     const argv = ['search']
     pushFlag(argv, '--query', args.query)
     pushFlag(argv, '--topic', args.topic)
     pushFlag(argv, '--agent', args.agent)
     pushFlag(argv, '--session-id', args.session_id)
+    pushFlag(argv, '--index-id', args.index_id)
     pushFlag(argv, '--within', args.within)
     if (args.filter) pushFlag(argv, '--filter', JSON.stringify(args.filter))
     addCommonSearchArgs(argv, args)
@@ -334,9 +336,10 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
 
   server.registerTool('conversation_browse', {
     title: 'Browse Indexed Conversation',
-    description: 'Browse an existing transcript summary hierarchy. Start with session_id, optionally topic_id:"root", then navigate with topic_id values returned by previous browse results. This never indexes on demand.',
+    description: 'Browse an existing transcript summary hierarchy. Start with index_id, optionally topic_id:"root", then navigate with topic_id values returned by previous browse results. session_id is only a visibility filter. This never indexes on demand.',
     inputSchema: {
-      session_id: z.string().describe('Indexed session id.'),
+      index_id: z.string().describe('Definitive indexed-content id returned by search or index status.'),
+      session_id: z.string().optional().describe('Optional visibility filter.'),
       agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
       topic_id: z.string().optional().describe('Opaque topic id returned by a previous conversation_browse response. Use "root" or omit for the root browse.'),
       zoom: z.enum(['children', 'in', 'out', 'siblings']).optional().describe('Navigation mode. Defaults to children, or in when topic_id is supplied.'),
@@ -346,6 +349,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
   }, async args => {
     lifecycle.rememberIndexRoot()
     const argv = ['browse']
+    pushFlag(argv, '--index-id', args.index_id)
     pushFlag(argv, '--session-id', args.session_id)
     pushFlag(argv, '--agent', args.agent)
     pushFlag(argv, '--topic-id', args.topic_id)

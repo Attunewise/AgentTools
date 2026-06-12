@@ -21,9 +21,27 @@ const hasUsage = usage => Object.values(normalizeUsage(usage)).some(Boolean)
 
 const makeHandle = parts => parts.map(part => encodeURIComponent(String(part))).join('/')
 
-const sessionLink = ({ sessionId, handle }) => {
+const indexEventMaterial = event => {
+  if (!event || typeof event !== 'object') return event
+  const { source: _source, ...rest } = event
+  return rest
+}
+
+const indexIdForIR = ir => {
+  const explicit = ir && (ir.indexId || ir.index_id || ir.session && (ir.session.indexId || ir.session.index_id))
+  if (explicit) return String(explicit)
+  return `idx-${hashString(stableStringify({
+    schema: 'conversation-history.index.v1',
+    sourceKind: ir && ir.source && ir.source.kind || '',
+    agent: ir && ir.session && ir.session.agent || '',
+    events: (ir && ir.events || []).map(indexEventMaterial)
+  })).slice(0, 32)}`
+}
+
+const sessionLink = ({ indexId, sessionId, handle }) => {
   const params = new URLSearchParams()
-  params.set('sessionId', sessionId)
+  if (indexId) params.set('indexId', indexId)
+  else if (sessionId) params.set('sessionId', sessionId)
   params.set('handle', handle)
   return `tool:conversation_history://open?${params.toString()}`
 }
@@ -35,6 +53,7 @@ const parseSessionLink = link => {
   if (!match) return null
   const params = new URLSearchParams(match[1])
   return {
+    indexId: params.get('indexId') || params.get('index_id') || undefined,
     sessionId: params.get('sessionId') || undefined,
     handle: params.get('handle') || undefined
   }
@@ -278,9 +297,9 @@ const collectLeaves = (node, out = []) => {
   return out
 }
 
-const eventResourceLinks = ({ sessionId, event, eventHandle, pairedHandle }) => unique([
-  sessionLink({ sessionId, handle: eventHandle }),
-  pairedHandle ? sessionLink({ sessionId, handle: pairedHandle }) : undefined
+const eventResourceLinks = ({ indexId, sessionId, event, eventHandle, pairedHandle }) => unique([
+  sessionLink({ indexId, sessionId, handle: eventHandle }),
+  pairedHandle ? sessionLink({ indexId, sessionId, handle: pairedHandle }) : undefined
 ])
 
 const eventNode = ({ ir, event, index, pairLookup }) => {
@@ -311,7 +330,7 @@ const eventNode = ({ ir, event, index, pairLookup }) => {
       head: eventHead(event),
       raw: event.content.map(blockText).join('\n'),
       meta,
-      resourceLinks: eventResourceLinks({ sessionId: ir.session.id, event, eventHandle: base, pairedHandle })
+      resourceLinks: eventResourceLinks({ indexId: ir.indexId, sessionId: ir.session.id, event, eventHandle: base, pairedHandle })
     }))
   }
   if (event.reasoning && event.reasoning.length) {
@@ -322,7 +341,7 @@ const eventNode = ({ ir, event, index, pairLookup }) => {
       head: eventHead(event),
       raw: event.reasoning,
       meta,
-      resourceLinks: eventResourceLinks({ sessionId: ir.session.id, event, eventHandle: base, pairedHandle })
+      resourceLinks: eventResourceLinks({ indexId: ir.indexId, sessionId: ir.session.id, event, eventHandle: base, pairedHandle })
     }))
   }
   if (event.call) {
@@ -333,7 +352,7 @@ const eventNode = ({ ir, event, index, pairLookup }) => {
       head: eventHead(event),
       raw: event.call,
       meta,
-      resourceLinks: eventResourceLinks({ sessionId: ir.session.id, event, eventHandle: base, pairedHandle })
+      resourceLinks: eventResourceLinks({ indexId: ir.indexId, sessionId: ir.session.id, event, eventHandle: base, pairedHandle })
     }))
   }
   if (event.output !== undefined) {
@@ -344,7 +363,7 @@ const eventNode = ({ ir, event, index, pairLookup }) => {
       head: eventHead(event),
       raw: event.output,
       meta,
-      resourceLinks: eventResourceLinks({ sessionId: ir.session.id, event, eventHandle: base, pairedHandle })
+      resourceLinks: eventResourceLinks({ indexId: ir.indexId, sessionId: ir.session.id, event, eventHandle: base, pairedHandle })
     }))
   }
   if (!children.length) {
@@ -355,7 +374,7 @@ const eventNode = ({ ir, event, index, pairLookup }) => {
       head: eventHead(event),
       raw: event,
       meta,
-      resourceLinks: eventResourceLinks({ sessionId: ir.session.id, event, eventHandle: base, pairedHandle })
+      resourceLinks: eventResourceLinks({ indexId: ir.indexId, sessionId: ir.session.id, event, eventHandle: base, pairedHandle })
     }))
   }
   return section({
@@ -367,7 +386,7 @@ const eventNode = ({ ir, event, index, pairLookup }) => {
     ownUsage: event.usage,
     usage: event.usage,
     meta,
-    resourceLinks: eventResourceLinks({ sessionId: ir.session.id, event, eventHandle: base, pairedHandle })
+    resourceLinks: eventResourceLinks({ indexId: ir.indexId, sessionId: ir.session.id, event, eventHandle: base, pairedHandle })
   })
 }
 
@@ -387,6 +406,7 @@ const makePairLookup = ir => {
 }
 
 const buildMipTree = ir => {
+  ir.indexId = indexIdForIR(ir)
   const pairLookup = makePairLookup(ir)
   const children = ir.events.map((event, index) => eventNode({ ir, event, index, pairLookup }))
   const root = section({
@@ -453,6 +473,21 @@ const compactedEventSpans = tree => {
     endIndex = -1
   }
   return spans
+}
+
+const addVisibleHandles = (handles, node) => {
+  if (!node || isModelHiddenNode(node)) return
+  handles.add(node.handle)
+  for (const child of modelVisibleChildren(node.children)) addVisibleHandles(handles, child)
+}
+
+const compactedRetrievalHandles = tree => {
+  const handles = new Set()
+  if (tree && tree.root) handles.add(tree.root.handle)
+  for (const span of compactedEventSpans(tree)) {
+    for (const child of modelVisibleChildren(span.children)) addVisibleHandles(handles, child)
+  }
+  return handles
 }
 
 const replaceRootChildren = (tree, children, head, opts = {}) => {
@@ -593,7 +628,8 @@ const nodeConversationFields = node => {
 
 const nodeRef = (tree, node, opts = {}) => ({
   handle: node.handle,
-  link: sessionLink({ sessionId: tree.ir.session.id, handle: node.handle }),
+  index_id: tree.ir.indexId,
+  link: sessionLink({ indexId: tree.ir.indexId, handle: node.handle }),
   parentHandle: tree.parentByHandle && tree.parentByHandle.get(node.handle) || undefined,
   ...nodeNavigation(tree, node),
   ...nodeTimeFields(node),
@@ -677,6 +713,9 @@ const openLink = (tree, link, opts = {}) => {
   if (!parsed || !parsed.handle) throw new Error(`Unsupported conversation_history link: ${link}`)
   if (parsed.sessionId && parsed.sessionId !== tree.ir.session.id) {
     throw new Error(`link targets session ${parsed.sessionId}, loaded session is ${tree.ir.session.id}`)
+  }
+  if (parsed.indexId && parsed.indexId !== tree.ir.indexId) {
+    throw new Error(`link targets index ${parsed.indexId}, loaded index is ${tree.ir.indexId}`)
   }
   const node = tree.byHandle.get(parsed.handle)
   if (!node) throw new Error(`Unknown session handle: ${parsed.handle}`)
@@ -769,7 +808,8 @@ const browseNode = (tree, opts = {}) => {
     topic_id: topicIdForHandle({ handle: node.handle }),
     selected_topic_id: topicId || undefined,
     zoom,
-    link: sessionLink({ sessionId: tree.ir.session.id, handle: node.handle }),
+    index_id: tree.ir.indexId,
+    link: sessionLink({ indexId: tree.ir.indexId, handle: node.handle }),
     ...nodeTimeFields(node),
     ...nodeConversationFields(node),
     kind: node.kind,
@@ -823,12 +863,13 @@ const compactNodeSearchText = node => [
   stableStringify(node.meta)
 ].filter(Boolean).join('\n')
 
-const boundedDescendantSearchText = (node, maxChars = MAX_INNER_DESCENDANT_SEARCH_CHARS) => {
+const boundedDescendantSearchText = (node, maxChars = MAX_INNER_DESCENDANT_SEARCH_CHARS, isSearchVisible = () => true) => {
   const parts = []
   const state = { used: 0 }
   const visit = child => {
     if (!child || state.used >= maxChars) return
     if (isModelHiddenNode(child)) return
+    if (!isSearchVisible(child)) return
     appendBounded(parts, compactNodeSearchText(child), state, maxChars)
     if (!child.children.length) {
       appendBounded(parts, child.raw, state, maxChars)
@@ -846,8 +887,12 @@ const boundedDescendantSearchText = (node, maxChars = MAX_INNER_DESCENDANT_SEARC
   return parts.join('\n')
 }
 
-const collectIndexDocuments = tree => {
+const collectIndexDocuments = (tree, opts = {}) => {
   const docs = []
+  const indexId = tree.ir.indexId || indexIdForIR(tree.ir)
+  const retrievalVisible = typeof opts.retrievalVisible === 'function'
+    ? opts.retrievalVisible
+    : () => opts.retrievalVisible !== false
   const visit = (node, parent, depth) => {
     if (isModelHiddenNode(node)) return
     const isLeaf = !node.children.length
@@ -860,15 +905,16 @@ const collectIndexDocuments = tree => {
       ? nodeSearchText(node, { topics: docTopics })
       : isPendingSummary
         ? nodeSearchText(node, { topics: docTopics })
-      : [nodeSearchText(node, { topics: docTopics }), boundedDescendantSearchText(node)].join('\n')
+      : [nodeSearchText(node, { topics: docTopics }), boundedDescendantSearchText(node, MAX_INNER_DESCENDANT_SEARCH_CHARS, retrievalVisible)].join('\n')
     const agent = tree.ir.session.agent || ''
     docs.push({
-      id: hashString(`${agent}:${tree.ir.session.id}:${node.handle}`),
+      id: hashString(`${agent}:${indexId}:${node.handle}`),
+      indexId,
       sessionId: tree.ir.session.id,
       agent,
       sourceKind: tree.ir.source.kind,
       handle: node.handle,
-      link: sessionLink({ sessionId: tree.ir.session.id, handle: node.handle }),
+      link: sessionLink({ indexId, handle: node.handle }),
       parentHandle: parent && parent.handle,
       ...nodeNavigation(tree, node, parent, depth),
       ...nodeTimeFields(node),
@@ -876,6 +922,7 @@ const collectIndexDocuments = tree => {
       depth,
       kind: node.kind,
       mipLevel: node.children.length ? 'summary' : 'leaf',
+      retrievalVisible: Boolean(retrievalVisible(node)),
       isVerbatim: isLeaf,
       title: node.title || '',
       breadcrumb: node.breadcrumb || '',
@@ -906,10 +953,12 @@ module.exports = {
   buildMipTree,
   compactedEventSpans,
   compactedPrefixChildren,
+  compactedRetrievalHandles,
   createSummaryNode,
   collectIndexDocuments,
   DEFAULT_SUMMARY_MODEL,
   hydrateMipTree,
+  indexIdForIR,
   isModelHiddenNode,
   isModelVisibleNode,
   lastCompactionChildIndex,

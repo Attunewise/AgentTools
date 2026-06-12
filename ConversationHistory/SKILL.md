@@ -19,8 +19,8 @@ If the tools are not visible, call `tool_search` for `conversation_history conve
 
 ## Functions
 
-- `conversation_search`: search existing transcript indexes. Inputs include `query`, `session_id`, `topic`, `within`, `filter`, `start_at`, `limit`, `agent`, and `index_dir`.
-- `conversation_browse`: navigate an indexed session hierarchy. Inputs include `session_id`, `topic_id`, `zoom`, `start`, `limit`, `agent`, and `index_dir`.
+- `conversation_search`: search existing transcript indexes. Inputs include `query`, `session_id` as a visibility filter, `index_id`, `topic`, `within`, `filter`, `start_at`, `limit`, `agent`, and `index_dir`.
+- `conversation_browse`: navigate an indexed hierarchy by definitive `index_id`. Inputs include `index_id`, optional `session_id` visibility filter, `topic_id`, `zoom`, `start`, `limit`, `agent`, and `index_dir`.
 - `conversation_openLink`: open a search or browse link with a token budget. Inputs include `link`, `budget_tokens`, `agent`, and `index_dir`. Outputs include `isVerbatim` and `omittedTokenCount`.
 - `conversation_index_status`: inspect indexed-session status. Inputs include `start_at`, `limit`, `session_id`, and `index_dir`.
 - `start_indexing_session`: start or reuse background indexing.
