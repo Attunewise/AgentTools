@@ -16,6 +16,11 @@ const SHUTDOWN_TIMEOUT_MS = 10000
 const SESSION_MARKER_SCAN_LIMIT = 100
 const SESSION_MARKER_SCAN_BYTES = 8 * 1024 * 1024
 const SESSION_MARKER_PATTERN = /(?:conversation_history-session-|session-indexer-session-)[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g
+const STATUS_POLL_INITIAL_MS = 15_000
+const STATUS_POLL_MAX_MS = 120_000
+const STATUS_POLL_ESTIMATE_BUFFER_MS = 1_000
+
+const statusPollMemory = new Map()
 
 const stringArg = value => typeof value === 'string' && value.length ? value : undefined
 
@@ -75,11 +80,19 @@ const lastSessionMarkerInFile = file => {
     const buffer = Buffer.allocUnsafe(length)
     fs.readSync(fd, buffer, 0, length, start)
     const text = buffer.toString('utf8')
-    let last = ''
-    for (const match of text.matchAll(SESSION_MARKER_PATTERN)) last = match[0]
+    let last = null
+    for (const match of text.matchAll(SESSION_MARKER_PATTERN)) {
+      last = {
+        marker: match[0],
+        file: file.file,
+        mtimeMs: file.mtimeMs,
+        size: file.size,
+        byteOffset: start + match.index
+      }
+    }
     return last
   } catch (_err) {
-    return ''
+    return null
   } finally {
     if (fd !== undefined) {
       try {
@@ -97,23 +110,22 @@ const discoverExistingSessionMarker = (args = {}) => {
   if (!shouldResolveThisChat(args) || stringArg(args.session_marker)) return null
   const source = args.source || defaultSource()
   const root = args.source_root || defaultSourceRoot(source)
-  for (const file of walkJsonlFiles(root).slice(0, SESSION_MARKER_SCAN_LIMIT)) {
-    const marker = lastSessionMarkerInFile(file)
-    if (marker && (marker.startsWith(SESSION_MARKER_PREFIX) || marker.startsWith(LEGACY_SESSION_MARKER_PREFIX))) return marker
-  }
-  return null
+  const latest = walkJsonlFiles(root)
+    .slice(0, SESSION_MARKER_SCAN_LIMIT)
+    .map(lastSessionMarkerInFile)
+    .filter(Boolean)
+    .sort((a, b) =>
+      b.mtimeMs - a.mtimeMs ||
+      b.byteOffset - a.byteOffset ||
+      b.size - a.size ||
+      a.file.localeCompare(b.file)
+    )[0]
+  return latest ? latest.marker : null
 }
 
 const ensureStartSessionMarker = (args = {}) => {
-  if (!shouldResolveThisChat(args) || stringArg(args.session_marker)) return null
-  const discovered = discoverExistingSessionMarker(args)
-  if (discovered) {
-    args.session_marker = discovered
-    return {
-      sessionMarker: discovered,
-      generated: false
-    }
-  }
+  delete args.session_marker
+  if (!shouldResolveThisChat(args)) return null
   const sessionMarker = makeSessionMarker()
   args.session_marker = sessionMarker
   args.wait_for_session_marker = true
@@ -227,6 +239,143 @@ const parseCliResult = stdout => {
 
 const callConversationHistory = async argv => {
   return parseCliResult(await runCli(argv))
+}
+
+const parseTimeMs = value => {
+  const time = Date.parse(value)
+  return Number.isFinite(time) ? time : null
+}
+
+const retryAtFrom = (nowMs, retryAfterMs) => new Date(nowMs + Math.max(0, Number(retryAfterMs || 0))).toISOString()
+
+const statusPollKey = session => [
+  session && (session.indexId || session.sessionId || 'unknown-index'),
+  session && session.sessionId || 'unknown-session',
+  session && session.indexingJob && session.indexingJob.jobId || 'no-job'
+].join(':')
+
+const statusPollSessionPrefix = session => [
+  session && (session.indexId || session.sessionId || 'unknown-index'),
+  session && session.sessionId || 'unknown-session'
+].join(':')
+
+const deleteStatusPollMemoryForSession = (session, exceptKey = null) => {
+  const prefix = `${statusPollSessionPrefix(session)}:`
+  for (const key of statusPollMemory.keys()) {
+    if (key.startsWith(prefix) && key !== exceptKey) statusPollMemory.delete(key)
+  }
+}
+
+const statusPollFingerprint = session => {
+  const job = session && session.indexingJob || {}
+  const progress = job.progress || {}
+  const stats = session && session.indexingStats || {}
+  const store = session && session.summaryTargetStore || {}
+  return JSON.stringify({
+    state: session && session.state,
+    indexed: session && session.indexed,
+    jobStatus: job.status,
+    suspendedReason: job.suspendedReason,
+    progressPhase: progress.phase,
+    progressTargetId: progress.targetId,
+    progressCompletedModelJobCount: progress.completedModelJobCount,
+    progressTotalModelJobCount: progress.totalModelJobCount,
+    indexedCompactionCount: stats.indexedCompactionCount,
+    pendingCompactionCount: stats.pendingCompactionCount,
+    completedTargetCount: stats.completedTargetCount,
+    pendingTargetCount: stats.pendingTargetCount,
+    failedTargetCount: stats.failedTargetCount,
+    currentStoredCompletedTargetCount: store.currentStoredCompletedTargetCount,
+    currentStoredClaimedTargetCount: store.currentStoredClaimedTargetCount,
+    currentStoredFailedTargetCount: store.currentStoredFailedTargetCount,
+    currentStoredStaleClaimCount: store.currentStoredStaleClaimCount
+  })
+}
+
+const nextStatusPollForSession = (session, now = new Date()) => {
+  const key = statusPollKey(session)
+  if (!session || session.state === 'suspended-budget' || session.state === 'suspended') {
+    deleteStatusPollMemoryForSession(session)
+    const suspension = session && session.suspension
+    return {
+      retryAfterMs: null,
+      retryAt: null,
+      reason: 'approval_required',
+      message: suspension && suspension.requiredAction
+        ? `Do not poll for completion until the required action is handled. ${suspension.requiredAction}`
+        : 'Do not poll for completion until the suspension is resolved.'
+    }
+  }
+  if (session.state !== 'indexing-in-progress' || !session.indexingJob) {
+    deleteStatusPollMemoryForSession(session)
+    return null
+  }
+  deleteStatusPollMemoryForSession(session, key)
+
+  const fingerprint = statusPollFingerprint(session)
+  const previous = statusPollMemory.get(key)
+  const backoffMs = previous && previous.fingerprint === fingerprint
+    ? Math.min(STATUS_POLL_MAX_MS, Math.max(STATUS_POLL_INITIAL_MS, Number(previous.backoffMs || STATUS_POLL_INITIAL_MS) * 2))
+    : STATUS_POLL_INITIAL_MS
+  const nowMs = now.getTime()
+  const progress = session.indexingJob.progress || {}
+  const retryAtMs = parseTimeMs(progress.retryAt)
+  const estimatedCompletionMs = parseTimeMs(progress.estimatedCompletionAt)
+  const retryAfterMs = Math.max(
+    backoffMs,
+    retryAtMs === null ? 0 : retryAtMs - nowMs + STATUS_POLL_ESTIMATE_BUFFER_MS,
+    estimatedCompletionMs === null ? 0 : estimatedCompletionMs - nowMs + STATUS_POLL_ESTIMATE_BUFFER_MS
+  )
+
+  statusPollMemory.set(key, {
+    fingerprint,
+    backoffMs,
+    updatedAt: now.toISOString()
+  })
+
+  return {
+    retryAfterMs,
+    retryAt: retryAtFrom(nowMs, retryAfterMs),
+    reason: retryAtMs !== null
+      ? 'worker_retry'
+      : estimatedCompletionMs !== null
+        ? 'estimated_completion'
+        : 'active_indexing',
+    source: retryAtMs !== null
+      ? 'progress.retryAt'
+      : estimatedCompletionMs !== null
+        ? 'progress.estimatedCompletionAt'
+        : 'mcp_backoff',
+    message: retryAtMs !== null
+      ? 'Poll after the worker retry window.'
+      : estimatedCompletionMs !== null
+        ? 'Poll after the current indexing batch is expected to complete.'
+        : 'Indexing is active; MCP is applying exponential backoff for repeated unchanged status.',
+    backoff: {
+      strategy: 'exponential',
+      currentMs: backoffMs,
+      initialMs: STATUS_POLL_INITIAL_MS,
+      maxMs: STATUS_POLL_MAX_MS,
+      resetOn: [
+        'state changes',
+        'progress phase or target changes',
+        'completed or pending counts change',
+        'job reaches ready, suspended, stopped, stale, or error'
+      ]
+    }
+  }
+}
+
+const withStatusPollHints = result => {
+  if (!result || !Array.isArray(result.sessions)) return result
+  const now = new Date()
+  return {
+    ...result,
+    sessions: result.sessions.map(session => {
+      const nextStatusPoll = nextStatusPollForSession(session, now)
+      return nextStatusPoll ? { ...session, nextStatusPoll } : session
+    })
+  }
 }
 
 const runCliSyncQuiet = argv => {
@@ -390,7 +539,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     pushFlag(argv, '--start-at', args.start_at)
     pushFlag(argv, '--limit', args.limit)
     pushFlag(argv, '--session-id', args.session_id)
-    return toolResult(await callConversationHistory(argv))
+    return toolResult(withStatusPollHints(await callConversationHistory(argv)))
   })
 
   server.registerTool('start_indexing_session', {
@@ -530,5 +679,9 @@ module.exports = {
   SESSION_INDEXER_SYSTEM_PROMPT: CONVERSATION_HISTORY_SYSTEM_PROMPT,
   CONVERSATION_HISTORY_SYSTEM_PROMPT,
   createPluginLifecycle,
-  startStdioServer
+  startStdioServer,
+  __testing: {
+    discoverExistingSessionMarker,
+    ensureStartSessionMarker
+  }
 }

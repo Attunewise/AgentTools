@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict')
+const childProcess = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -753,6 +754,34 @@ test('Typesense docs require a session id for shared-backend filtering', () => {
     mipLevel: 'root',
     isVerbatim: false
   }), /requires agent/)
+})
+
+test('Typesense docs replace lone surrogates before JSONL import', () => {
+  const stored = docForTypesense({
+    id: 'bad-surrogate',
+    indexId: 'idx-mini',
+    sessionId: 'mini-session',
+    agent: 'codex',
+    handle: 'session/mini-session/event/1',
+    depth: 1,
+    kind: 'message',
+    mipLevel: 'leaf',
+    isVerbatim: true,
+    title: 'bad high \uD800 and bad low \uDC00 but keep pair \uD83D\uDE00',
+    summary: 'summary \uD800',
+    searchText: 'search \uDC00',
+    content: 'content \uD800',
+    topics: ['topic \uD800'],
+    resourceLinks: ['tool:conversation_history://open?handle=\uDC00']
+  })
+
+  assert.equal(stored.title, 'bad high \uFFFD and bad low \uFFFD but keep pair \uD83D\uDE00')
+  assert.equal(stored.summary, 'summary \uFFFD')
+  assert.equal(stored.searchText, 'search \uFFFD')
+  assert.equal(stored.content, 'content \uFFFD')
+  assert.deepEqual(JSON.parse(stored.topicsJson), ['topic \uFFFD'])
+  assert.deepEqual(JSON.parse(stored.resourceLinksJson), ['tool:conversation_history://open?handle=\uFFFD'])
+  assert.doesNotMatch(JSON.stringify(stored), /\\ud(?:[89ab][0-9a-f]{2}|[cdef][0-9a-f]{2})/i)
 })
 
 test('Typesense imports reject cross-session records before backend startup', async () => {
@@ -3373,6 +3402,40 @@ test('redeploy target follows the install context, not the caller', async () => 
   }
 })
 
+test('MCP start indexing always generates the conversation marker server-side', () => {
+  const { __testing: mcpTesting } = require('../src/mcpServer.js')
+  const supplied = 'conversation_history-session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  const args = { session_marker: supplied }
+  const marker = mcpTesting.ensureStartSessionMarker(args)
+  assert.equal(marker.generated, true)
+  assert.match(marker.sessionMarker, /^conversation_history-session-[0-9a-f-]{36}$/)
+  assert.equal(args.session_marker, marker.sessionMarker)
+  assert.notEqual(args.session_marker, supplied)
+  assert.equal(args.wait_for_session_marker, true)
+
+  const allArgs = { all: true, session_marker: supplied }
+  assert.equal(mcpTesting.ensureStartSessionMarker(allArgs), null)
+  assert.equal(Object.hasOwn(allArgs, 'session_marker'), false)
+})
+
+test('MCP marker discovery uses only the last marker as definitive', () => {
+  const { __testing: mcpTesting } = require('../src/mcpServer.js')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-mcp-marker-'))
+  const session = path.join(root, 'session.jsonl')
+  const oldMarker = 'conversation_history-session-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+  const latestMarker = 'conversation_history-session-cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+  writeJsonl(session, [
+    { timestamp: '2026-06-05T00:00:00.000Z', type: 'response_item', payload: { type: 'function_call_output', output: JSON.stringify({ sessionMarker: oldMarker }) } },
+    { timestamp: '2026-06-05T00:00:01.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'forked work continues' } },
+    { timestamp: '2026-06-05T00:00:02.000Z', type: 'response_item', payload: { type: 'function_call_output', output: JSON.stringify({ sessionMarker: latestMarker }) } }
+  ])
+
+  assert.equal(mcpTesting.discoverExistingSessionMarker({
+    source: 'codex',
+    source_root: root
+  }), latestMarker)
+})
+
 test('MCP server exposes native conversation search and openLink tools', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-mcp-'))
   const ir = importCodexJsonl(fixture)
@@ -3532,7 +3595,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.equal(zoomedBrowse.topic_id, browseResult.children[0].topic_id)
     assert.equal(Object.hasOwn(zoomedBrowse, 'handle'), false)
 
-    const statusResult = (await client.callTool({
+    const callMiniStatus = async () => (await client.callTool({
       name: 'conversation_index_status',
       arguments: {
         start_at: 0,
@@ -3540,6 +3603,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
         session_id: 'mini-session'
       }
     })).structuredContent.result
+    const statusResult = await callMiniStatus()
     assert.equal(statusResult.schema, 'session-indexer.index_status.v1')
     assert.equal(Object.hasOwn(statusResult, 'indexedSessionCount'), false)
     assert.equal(Object.hasOwn(statusResult, 'requestedSessionCount'), false)
@@ -3557,6 +3621,98 @@ test('MCP server exposes native conversation search and openLink tools', async (
       assert.equal(Object.hasOwn(statusResult.sessions[0].indexingJob, 'maxSummaryNodes'), false)
     }
     assert.equal(statusResult.sessions[0].summaryTargetStore.targetCount, 0)
+    assert.equal(Object.hasOwn(statusResult.sessions[0], 'nextStatusPoll'), false)
+
+    const statusWorker = childProcess.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore'
+    })
+    try {
+      writeJobState({
+        root,
+        state: {
+          jobId: 'mcp-status-backoff',
+          scope: 'this_session_only',
+          source: 'codex',
+          sessions: [ir.source.path],
+          pid: statusWorker.pid,
+          status: 'indexing',
+          ready: false,
+          progress: {
+            phase: 'indexing',
+            targetId: 'same-target'
+          }
+        }
+      })
+      const activeFirst = await callMiniStatus()
+      assert.equal(activeFirst.sessions[0].state, 'indexing-in-progress')
+      assert.equal(activeFirst.sessions[0].nextStatusPoll.reason, 'active_indexing')
+      assert.equal(activeFirst.sessions[0].nextStatusPoll.source, 'mcp_backoff')
+      assert.equal(activeFirst.sessions[0].nextStatusPoll.retryAfterMs, 15000)
+      assert.match(activeFirst.sessions[0].nextStatusPoll.retryAt, /^\d{4}-\d{2}-\d{2}T/)
+      assert.equal(activeFirst.sessions[0].nextStatusPoll.backoff.strategy, 'exponential')
+      assert.equal(activeFirst.sessions[0].nextStatusPoll.backoff.currentMs, 15000)
+
+      const activeSecond = await callMiniStatus()
+      assert.equal(activeSecond.sessions[0].state, 'indexing-in-progress')
+      assert.equal(activeSecond.sessions[0].nextStatusPoll.retryAfterMs, 30000)
+      assert.equal(activeSecond.sessions[0].nextStatusPoll.backoff.currentMs, 30000)
+
+      writeJobState({
+        root,
+        state: {
+          jobId: 'mcp-status-backoff',
+          scope: 'this_session_only',
+          source: 'codex',
+          sessions: [ir.source.path],
+          pid: statusWorker.pid,
+          status: 'indexing',
+          ready: false,
+          progress: {
+            phase: 'indexing',
+            targetId: 'next-target'
+          }
+        }
+      })
+      const activeChanged = await callMiniStatus()
+      assert.equal(activeChanged.sessions[0].state, 'indexing-in-progress')
+      assert.equal(activeChanged.sessions[0].nextStatusPoll.retryAfterMs, 15000)
+      assert.equal(activeChanged.sessions[0].nextStatusPoll.backoff.currentMs, 15000)
+
+      writeJobState({
+        root,
+        state: {
+          jobId: 'mcp-status-backoff',
+          scope: 'this_session_only',
+          source: 'codex',
+          sessions: [ir.source.path],
+          status: 'suspended',
+          suspendedReason: 'summary_budget',
+          message: 'summary budget approval required',
+          suspension: {
+            reason: 'summary_budget',
+            message: 'summary budget approval required',
+            requiredAction: 'Ask the user to approve the remaining conversation_history indexing budget.'
+          },
+          progress: {
+            phase: 'summary:budget_suspended',
+            suspended: true,
+            reason: 'summary_budget'
+          }
+        }
+      })
+      const suspended = await callMiniStatus()
+      assert.equal(suspended.sessions[0].state, 'suspended-budget')
+      assert.equal(suspended.sessions[0].nextStatusPoll.reason, 'approval_required')
+      assert.equal(suspended.sessions[0].nextStatusPoll.retryAfterMs, null)
+      assert.equal(suspended.sessions[0].nextStatusPoll.retryAt, null)
+      assert.match(suspended.sessions[0].nextStatusPoll.message, /Do not poll/)
+    } finally {
+      if (!statusWorker.killed) statusWorker.kill('SIGTERM')
+      await Promise.race([
+        new Promise(resolve => statusWorker.once('exit', resolve)),
+        sleepMs(1000)
+      ])
+    }
 
     const searched = await client.callTool({
       name: 'conversation_search',

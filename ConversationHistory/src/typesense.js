@@ -30,7 +30,41 @@ const parseSessionLink = link => {
   }
 }
 
-const compactJson = value => value === undefined ? '' : JSON.stringify(value)
+const wellFormedString = value => {
+  const text = String(value)
+  let out = ''
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index)
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = text.charCodeAt(index + 1)
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        out += text[index] + text[index + 1]
+        index++
+      } else {
+        out += '\uFFFD'
+      }
+    } else if (code >= 0xDC00 && code <= 0xDFFF) {
+      out += '\uFFFD'
+    } else {
+      out += text[index]
+    }
+  }
+  return out
+}
+
+const wellFormedValue = value => {
+  if (typeof value === 'string') return wellFormedString(value)
+  if (Array.isArray(value)) return value.map(wellFormedValue)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      wellFormedString(key),
+      wellFormedValue(item)
+    ]))
+  }
+  return value
+}
+
+const compactJson = value => value === undefined ? '' : JSON.stringify(wellFormedValue(value))
 
 const compactSummaryMeta = meta => {
   if (!meta) return {}
@@ -276,7 +310,7 @@ const docForTypesense = doc => {
   const timeRange = doc.timeRange || {}
   const topics = normalizeTopics(doc.topics || [], { max: 0 })
   const resourceLinks = doc.resourceLinks || []
-  return {
+  return wellFormedValue({
     id: String(doc.id),
     indexId,
     sessionId,
@@ -326,7 +360,7 @@ const docForTypesense = doc => {
       nextLevelTokenCount: Number(doc.nextLevelTokenCount || 0)
     }),
     ts: Number(doc.ts || 0)
-  }
+  })
 }
 
 const filterValue = value => `\`${String(value).replace(/\\/g, '\\\\').replace(/`/g, '\\`')}\``
