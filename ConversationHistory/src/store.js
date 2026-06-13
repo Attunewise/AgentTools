@@ -8,6 +8,7 @@ const {
 const {
   formatAgo,
   hashString,
+  preview,
   readJson,
   readJsonlRows,
   withFileLock,
@@ -714,6 +715,99 @@ const sessionSortTime = session => {
   return Number.isFinite(time) ? time : 0
 }
 
+const sessionCatalogSortTime = session => {
+  const time = Date.parse(session && (session.updatedAt || session.indexedAt))
+  return Number.isFinite(time) ? time : 0
+}
+
+const turnCountForIR = ir => (ir.events || [])
+  .filter(event => event && event.type === 'message' && event.role === 'user')
+  .length
+
+const sessionSummaryText = session => preview(
+  session.shortSummary ||
+  session.summary ||
+  session.summaryIndex && (session.summaryIndex.summary || session.summaryIndex.description) ||
+  session.title ||
+  session.sessionId,
+  180
+)
+
+const compactCatalogEntry = (session, now) => {
+  const stats = publicIndexingStats(session)
+  const indexId = session.indexId || session.sessionId
+  const updatedAt = session.updatedAt || session.indexedAt || null
+  const entry = {
+    session_id: session.sessionId,
+    index_id: indexId,
+    agent: session.agent,
+    title: preview(session.title || session.sessionId, 120),
+    short_summary: sessionSummaryText(session),
+    last_modified_at: updatedAt,
+    last_modified_ago: updatedAt ? formatAgo(updatedAt, now) : null,
+    indexed_at: session.indexedAt || null,
+    source_kind: session.sourceKind,
+    turn_count: Number.isFinite(Number(session.turnCount)) ? Number(session.turnCount) : undefined,
+    event_count: Number.isFinite(Number(session.eventCount)) ? Number(session.eventCount) : undefined,
+    doc_count: Number.isFinite(Number(session.docCount)) ? Number(session.docCount) : undefined,
+    full_token_count: Number.isFinite(Number(session.fullTokenCount)) ? Number(session.fullTokenCount) : undefined,
+    usage_total_tokens: session.usage && Number.isFinite(Number(session.usage.total)) ? Number(session.usage.total) : undefined,
+    compaction_count: Number(stats.compactionCount || 0),
+    indexed_compaction_count: Number(stats.indexedCompactionCount || 0),
+    pending_compaction_count: Number(stats.pendingCompactionCount || 0),
+    browse: {
+      index_id: indexId,
+      topic_id: 'root'
+    }
+  }
+  for (const key of Object.keys(entry)) {
+    if (entry[key] === undefined || entry[key] === null || entry[key] === '') delete entry[key]
+  }
+  return entry
+}
+
+const catalogSearchText = entry => [
+  entry.session_id,
+  entry.index_id,
+  entry.agent,
+  entry.title,
+  entry.short_summary,
+  entry.source_kind
+].filter(Boolean).join('\n').toLowerCase()
+
+const browseSessionCatalog = ({
+  root = DEFAULT_INDEX_DIR,
+  startAt = 0,
+  start,
+  limit = 20,
+  agent,
+  query
+} = {}) => {
+  const manifest = readManifest(root)
+  const now = new Date()
+  const offset = start === undefined ? startAt : start
+  const normalizedQuery = String(query || '').trim().toLowerCase()
+  const sessions = Object.values(manifest.sessions || {})
+    .filter(session => session && session.sessionId)
+    .sort((a, b) => sessionCatalogSortTime(b) - sessionCatalogSortTime(a) || String(a.sessionId).localeCompare(String(b.sessionId)))
+    .map(session => compactCatalogEntry(session, now))
+    .filter(entry => !agent || entry.agent === agent)
+    .filter(entry => !normalizedQuery || catalogSearchText(entry).includes(normalizedQuery))
+  const pageSessions = sessions.slice(offset, offset + limit)
+  return {
+    level: 'sessions',
+    checked_at: now.toISOString(),
+    page: {
+      start: offset,
+      limit,
+      returned: pageSessions.length,
+      total: sessions.length,
+      ...(offset + limit < sessions.length ? { next_start: offset + limit } : {})
+    },
+    sessions: pageSessions
+  }
+}
+
 const activeUnindexedSessionIds = ({ root, indexedIds }) => {
   const out = new Set()
   for (const state of listJobStates({ root })) {
@@ -939,8 +1033,10 @@ const writeSessionIndex = ({ root = DEFAULT_INDEX_DIR, ir }) => {
     updatedAt: ir.session.updatedAt,
     indexedAt: now,
     eventCount: ir.events.length,
+    turnCount: turnCountForIR(ir),
     docCount: docs.length,
     rootHandle: tree.root.handle,
+    shortSummary: preview(tree.root.head || ir.session.title || ir.session.id, 180),
     fullTokenCount: tree.root.fullTokenCount,
     usage: tree.root.usage
   }
@@ -960,8 +1056,10 @@ const writeSessionIndex = ({ root = DEFAULT_INDEX_DIR, ir }) => {
     sourcePath: ir.source.path,
     sourceFingerprint: ir.source.fingerprint,
     eventCount: ir.events.length,
+    turnCount: turnCountForIR(ir),
     docCount: docs.length,
     rootHandle: tree.root.handle,
+    shortSummary: preview(tree.root.head || ir.session.title || ir.session.id, 180),
     fullTokenCount: tree.root.fullTokenCount,
     usage: tree.root.usage,
     readiness: sessionIndexReadiness({ root, sessionRecord })
@@ -1095,8 +1193,10 @@ const writeSessionIndexWithBackend = async ({
     updatedAt: ir.session.updatedAt,
     indexedAt: hasPublishedCurrentSource ? previousPublishedIndexedAt || now : now,
     eventCount: ir.events.length,
+    turnCount: turnCountForIR(ir),
     docCount: hasPublishedCurrentSource ? previousPublishedDocCount : 0,
     rootHandle: tree.root.handle,
+    shortSummary: preview(tree.root.head || ir.session.title || ir.session.id, 180),
     fullTokenCount: tree.root.fullTokenCount,
     usage: tree.root.usage,
     summaryIndex: summaryIndex.summary,
@@ -1172,8 +1272,10 @@ const writeSessionIndexWithBackend = async ({
     sourcePath: ir.source.path,
     sourceFingerprint: ir.source.fingerprint,
     eventCount: ir.events.length,
+    turnCount: turnCountForIR(ir),
     docCount: sessionRecord.docCount,
     rootHandle: tree.root.handle,
+    shortSummary: sessionRecord.shortSummary,
     fullTokenCount: tree.root.fullTokenCount,
     usage: tree.root.usage,
     summaryIndex: summaryIndex.summary,
@@ -1317,6 +1419,7 @@ module.exports = {
   DEFAULT_INDEX_DIR,
   DEFAULT_SEARCH_BACKEND,
   DEFAULT_SUMMARY_MODE,
+  browseSessionCatalog,
   commitSummaryJobs,
   completedSummaryJobs,
   browseIndexWithBackend,

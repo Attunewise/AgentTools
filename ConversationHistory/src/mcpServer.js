@@ -10,6 +10,7 @@ const {
   readFileWindow,
   walkJsonlFiles: walkCodexJsonlFiles
 } = require('codex-session-tools')
+const { connectOrStartCodexSessionServer } = require('codex-session-tools/src/client.js')
 
 const REPO_ROOT = path.resolve(__dirname, '..')
 const CLI_PATH = path.join(REPO_ROOT, 'bin', 'session-indexer.js')
@@ -25,6 +26,7 @@ const STATUS_POLL_MAX_MS = 120_000
 const STATUS_POLL_ESTIMATE_BUFFER_MS = 1_000
 
 const statusPollMemory = new Map()
+const codexSessionClients = new Map()
 
 const stringArg = value => typeof value === 'string' && value.length ? value : undefined
 
@@ -48,6 +50,16 @@ const defaultSourceRoot = source => source === 'claude'
   ? path.join(os.homedir(), '.claude', 'projects')
   : path.join(os.homedir(), '.codex', 'sessions')
 
+const codexSessionServiceFor = async root => {
+  const resolved = path.resolve(root)
+  if (!codexSessionClients.has(resolved)) {
+    codexSessionClients.set(resolved, connectOrStartCodexSessionServer({
+      sessionRoot: resolved
+    }))
+  }
+  return codexSessionClients.get(resolved)
+}
+
 const lastSessionMarkerInFile = file => {
   const window = readFileWindow(file.file, SESSION_MARKER_SCAN_BYTES)
   if (!window || !window.text) return null
@@ -66,10 +78,19 @@ const lastSessionMarkerInFile = file => {
 
 const shouldResolveThisChat = (args = {}) => (args.this_chat !== false && !args.session && !args.latest && !isAllScope(args)) || args.this_chat
 
-const discoverExistingSessionMarker = (args = {}) => {
+const discoverExistingSessionMarker = async (args = {}) => {
   if (!shouldResolveThisChat(args) || stringArg(args.session_marker)) return null
   const source = args.source || defaultSource()
   const root = args.source_root || defaultSourceRoot(source)
+  if (source === 'codex') {
+    const service = args.codex_session_service || await codexSessionServiceFor(root)
+    const latest = await service.latestMarker({
+      pattern: SESSION_MARKER_PATTERN,
+      maxBytes: SESSION_MARKER_SCAN_BYTES,
+      limit: SESSION_MARKER_SCAN_LIMIT
+    })
+    return latest ? latest.marker : null
+  }
   const latest = walkCodexJsonlFiles(root)
     .slice(0, SESSION_MARKER_SCAN_LIMIT)
     .map(lastSessionMarkerInFile)
@@ -358,6 +379,7 @@ const createPluginLifecycle = () => {
     cleanupSync() {
       if (cleaned) return
       cleaned = true
+      codexSessionClients.clear()
       for (const root of indexRoots) {
         const args = rootArgs(root)
         runCliSyncQuiet(['stop_indexing_session', '--scope', 'all', '--timeout-ms', '5000', '--poll-ms', '100', ...args])
@@ -445,9 +467,10 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
 
   server.registerTool('conversation_browse', {
     title: 'Browse Indexed Conversation',
-    description: 'Browse an existing transcript summary hierarchy. Start with index_id, optionally topic_id:"root", then navigate with topic_id values returned by previous browse results. session_id is only a visibility filter. This never indexes on demand.',
+    description: 'Browse existing conversation indexes without indexing on demand. Omit index_id for a paged compact session catalog. Use index_id, optionally topic_id:"root", to drill into one transcript hierarchy. session_id is only a visibility filter.',
     inputSchema: {
-      index_id: z.string().describe('Definitive indexed-content id returned by search or index status.'),
+      query: z.string().optional().describe('Optional title/session catalog filter used only when index_id is omitted.'),
+      index_id: z.string().optional().describe('Definitive indexed-content id returned by search, catalog browse, or index status. Omit for the top-level session catalog.'),
       session_id: z.string().optional().describe('Optional visibility filter.'),
       agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
       topic_id: z.string().optional().describe('Opaque topic id returned by a previous conversation_browse response. Use "root" or omit for the root browse.'),
@@ -458,6 +481,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
   }, async args => {
     lifecycle.rememberIndexRoot()
     const argv = ['browse']
+    pushFlag(argv, '--query', args.query)
     pushFlag(argv, '--index-id', args.index_id)
     pushFlag(argv, '--session-id', args.session_id)
     pushFlag(argv, '--agent', args.agent)
@@ -535,7 +559,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     args.source = defaultSource()
     if (args.all) args.scope = 'all'
     if (!args.all) {
-      const discovered = discoverExistingSessionMarker(args)
+      const discovered = await discoverExistingSessionMarker(args)
       if (!discovered) {
         return toolResult({
           schema: 'session-indexer.stop_indexing_session.v1',
@@ -567,7 +591,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     args.source = defaultSource()
     if (args.all) args.scope = 'all'
     if (!args.session_id && !args.all) {
-      const discovered = discoverExistingSessionMarker(args)
+      const discovered = await discoverExistingSessionMarker(args)
       if (!discovered) {
         return toolResult({
           schema: 'session-indexer.reset_session_index.v1',

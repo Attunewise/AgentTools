@@ -5,14 +5,16 @@ const path = require('node:path')
 const {
   analyzeCodexSessionFile: analyzeCodexSessionLog,
   defaultCodexSessionRoot,
-  findCodexSessionsContainingMarker,
-  latestCodexSessionFile
+  latestCodexSessionFile,
+  resolveCodexSessionForMarker
 } = require('codex-session-tools')
+const { connectOrStartCodexSessionServer } = require('codex-session-tools/src/client.js')
 
 const {
   discoverDocs,
   docFingerprint,
   getStatus,
+  gitPrivatePath,
   installHook,
   prepareReview,
   recordCheck,
@@ -98,14 +100,21 @@ const scanCodexSessionTail = file => agentDocSessionFromCodexLog(analyzeCodexSes
   matchTerm: ['agentdoc_', 'AgentDoc']
 }))
 
-const findCodexSessionForMarker = (root, marker) => findCodexSessionsContainingMarker(root, marker, {
-  matchTerm: ['agentdoc_', 'AgentDoc']
-}).map(agentDocSessionFromCodexLog)
+const findCodexSessionForMarker = async (root, marker, codexSessions = null) => {
+  const resolved = codexSessions
+    ? await codexSessions.resolveMarker({ marker, matchTerm: ['agentdoc_', 'AgentDoc'] })
+    : resolveCodexSessionForMarker(root, marker, {
+        matchTerm: ['agentdoc_', 'AgentDoc']
+      })
+  return resolved ? [agentDocSessionFromCodexLog(resolved)] : []
+}
 
 class AgentDocServerState {
   constructor(options = {}) {
     this.codexSessionRoot = options.codexSessionRoot || defaultCodexSessionRoot()
     this.watch = options.watch !== false
+    this.codexSessions = options.codexSessions || null
+    this.codexSessionsStarted = false
     this.watchers = []
     this.repoWatchers = new Map()
     this.sessions = new Map()
@@ -114,20 +123,30 @@ class AgentDocServerState {
     this.snapshot = null
   }
 
+  async ensureCodexSessions() {
+    if (!this.codexSessions) {
+      this.codexSessions = await connectOrStartCodexSessionServer({
+        sessionRoot: this.codexSessionRoot,
+        watch: this.watch
+      })
+      this.codexSessionsStarted = true
+      return this.codexSessions
+    }
+    if (!this.codexSessionsStarted && typeof this.codexSessions.start === 'function') {
+      await this.codexSessions.start()
+    }
+    this.codexSessionsStarted = true
+    return this.codexSessions
+  }
+
   async start() {
-    this.refresh('start')
-    if (!this.watch) return this
-    const chokidar = require('chokidar')
-    const sessionWatcher = chokidar.watch(this.codexSessionRoot, {
-      ignored: file => path.extname(file) && path.extname(file) !== '.jsonl',
-      ignoreInitial: true
-    })
-    sessionWatcher.on('all', event => this.refresh(`codex-sessions:${event}`))
-    this.watchers.push(sessionWatcher)
+    await this.ensureCodexSessions()
+    await this.refresh('start')
     return this
   }
 
   async stop() {
+    if (this.codexSessions && typeof this.codexSessions.stop === 'function') this.codexSessions.stop()
     const closing = [
       ...this.watchers.map(watcher => watcher.close()),
       ...Array.from(this.repoWatchers.values()).map(watcher => watcher.close())
@@ -145,7 +164,7 @@ class AgentDocServerState {
     this.events = this.events.slice(-MAX_EVENTS)
   }
 
-  startAgentDocSession() {
+  async startAgentDocSession() {
     const agentdocSessionId = makeAgentDocSessionId()
     const session = {
       schema: 'agentdoc.session.v1',
@@ -157,7 +176,7 @@ class AgentDocServerState {
     }
     this.sessions.set(agentdocSessionId, session)
     this.pushEvent(`agentdoc-session:start:${agentdocSessionId}`)
-    this.refreshSession(agentdocSessionId)
+    await this.refreshSession(agentdocSessionId)
     return {
       schema: 'agentdoc.start-session.v1',
       agentdoc_session_id: agentdocSessionId,
@@ -166,10 +185,11 @@ class AgentDocServerState {
     }
   }
 
-  refreshSession(agentdocSessionId) {
+  async refreshSession(agentdocSessionId) {
     const session = this.sessions.get(agentdocSessionId)
     if (!session) throw new Error(`unknown AgentDoc session: ${agentdocSessionId}`)
-    const matches = findCodexSessionForMarker(this.codexSessionRoot, session.marker)
+    await this.ensureCodexSessions()
+    const matches = await findCodexSessionForMarker(this.codexSessionRoot, session.marker, this.codexSessions)
     if (matches.length) {
       session.codex_session = matches[0]
       session.repositories = matches[0].repositories
@@ -178,7 +198,7 @@ class AgentDocServerState {
     return session
   }
 
-  resolveSession(agentdocSessionId) {
+  async resolveSession(agentdocSessionId) {
     if (!agentdocSessionId) {
       const latest = Array.from(this.sessions.values()).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0]
       if (!latest) throw new Error('AgentDoc session required: call agentdoc_start_session first')
@@ -187,9 +207,9 @@ class AgentDocServerState {
     return this.refreshSession(agentdocSessionId)
   }
 
-  resolveWorkdir(args = {}) {
+  async resolveWorkdir(args = {}) {
     if (args.workdir) return repo(args.workdir).root
-    const session = this.resolveSession(args.agentdoc_session_id)
+    const session = await this.resolveSession(args.agentdoc_session_id)
     const current = session.codex_session && session.codex_session.current_repository
     if (!current || !current.root) {
       throw new Error(`AgentDoc session is not associated with a repository yet: ${session.agentdoc_session_id}`)
@@ -200,9 +220,11 @@ class AgentDocServerState {
   watchRepo(root) {
     if (!this.watch || this.repoWatchers.has(root)) return
     const chokidar = require('chokidar')
-    let gitDir
+    let gitIndex
+    let gitHead
     try {
-      gitDir = repo(root).gitDir
+      gitIndex = gitPrivatePath(root, 'index')
+      gitHead = gitPrivatePath(root, 'HEAD')
     } catch (_) {
       return
     }
@@ -219,7 +241,7 @@ class AgentDocServerState {
     docWatcher.on('all', (event, file) => {
       if (path.extname(file) === '.md') this.refresh(`repo-docs:${event}:${root}:${normalizePath(path.relative(root, file))}`)
     })
-    const gitWatcher = chokidar.watch([path.join(gitDir, 'index'), path.join(gitDir, 'HEAD')], { ignoreInitial: true })
+    const gitWatcher = chokidar.watch([gitIndex, gitHead], { ignoreInitial: true })
     gitWatcher.on('all', event => this.refresh(`repo-git:${event}:${root}`))
     this.repoWatchers.set(root, {
       close: async () => {
@@ -229,6 +251,7 @@ class AgentDocServerState {
   }
 
   repoSnapshot(root) {
+    const repoInfo = repo(root)
     const docs = discoverDocs(root)
     const staged = stagedFingerprint(root)
     const stampFile = stampPath(root)
@@ -236,6 +259,9 @@ class AgentDocServerState {
     return {
       root,
       git: {
+        git_dir: repoInfo.gitDir,
+        common_git_dir: repoInfo.commonGitDir,
+        is_linked_worktree: repoInfo.isLinkedWorktree,
         head: staged.git_head,
         staged_change_fingerprint: staged.staged_change_fingerprint,
         staged_file_count: staged.staged_file_count,
@@ -254,24 +280,24 @@ class AgentDocServerState {
     }
   }
 
-  prepareReview(args = {}) {
-    const workdir = this.resolveWorkdir(args)
+  async prepareReview(args = {}) {
+    const workdir = await this.resolveWorkdir(args)
     return {
       message: prepareReview({ workdir }),
       repository: this.repoSnapshot(workdir)
     }
   }
 
-  recordCheck(args = {}) {
-    const workdir = this.resolveWorkdir(args)
+  async recordCheck(args = {}) {
+    const workdir = await this.resolveWorkdir(args)
     return {
       message: recordCheck({ ...args, workdir }),
       repository: this.repoSnapshot(workdir)
     }
   }
 
-  gateStatus(args = {}) {
-    const workdir = this.resolveWorkdir(args)
+  async gateStatus(args = {}) {
+    const workdir = await this.resolveWorkdir(args)
     try {
       verifyGate({ workdir })
       return {
@@ -289,22 +315,32 @@ class AgentDocServerState {
     }
   }
 
-  installHook(args = {}) {
-    const workdir = this.resolveWorkdir(args)
+  async installHook(args = {}) {
+    const workdir = await this.resolveWorkdir(args)
     return {
       message: installHook({ workdir }),
       repository: this.repoSnapshot(workdir)
     }
   }
 
-  refresh(reason = 'manual') {
+  async refresh(reason = 'manual') {
+    await this.ensureCodexSessions()
     for (const id of this.sessions.keys()) {
       try {
-        this.refreshSession(id)
+        await this.refreshSession(id)
       } catch (_) {
         // Keep server status available even when one session cannot resolve.
       }
     }
+    let codexStatus = null
+    try {
+      codexStatus = await this.codexSessions.status()
+    } catch (err) {
+      codexStatus = {
+        error: err && err.message ? err.message : String(err)
+      }
+    }
+    const latestFile = codexStatus && codexStatus.latest_session && codexStatus.latest_session.file
     this.pushEvent(reason)
     this.snapshot = {
       schema: 'agentdoc.server-state.v1',
@@ -324,13 +360,14 @@ class AgentDocServerState {
         } : null
       })),
       watched_repositories: Array.from(this.repoWatchers.keys()),
-      latest_codex_session: scanCodexSessionTail(latestCodexSessionFile(this.codexSessionRoot)),
+      latest_codex_session: latestFile ? scanCodexSessionTail(latestFile) : null,
+      codex_session_server: codexStatus,
       recent_events: this.events
     }
     return this.snapshot
   }
 
-  getSnapshot() {
+  async getSnapshot() {
     return this.snapshot || this.refresh('snapshot')
   }
 }

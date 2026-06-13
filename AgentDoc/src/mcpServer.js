@@ -4,15 +4,85 @@ const { z } = require('zod')
 
 const { AgentDocServerState } = require('./server.js')
 
-const toolResult = result => ({
-  content: [{
-    type: 'text',
-    text: JSON.stringify(result, null, 2)
-  }],
-  structuredContent: {
-    result
+const shorten = (value, max = 88) => {
+  const text = String(value || '')
+  return text.length <= max ? text : `...${text.slice(-(max - 3))}`
+}
+
+const repositorySummary = repo => {
+  if (!repo) return {}
+  return {
+    repo: repo.root,
+    staged: repo.git && repo.git.staged_file_count,
+    docs: repo.docs && repo.docs.section_count,
+    stamp: repo.stamp && repo.stamp.status && repo.stamp.status.status,
+    linked: repo.git && repo.git.is_linked_worktree
   }
-})
+}
+
+const summarizeResult = result => {
+  const schema = result && result.schema || 'agentdoc.result.v1'
+  if (schema === 'agentdoc.server-state.v1') {
+    return {
+      schema,
+      status: 'ok',
+      sessions: Array.isArray(result.sessions) ? result.sessions.length : 0,
+      watched: Array.isArray(result.watched_repositories) ? result.watched_repositories.length : 0
+    }
+  }
+  if (schema === 'agentdoc.start-session.v1') {
+    return {
+      schema,
+      status: 'ok',
+      agentdoc_session_id: result.agentdoc_session_id
+    }
+  }
+  if (schema === 'agentdoc.gate-status.v1') {
+    return {
+      schema,
+      status: result.allowed ? 'allowed' : 'blocked',
+      allowed: result.allowed,
+      reason: result.reason,
+      ...repositorySummary(result.repository)
+    }
+  }
+  return {
+    schema,
+    status: result && result.message && /blocked|required|stale|invalid/i.test(result.message) ? 'blocked' : 'ok',
+    message: result && result.message ? String(result.message).split(/\r?\n/)[0] : undefined,
+    ...repositorySummary(result && result.repository)
+  }
+}
+
+const renderSummary = summary => {
+  const bits = [
+    summary.status === 'blocked' ? 'blocked' : 'ok',
+    summary.allowed === false ? 'allowed=0' : summary.allowed === true ? 'allowed=1' : null,
+    summary.reason ? `reason=${summary.reason}` : null,
+    summary.repo ? `repo=${shorten(summary.repo)}` : null,
+    summary.agentdoc_session_id ? `session=${summary.agentdoc_session_id}` : null,
+    summary.staged !== undefined ? `staged=${summary.staged}` : null,
+    summary.docs !== undefined ? `docs=${summary.docs}` : null,
+    summary.stamp ? `stamp=${summary.stamp}` : null,
+    summary.linked ? 'linked=1' : null,
+    summary.sessions !== undefined ? `sessions=${summary.sessions}` : null,
+    summary.watched !== undefined ? `watched=${summary.watched}` : null
+  ].filter(Boolean)
+  return bits.join(' ')
+}
+
+const toolResult = result => {
+  const summary = summarizeResult(result)
+  return {
+    content: [{
+      type: 'text',
+      text: renderSummary(summary)
+    }],
+    structuredContent: {
+      result: summary
+    }
+  }
+}
 
 const sessionScopedShape = {
   agentdoc_session_id: z.string().optional().describe('AgentDoc session id returned by agentdoc_start_session. Omit only when there is exactly one active AgentDoc session.'),
@@ -24,7 +94,7 @@ const registerTools = (server, state) => {
     title: 'Start AgentDoc Session',
     description: 'Start AgentDoc for this Codex session. Returns a generated id/marker that AgentDoc uses to bind to the recorded Codex session log.',
     inputSchema: {}
-  }, async () => toolResult(state.startAgentDocSession()))
+  }, async () => toolResult(await state.startAgentDocSession()))
 
   server.registerTool('agentdoc_status', {
     title: 'AgentDoc Status',
@@ -33,7 +103,7 @@ const registerTools = (server, state) => {
       refresh: z.boolean().optional().describe('Refresh live state before returning it.')
     }
   }, async args => {
-    const snapshot = args.refresh ? state.refresh('mcp:status') : state.getSnapshot()
+    const snapshot = args.refresh ? await state.refresh('mcp:status') : await state.getSnapshot()
     return toolResult(snapshot)
   })
 
@@ -42,7 +112,7 @@ const registerTools = (server, state) => {
     description: 'Prepare a bounded staged-change documentation review file. This does not stamp the check.',
     inputSchema: sessionScopedShape
   }, async args => {
-    const result = state.prepareReview(args)
+    const result = await state.prepareReview(args)
     return toolResult({
       schema: 'agentdoc.prepare.v1',
       message: result.message,
@@ -62,7 +132,7 @@ const registerTools = (server, state) => {
       ...sessionScopedShape
     }
   }, async args => {
-    const result = state.recordCheck({
+    const result = await state.recordCheck({
       result: args.result,
       reviewed: args.reviewed || [],
       updated: args.updated || [],
@@ -82,14 +152,14 @@ const registerTools = (server, state) => {
     title: 'AgentDoc Gate Status',
     description: 'Check whether the current staged state has a valid AgentDoc stamp without printing hook text.',
     inputSchema: sessionScopedShape
-  }, async args => toolResult(state.gateStatus(args)))
+  }, async args => toolResult(await state.gateStatus(args)))
 
   server.registerTool('agentdoc_direct_status', {
     title: 'AgentDoc Repository Status',
     description: 'Return bounded status for the repository/worktree resolved from the AgentDoc session.',
     inputSchema: sessionScopedShape
   }, async args => {
-    const root = state.resolveWorkdir(args)
+    const root = await state.resolveWorkdir(args)
     return toolResult({
       schema: 'agentdoc.repository-status.v1',
       repository: state.repoSnapshot(root)
@@ -102,7 +172,7 @@ const registerTools = (server, state) => {
     inputSchema: sessionScopedShape
   }, async args => toolResult({
     schema: 'agentdoc.install-hook.v1',
-    ...state.installHook(args)
+    ...(await state.installHook(args))
   }))
 }
 

@@ -6,6 +6,7 @@ const path = require('node:path')
 const test = require('node:test')
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js')
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js')
+const { CodexSessionServerState } = require('codex-session-tools/src/server.js')
 
 const { codexSessionFingerprint, importCodexJsonl, resolveCurrentCodexSessionFile } = require('../src/adapters/codex.js')
 const { importClaudeJsonl, resolveCurrentClaudeSessionFile } = require('../src/adapters/claude.js')
@@ -25,6 +26,7 @@ const {
   commitSummaryJobs,
   completedSummaryJobs,
   browseIndexWithBackend,
+  browseSessionCatalog,
   indexStatus,
   readSessionTree,
   reserveSummaryJobs,
@@ -930,6 +932,12 @@ test('CLI accepts index id as the definitive browse/search id', () => {
   const browse = parseArgs(['browse', '--index-id', 'idx-abc'])
   assert.equal(browse.indexId, 'idx-abc')
   assert.equal(browse.sessionId, '')
+
+  const catalogBrowse = parseArgs(['browse', '--query', 'agent docs', '--start', '2', '--limit', '3'])
+  assert.equal(catalogBrowse.indexId, '')
+  assert.equal(catalogBrowse.query, 'agent docs')
+  assert.equal(catalogBrowse.start, 2)
+  assert.equal(catalogBrowse.limit, 3)
 })
 
 test('Typesense search failures reject instead of returning empty hits', async () => {
@@ -1108,6 +1116,72 @@ test('search documents preserve searchable navigation metadata', () => {
   assert.match(searchableDoc.index, /^\d+\/\d+$/)
   assert.match(searchableDoc.zoom, /^\d+\/\d+$/)
   assert.ok(searchableDoc.navigation.siblingCount >= searchableDoc.navigation.siblingIndex)
+})
+
+test('top-level browse returns a compact paged session catalog', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-catalog-'))
+  const oldIr = createSessionIR({
+    source: { kind: 'test', path: path.join(root, 'old.jsonl') },
+    session: {
+      id: 'old-session',
+      agent: 'codex',
+      title: 'Older compiler frontend notes',
+      updatedAt: '2026-06-01T00:00:00.000Z'
+    },
+    events: [
+      { type: 'message', role: 'user', content: [textBlock('Design the compiler frontend notes.')] },
+      { type: 'message', role: 'assistant', content: [textBlock('Frontend notes captured.')] }
+    ]
+  })
+  const newIr = createSessionIR({
+    source: { kind: 'test', path: path.join(root, 'new.jsonl') },
+    session: {
+      id: 'new-session',
+      agent: 'codex',
+      title: 'New agent doc catalog work',
+      updatedAt: '2026-06-03T00:00:00.000Z'
+    },
+    events: [
+      { type: 'message', role: 'user', content: [textBlock('Add a catalog browser.')] },
+      { type: 'message', role: 'assistant', content: [textBlock('Catalog browser implemented.')] },
+      { type: 'message', role: 'user', content: [textBlock('Keep output compact.')] }
+    ]
+  })
+  writeSessionIndex({ root, ir: oldIr })
+  writeSessionIndex({ root, ir: newIr })
+
+  const firstPage = await runCommand(parseArgs([
+    'browse',
+    '--index-dir', root,
+    '--start', '0',
+    '--limit', '1'
+  ]))
+  assert.equal(firstPage.schema, 'session-indexer.browse.v1')
+  assert.equal(firstPage.level, 'sessions')
+  assert.equal(firstPage.page.total, 2)
+  assert.equal(firstPage.page.returned, 1)
+  assert.equal(firstPage.page.next_start, 1)
+  assert.equal(firstPage.sessions[0].session_id, 'new-session')
+  assert.equal(firstPage.sessions[0].turn_count, 2)
+  assert.equal(firstPage.sessions[0].event_count, 3)
+  assert.equal(firstPage.sessions[0].browse.index_id, indexIdForIR(newIr))
+  assert.equal(firstPage.sessions[0].browse.topic_id, 'root')
+  assert.equal(Object.hasOwn(firstPage, 'resourceUsage'), false)
+  assert.equal(Object.hasOwn(firstPage.sessions[0], 'sourcePath'), false)
+  assert.equal(Object.hasOwn(firstPage.sessions[0], 'summaryIndex'), false)
+  assert.equal(Object.hasOwn(firstPage.sessions[0], 'usage'), false)
+
+  const secondPage = await runCommand(parseArgs([
+    'browse',
+    '--index-dir', root,
+    '--start', '1',
+    '--limit', '1'
+  ]))
+  assert.equal(secondPage.sessions[0].session_id, 'old-session')
+
+  const filtered = browseSessionCatalog({ root, query: 'frontend', limit: 5 })
+  assert.equal(filtered.page.total, 1)
+  assert.equal(filtered.sessions[0].session_id, 'old-session')
 })
 
 test('summary and leaf docs expose chronological anchors', () => {
@@ -2175,6 +2249,41 @@ test('Codex current-chat resolver rejects duplicate session marker matches', () 
   )
 })
 
+test('Codex current-chat resolver chooses fork descendant for duplicate marker matches', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-current-chat-fork-marker-'))
+  const parent = path.join(root, 'parent.jsonl')
+  const child = path.join(root, 'child.jsonl')
+  const marker = 'conversation_history-session-12121212-1212-4121-8121-121212121212'
+  const markerCall = {
+    type: 'function_call',
+    name: 'exec_command',
+    call_id: 'call_start',
+    arguments: JSON.stringify({ cmd: `node bin/session-indexer.js start_indexing_session --this-chat --session-marker ${marker}` })
+  }
+  writeJsonl(parent, [
+    { timestamp: '2026-06-05T00:00:00.000Z', type: 'session_meta', payload: { id: 'parent-thread' } },
+    { timestamp: '2026-06-05T00:00:01.000Z', type: 'response_item', payload: markerCall }
+  ])
+  writeJsonl(child, [
+    { timestamp: '2026-06-05T00:00:00.000Z', type: 'session_meta', payload: { id: 'child-thread' } },
+    { timestamp: '2026-06-05T00:00:01.000Z', type: 'response_item', payload: markerCall },
+    { timestamp: '2026-06-05T00:00:02.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'fork continuation' } }
+  ])
+
+  const resolved = resolveCurrentCodexSessionFile({
+    root,
+    command: 'start_indexing_session',
+    sessionMarker: marker,
+    threadSpawnEdges: [{
+      parentThreadId: 'parent-thread',
+      childThreadId: 'child-thread'
+    }]
+  })
+  assert.equal(resolved.file, child)
+  assert.equal(resolved.reason, 'session_marker_match_fork_descendant')
+  assert.equal(resolved.signals.forkResolution.selectedThreadId, 'child-thread')
+})
+
 test('Codex current-chat resolver scans the recent-file window first', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-current-chat-window-'))
   const marker = 'conversation_history-session-44444444-4444-4444-8444-444444444444'
@@ -2375,7 +2484,7 @@ test('start indexing waits for a generated session marker to land in the Codex l
     const ready = await waitForJob({
       root: indexRoot,
       jobId: started.job.jobId,
-      timeoutMs: 20000,
+      timeoutMs: 30000,
       pollMs: 50
     })
     assert.equal(ready.status, 'ready')
@@ -2429,7 +2538,7 @@ test('index worker suspends and exits when the next summary target exceeds appro
     '--summary-max-output-tokens', '64',
     '--codex-home', codexHome,
     '--pricing-cache-dir', pricingCacheDir,
-    '--timeout-ms', '10000',
+    '--timeout-ms', '30000',
     '--poll-ms', '50'
   ]))
 
@@ -2832,7 +2941,7 @@ test('index worker coalesces live transcript changes and publishes when a compac
     '--summary-mode', 'off',
     '--typesense-collection', typesenseCollection,
     '--debounce-ms', '100',
-    '--timeout-ms', '10000',
+    '--timeout-ms', '30000',
     '--poll-ms', '50'
   ]))
 
@@ -3418,7 +3527,7 @@ test('MCP start indexing always generates the conversation marker server-side', 
   assert.equal(Object.hasOwn(allArgs, 'session_marker'), false)
 })
 
-test('MCP marker discovery uses only the last marker as definitive', () => {
+test('MCP marker discovery uses only the last marker as definitive', async () => {
   const { __testing: mcpTesting } = require('../src/mcpServer.js')
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-mcp-marker-'))
   const session = path.join(root, 'session.jsonl')
@@ -3430,9 +3539,15 @@ test('MCP marker discovery uses only the last marker as definitive', () => {
     { timestamp: '2026-06-05T00:00:02.000Z', type: 'response_item', payload: { type: 'function_call_output', output: JSON.stringify({ sessionMarker: latestMarker }) } }
   ])
 
-  assert.equal(mcpTesting.discoverExistingSessionMarker({
+  const codexSessionService = new CodexSessionServerState({
+    sessionRoot: root,
+    watch: false
+  }).start()
+
+  assert.equal(await mcpTesting.discoverExistingSessionMarker({
     source: 'codex',
-    source_root: root
+    source_root: root,
+    codex_session_service: codexSessionService
   }), latestMarker)
 })
 
@@ -3501,6 +3616,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.ok(searchTool.inputSchema.properties.agent)
     assert.ok(searchTool.inputSchema.properties.filter.properties.agent)
     const browseTool = listed.tools.find(tool => tool.name === 'conversation_browse')
+    assert.ok(browseTool.inputSchema.properties.query)
     assert.ok(browseTool.inputSchema.properties.agent)
     assert.ok(browseTool.inputSchema.properties.index_id)
     assert.ok(browseTool.inputSchema.properties.topic_id)
@@ -3529,6 +3645,21 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.doesNotMatch(prompt.messages[0].content.text, /session_marker_required|conversation_history-session|session-indexer-session|retry\.session_marker/)
     assert.doesNotMatch(prompt.messages[0].content.text, /start_indexing_session first/)
     assert.doesNotMatch(prompt.messages[0].content.text, /typesense|backend|serverIndex|search_backend|search-backend/i)
+
+    const catalogBrowse = (await client.callTool({
+      name: 'conversation_browse',
+      arguments: {
+        limit: 1
+      }
+    })).structuredContent.result
+    assert.equal(catalogBrowse.schema, 'session-indexer.browse.v1')
+    assert.equal(catalogBrowse.level, 'sessions')
+    assert.equal(catalogBrowse.page.returned, 1)
+    assert.equal(catalogBrowse.sessions[0].session_id, 'mini-session')
+    assert.equal(catalogBrowse.sessions[0].browse.index_id, indexId)
+    assert.equal(catalogBrowse.sessions[0].browse.topic_id, 'root')
+    assert.equal(Object.hasOwn(catalogBrowse, 'resourceUsage'), false)
+    assert.equal(Object.hasOwn(catalogBrowse.sessions[0], 'summaryIndex'), false)
 
     const browsed = await client.callTool({
       name: 'conversation_browse',

@@ -5,7 +5,8 @@ const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 
-const { installHook, prepareReview, recordCheck, verifyGate } = require('../src/agentdoc.js')
+const { CodexSessionServerState } = require('codex-session-tools/src/server.js')
+const { gitPrivatePath, installHook, prepareReview, recordCheck, verifyGate } = require('../src/agentdoc.js')
 const { AgentDocServerState, scanCodexSessionTail } = require('../src/server.js')
 
 const git = (cwd, args) => childProcess.execFileSync('git', args, {
@@ -61,6 +62,54 @@ test('check stamps the exact staged fingerprint and gate rejects later staged ch
     git(root, ['add', 'src/parser.js'])
     assert.throws(() => verifyGate({ workdir: root }), /AgentDoc stale: staged fingerprint changed/)
   } finally {
+    cleanup(root)
+  }
+})
+
+test('checks and stamps are scoped to linked git worktrees', () => {
+  const root = makeRepo()
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), 'agentdoc-worktree-'))
+  try {
+    write(root, 'Math.md', '# Math\n\n- [Calculator](Math.doc/calculator.md)\n')
+    write(root, 'Math.doc/calculator.md', `---
+id: math.calculator
+title: Calculator
+scope:
+  paths:
+    - src/calc.js
+---
+
+# Calculator
+
+Calculator behavior.
+`)
+    write(root, 'src/calc.js', 'module.exports = 1\n')
+    git(root, ['add', 'Math.md', 'Math.doc/calculator.md', 'src/calc.js'])
+    git(root, ['commit', '-m', 'docs and source'])
+    fs.rmSync(worktree, { recursive: true, force: true })
+    git(root, ['worktree', 'add', '-b', `agentdoc-worktree-${process.pid}`, worktree])
+
+    write(worktree, 'src/calc.js', 'module.exports = 2\n')
+    git(worktree, ['add', 'src/calc.js'])
+    recordCheck({
+      workdir: worktree,
+      result: 'docs-current',
+      reviewed: ['Math.doc/calculator.md']
+    })
+
+    const worktreeStamp = gitPrivatePath(worktree, 'agentdoc/last-check.json')
+    const mainStamp = gitPrivatePath(root, 'agentdoc/last-check.json')
+    assert.notEqual(worktreeStamp, mainStamp)
+    assert.match(worktreeStamp, /[\\/]worktrees[\\/]/)
+    assert.equal(fs.existsSync(worktreeStamp), true)
+    assert.equal(fs.existsSync(mainStamp), false)
+    assert.equal(verifyGate({ workdir: worktree }), null)
+  } finally {
+    try {
+      git(root, ['worktree', 'remove', worktree, '--force'])
+    } catch (_) {
+      fs.rmSync(worktree, { recursive: true, force: true })
+    }
     cleanup(root)
   }
 })
@@ -127,7 +176,7 @@ test('install-hook writes a pre-commit gate script', async () => {
   }
 })
 
-test('server binds AgentDoc session marker to Codex session and resolved repo', () => {
+test('server binds AgentDoc session marker to Codex session and resolved repo', async () => {
   const root = makeRepo()
   const codexRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agentdoc-codex-sessions-'))
   const realRoot = fs.realpathSync(root)
@@ -148,9 +197,13 @@ scope:
 
     const state = new AgentDocServerState({
       watch: false,
-      codexSessionRoot: codexRoot
+      codexSessionRoot: codexRoot,
+      codexSessions: new CodexSessionServerState({
+        sessionRoot: codexRoot,
+        watch: false
+      })
     })
-    const started = state.startAgentDocSession()
+    const started = await state.startAgentDocSession()
     const sessionFile = path.join(codexRoot, '2026', '06', '13', 'rollout-agentdoc.jsonl')
     fs.mkdirSync(path.dirname(sessionFile), { recursive: true })
     fs.writeFileSync(sessionFile, [
@@ -160,6 +213,7 @@ scope:
       JSON.stringify({ type: 'response_item', payload: { type: 'function_call', name: 'agentdoc_prepare_review', arguments: '{}' } }),
       ''
     ].join('\n'))
+    state.codexSessions.refresh('test')
 
     const scanned = scanCodexSessionTail(sessionFile)
     assert.equal(scanned.codex_session_id, 'codex-session-1')
@@ -167,16 +221,16 @@ scope:
     assert.equal(scanned.agentdoc_events.length, 1)
     assert.equal(scanned.agentdoc_events[0].kind, 'prepare-review')
 
-    const review = state.prepareReview({ agentdoc_session_id: started.agentdoc_session_id })
+    const review = await state.prepareReview({ agentdoc_session_id: started.agentdoc_session_id })
     assert.equal(fs.realpathSync(review.repository.root), realRoot)
-    const checked = state.recordCheck({
+    const checked = await state.recordCheck({
       agentdoc_session_id: started.agentdoc_session_id,
       result: 'docs-current',
       reviewed: ['AgentDoc.doc/workflow.md']
     })
     assert.equal(checked.repository.stamp.status.matches_staged, true)
 
-    const snapshot = state.refresh('test')
+    const snapshot = await state.refresh('test')
     assert.equal(snapshot.sessions.length, 1)
     assert.equal(snapshot.sessions[0].codex_session.codex_session_id, 'codex-session-1')
     assert.equal(fs.realpathSync(snapshot.sessions[0].codex_session.current_repository.root), realRoot)

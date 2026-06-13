@@ -1,11 +1,11 @@
 {
-  "name": "codex-session-tools",
+  "name": "worktree-tools",
   "version": "0.1.0",
   "private": true,
   "type": "commonjs",
   "main": "src/index.js",
   "bin": {
-    "codex-session-server": "bin/codex-session-server.js"
+    "worktree-server": "bin/worktree-server.js"
   },
   "scripts": {
     "test": "node --test test/*.test.js",

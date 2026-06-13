@@ -26,6 +26,7 @@ const {
   DEFAULT_SEARCH_BACKEND,
   DEFAULT_SUMMARY_MODE,
   browseIndexWithBackend,
+  browseSessionCatalog,
   completedSummaryJobs,
   indexStatus,
   readManifest,
@@ -63,6 +64,7 @@ Usage:
   session-indexer inspect --source codex|claude [--this-chat --session-marker id|--latest|--session path]
   session-indexer index --source codex|claude [--this-chat --session-marker id|--latest|--all|--session path]
   session-indexer search [--query text] [--topic text] [--filter json] [--session-id id] [--index-id id] [--within handle] [--start-at 0] [--limit 10]
+  session-indexer browse [--query text] [--agent name] [--start 0|--start-at 0] [--limit 20]
   session-indexer browse --index-id id [--session-id filter] [--topic-id id] [--zoom children|in|out|siblings] [--start 0] [--limit 20]
   session-indexer openLink --link tool:conversation_history://open?indexId=...&handle=...
   session-indexer index_status --start-at n --limit n [--session-id id]
@@ -402,7 +404,6 @@ const parseArgs = argv => {
   if (opts.command === 'search' && !opts.query && !opts.topic && !opts.agent && !opts.indexId && !opts.sessionId && !opts.filter && !opts.messageId && !opts.inReplyToMessageId && !opts.toolCallId && !opts.role && opts.mip === undefined && !opts.mipLevel) {
     throw new Error('search requires --query, --topic, or a filter')
   }
-  if (opts.command === 'browse' && !opts.indexId && !opts.sessionId) throw new Error('browse requires --index-id')
   if (opts.command === 'openLink' && !opts.link) throw new Error('openLink requires --link')
   if (['get_pricing', 'getPricing', 'get_cost', 'getCost'].includes(opts.command) && !opts.modelId) throw new Error(`${opts.command} requires --model-id`)
   if (['get_cost', 'getCost'].includes(opts.command) && !opts.usage && !opts.usageFile && !opts.sessionId) {
@@ -589,6 +590,19 @@ const search = async opts => {
 }
 
 const browse = async opts => {
+  if (!opts.indexId && !opts.sessionId) {
+    return {
+      schema: 'session-indexer.browse.v1',
+      ...browseSessionCatalog({
+        root: opts.indexDir,
+        agent: opts.agent || undefined,
+        query: opts.query || undefined,
+        start: opts.startSet ? opts.start : undefined,
+        startAt: opts.startAt,
+        limit: opts.limit
+      })
+    }
+  }
   const browsed = await browseIndexWithBackend({
     indexId: opts.indexId || undefined,
     sessionId: opts.sessionId,

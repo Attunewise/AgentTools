@@ -8,8 +8,8 @@ const {
   USAGE_FIELDS
 } = require('../ir.js')
 const {
-  fileContainsLiteral,
   latestCodexSessionFile: latestCodexSessionFileFromTools,
+  resolveCodexSessionForMarker,
   walkJsonlFiles: walkCodexJsonlFiles
 } = require('codex-session-tools')
 const {
@@ -101,53 +101,10 @@ const codexSessionFingerprint = file => {
 
 const latestCodexSessionFile = (root = DEFAULT_SESSIONS_ROOT) => latestCodexSessionFileFromTools(root)
 
-const codexSessionFileItems = (root = DEFAULT_SESSIONS_ROOT) => walkCodexJsonlFiles(root)
-
-const sessionMarkerScanLimit = opts => {
-  const value = opts.sessionMarkerScanLimit === undefined
-    ? process.env.SESSION_INDEXER_SESSION_MARKER_SCAN_LIMIT || DEFAULT_SESSION_MARKER_SCAN_LIMIT
-    : opts.sessionMarkerScanLimit
-  const text = String(value || '').trim().toLowerCase()
-  if (!text || text === 'all' || text === 'off' || text === 'none') return Infinity
-  const number = Number(text)
-  return Number.isFinite(number) && number > 0 ? Math.floor(number) : DEFAULT_SESSION_MARKER_SCAN_LIMIT
-}
-
-const recentSessionFileItems = (items, opts = {}) => {
-  const sorted = [...(items || [])].sort((a, b) =>
-    b.mtimeMs - a.mtimeMs ||
-    b.size - a.size ||
-    a.file.localeCompare(b.file)
-  )
-  const limit = sessionMarkerScanLimit(opts)
-  return Number.isFinite(limit) ? sorted.slice(0, limit) : sorted
-}
-
 const normalizeSessionMarker = value => {
   const marker = String(value || '').trim()
   if (!marker) return ''
   return marker.startsWith(SESSION_MARKER_PREFIX) || marker.startsWith(LEGACY_SESSION_MARKER_PREFIX) ? marker : ''
-}
-
-const scoreSessionMarkerFile = (item, marker, opts = {}) => {
-  const match = fileContainsLiteral({
-    file: item.file,
-    literal: marker,
-    tailBytes: opts.sessionMarkerScanBytes || DEFAULT_SESSION_MARKER_SCAN_BYTES
-  })
-  if (!match) return null
-  return {
-    file: item.file,
-    mtimeMs: item.mtimeMs,
-    size: item.size,
-    signals: {
-      sessionMarkerMatch: {
-        marker,
-        byteOffset: match.byteOffset,
-        scan: match.scan
-      }
-    }
-  }
 }
 
 const rowPayload = row => row && !row.parseError && row.json && row.json.payload ? row.json.payload : {}
@@ -155,22 +112,18 @@ const rowPayload = row => row && !row.parseError && row.json && row.json.payload
 const resolveCurrentCodexSessionFile = (opts = {}) => {
   const sessionMarker = normalizeSessionMarker(opts.sessionMarker)
   if (!sessionMarker) return null
-  const markerCandidates = recentSessionFileItems(codexSessionFileItems(opts.root || DEFAULT_SESSIONS_ROOT), opts)
-    .map(item => scoreSessionMarkerFile(item, sessionMarker, opts))
-    .filter(Boolean)
-  if (!markerCandidates.length) return null
-  markerCandidates.sort((a, b) => a.file.localeCompare(b.file))
-  if (markerCandidates.length > 1) {
-    const err = new Error(`session marker matched multiple Codex session files: ${markerCandidates.map(item => item.file).join(', ')}`)
-    err.code = 'AMBIGUOUS_SESSION_MARKER'
-    err.candidates = markerCandidates
-    throw err
-  }
-  const selected = markerCandidates[0]
+  const selected = resolveCodexSessionForMarker(opts.root || DEFAULT_SESSIONS_ROOT, sessionMarker, {
+    ...opts,
+    sessionMarkerScanBytes: opts.sessionMarkerScanBytes || DEFAULT_SESSION_MARKER_SCAN_BYTES,
+    sessionMarkerScanLimit: opts.sessionMarkerScanLimit === undefined
+      ? process.env.SESSION_INDEXER_SESSION_MARKER_SCAN_LIMIT || DEFAULT_SESSION_MARKER_SCAN_LIMIT
+      : opts.sessionMarkerScanLimit
+  })
+  if (!selected) return null
   return {
     ...selected,
-    reason: 'session_marker_match',
-    candidates: markerCandidates.slice(0, opts.includeCandidates ? opts.limit || 10 : 0)
+    mtimeMs: selected.mtimeMs || selected.mtime_ms,
+    candidates: selected.candidates || []
   }
 }
 

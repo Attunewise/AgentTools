@@ -1,82 +1,46 @@
-const childProcess = require('node:child_process')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
+const {
+  currentHead,
+  gitPath: worktreeGitPath,
+  resolveWorktree,
+  stagedFingerprint: worktreeStagedFingerprint,
+  stagedNameStatus: worktreeStagedNameStatus
+} = require('worktree-tools')
 
 const TOOL_VERSION = '0.1.0'
 const ALLOW_RESULTS = new Set(['docs-current', 'docs-updated'])
 const FINAL_RESULTS = new Set([...ALLOW_RESULTS, 'needs-doc-update', 'blocked'])
 
-const runGit = (args, cwd, options = {}) => {
-  try {
-    return childProcess.execFileSync('git', args, {
-      cwd,
-      encoding: options.encoding || 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe']
-    })
-  } catch (err) {
-    const stderr = err.stderr ? String(err.stderr).trim() : ''
-    throw new Error(stderr || `git ${args.join(' ')} failed`)
-  }
-}
-
-const sha256 = value => crypto.createHash('sha256').update(value).digest('hex')
-
 const repo = cwd => {
-  const start = cwd || process.cwd()
-  const root = runGit(['rev-parse', '--show-toplevel'], start).trim()
-  const gitDir = runGit(['rev-parse', '--git-dir'], root).trim()
+  const resolved = resolveWorktree(cwd || process.cwd())
   return {
-    root,
-    gitDir: path.isAbsolute(gitDir) ? gitDir : path.join(root, gitDir)
+    root: resolved.root,
+    gitDir: resolved.git_dir,
+    commonGitDir: resolved.common_git_dir,
+    isLinkedWorktree: resolved.is_linked_worktree
   }
 }
 
-const gitPrivatePath = (root, rel) => {
-  const gitPath = runGit(['rev-parse', '--git-path', rel], root).trim()
-  return path.isAbsolute(gitPath) ? gitPath : path.join(root, gitPath)
-}
-
-const currentHead = root => {
-  try {
-    return runGit(['rev-parse', '--verify', 'HEAD'], root).trim()
-  } catch (_) {
-    return '0000000000000000000000000000000000000000'
-  }
-}
-
-const stagedDiff = root => runGit(['diff', '--cached', '--binary', '--full-index', '--no-ext-diff'], root)
+const gitPrivatePath = (root, rel) => worktreeGitPath(root, rel)
 
 const stagedNameStatus = root => {
-  const text = runGit(['diff', '--cached', '--name-status', '-z', '--no-ext-diff'], root)
-  const parts = text.split('\0').filter(Boolean)
-  const rows = []
-  for (let i = 0; i < parts.length; i++) {
-    const status = parts[i]
-    if (/^[RC]\d+/.test(status)) {
-      rows.push({ status, path: normalizePath(parts[i + 2]), oldPath: normalizePath(parts[i + 1]) })
-      i += 2
-    } else {
-      rows.push({ status, path: normalizePath(parts[i + 1]) })
-      i += 1
-    }
-  }
-  return rows
+  return worktreeStagedNameStatus(root).map(row => ({
+    status: row.status,
+    path: row.path,
+    oldPath: row.old_path
+  }))
 }
 
 const stagedFingerprint = root => {
-  const diff = stagedDiff(root)
-  const head = currentHead(root)
+  const staged = worktreeStagedFingerprint(root)
   return {
     schema: 'agentdoc.staged-fingerprint.v1',
-    git_head: head,
-    staged_change_fingerprint: `sha256:${sha256(JSON.stringify({
-      schema: 'agentdoc.staged-fingerprint.v1',
-      git_head: head,
-      diff
-    }))}`,
-    staged_diff_bytes: Buffer.byteLength(diff),
-    staged_file_count: stagedNameStatus(root).length
+    git_head: staged.git_head,
+    staged_change_fingerprint: staged.staged_change_fingerprint,
+    staged_diff_bytes: staged.staged_diff_bytes,
+    staged_file_count: staged.staged_file_count
   }
 }
 
@@ -371,6 +335,7 @@ module.exports = {
   docFingerprint,
   discoverDocs,
   getStatus,
+  gitPrivatePath,
   installHook,
   prepareReview,
   recordCheck,

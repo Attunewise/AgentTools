@@ -1,12 +1,33 @@
 const fs = require('node:fs')
+const childProcess = require('node:child_process')
 const os = require('node:os')
 const path = require('node:path')
+const {
+  buildCodexExecArgs,
+  parseJsonl,
+  runCodexExec
+} = require('./exec.js')
+const { CodexAppServerClient } = require('./appServerClient.js')
+const { DiagnosticsStore } = require('./diagnostics.js')
+const {
+  renderForTool,
+  toolResult
+} = require('./render.js')
+const {
+  compactError,
+  reconcileThreadRecord
+} = require('./reconcile.js')
 
 const DEFAULT_SESSION_SCAN_LIMIT = 100
 const DEFAULT_WINDOW_BYTES = 8 * 1024 * 1024
 const DEFAULT_PREVIEW_CHARS = 240
 
 const defaultCodexSessionRoot = () => path.join(os.homedir(), '.codex', 'sessions')
+
+const codexHomeForSessionsRoot = root => {
+  const resolved = path.resolve(root || defaultCodexSessionRoot())
+  return path.basename(resolved) === 'sessions' ? path.dirname(resolved) : path.join(os.homedir(), '.codex')
+}
 
 const walkJsonlFiles = root => {
   const files = []
@@ -144,6 +165,71 @@ const parseToolArguments = payload => {
   return args && typeof args === 'object' ? args : null
 }
 
+const fallbackSessionIdFromFile = file => {
+  const match = path.basename(file).match(/([0-9a-f]{8}-[0-9a-f-]{27,})/)
+  return match ? match[1] : file
+}
+
+const codexSessionIdFromFile = file => {
+  const window = readFileWindow(file, DEFAULT_WINDOW_BYTES)
+  if (!window) return fallbackSessionIdFromFile(file)
+  for (const line of window.text.split(/\r?\n/)) {
+    if (!line || !line.includes('"session_meta"')) continue
+    const parsed = parseJsonLine(line)
+    if (parsed && parsed.type === 'session_meta' && parsed.payload && parsed.payload.id) return parsed.payload.id
+  }
+  return fallbackSessionIdFromFile(file)
+}
+
+const codexStateDbFiles = codexHome => {
+  try {
+    return fs.readdirSync(codexHome)
+      .filter(name => /^state_.*\.sqlite$/.test(name))
+      .map(name => {
+        const file = path.join(codexHome, name)
+        try {
+          const stat = fs.statSync(file)
+          return { file, mtimeMs: stat.mtimeMs }
+        } catch (_) {
+          return null
+        }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs || a.file.localeCompare(b.file))
+      .map(item => item.file)
+  } catch (_) {
+    return []
+  }
+}
+
+const readCodexThreadSpawnEdges = (options = {}) => {
+  if (Array.isArray(options.threadSpawnEdges)) return options.threadSpawnEdges
+  const codexHome = options.codexHome || codexHomeForSessionsRoot(options.root || defaultCodexSessionRoot())
+  const files = options.stateDb ? [options.stateDb] : codexStateDbFiles(codexHome)
+  for (const file of files) {
+    try {
+      const text = childProcess.execFileSync('sqlite3', [
+        '-separator', '\t',
+        file,
+        'SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges'
+      ], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore']
+      })
+      return text.split(/\r?\n/)
+        .map(line => line.split('\t'))
+        .filter(parts => parts.length >= 2 && parts[0] && parts[1])
+        .map(parts => ({
+          parentThreadId: parts[0],
+          childThreadId: parts[1]
+        }))
+    } catch (_) {
+      // CLI-only installs and older Codex state databases may not expose fork edges.
+    }
+  }
+  return []
+}
+
 const addPathEvent = (events, value, source, line) => {
   if (!value || typeof value !== 'string') return
   events.push({
@@ -240,15 +326,144 @@ const findCodexSessionsContainingMarker = (root, marker, options = {}) => {
   return matches.sort((a, b) => b.mtime_ms - a.mtime_ms || b.size - a.size || a.file.localeCompare(b.file))
 }
 
+const sessionMarkerScanLimit = options => {
+  const value = options.sessionMarkerScanLimit === undefined
+    ? options.limit || DEFAULT_SESSION_SCAN_LIMIT
+    : options.sessionMarkerScanLimit
+  const text = String(value || '').trim().toLowerCase()
+  if (!text || text === 'all' || text === 'off' || text === 'none') return Infinity
+  const number = Number(text)
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : DEFAULT_SESSION_SCAN_LIMIT
+}
+
+const recentSessionFileItems = (items, options = {}) => {
+  const sorted = [...(items || [])].sort((a, b) =>
+    b.mtimeMs - a.mtimeMs ||
+    b.size - a.size ||
+    a.file.localeCompare(b.file)
+  )
+  const limit = sessionMarkerScanLimit(options)
+  return Number.isFinite(limit) ? sorted.slice(0, limit) : sorted
+}
+
+const scoreCodexSessionMarkerFile = (item, marker, options = {}) => {
+  const match = fileContainsLiteral({
+    file: item.file,
+    literal: marker,
+    tailBytes: options.sessionMarkerScanBytes || options.maxBytes || DEFAULT_WINDOW_BYTES
+  })
+  if (!match) return null
+  return {
+    file: item.file,
+    sessionId: codexSessionIdFromFile(item.file),
+    mtimeMs: item.mtimeMs,
+    size: item.size,
+    signals: {
+      sessionMarkerMatch: {
+        marker,
+        byteOffset: match.byteOffset,
+        scan: match.scan
+      }
+    }
+  }
+}
+
+const resolveForkedMarkerCandidate = (candidates, options = {}) => {
+  const candidateIds = new Set(candidates.map(item => item.sessionId || item.codex_session_id).filter(Boolean))
+  if (candidateIds.size < 2) return null
+  const edges = readCodexThreadSpawnEdges(options)
+    .filter(edge => candidateIds.has(edge.parentThreadId) && candidateIds.has(edge.childThreadId))
+  if (!edges.length) return null
+
+  const parentIds = new Set(edges.map(edge => edge.parentThreadId))
+  const leaves = candidates.filter(item => {
+    const id = item.sessionId || item.codex_session_id
+    return id && !parentIds.has(id)
+  })
+  if (leaves.length !== 1) return null
+
+  const selected = leaves[0]
+  return {
+    ...selected,
+    signals: {
+      ...(selected.signals || {}),
+      forkResolution: {
+        selectedThreadId: selected.sessionId || selected.codex_session_id,
+        candidateThreadIds: Array.from(candidateIds).sort(),
+        edgesConsidered: edges.length
+      }
+    }
+  }
+}
+
+const resolveCodexSessionForMarker = (root, marker, options = {}) => {
+  const sessionRoot = root || defaultCodexSessionRoot()
+  const sessionFiles = Array.isArray(options.sessionFiles) ? options.sessionFiles : walkJsonlFiles(sessionRoot)
+  const candidates = recentSessionFileItems(sessionFiles, options)
+    .map(item => scoreCodexSessionMarkerFile(item, marker, options))
+    .filter(Boolean)
+  if (!candidates.length) return null
+  candidates.sort((a, b) => a.file.localeCompare(b.file))
+  let selected = null
+  let reason = 'session_marker_match'
+  if (candidates.length === 1) {
+    selected = candidates[0]
+  } else {
+    const fork = resolveForkedMarkerCandidate(candidates, {
+      ...options,
+      root: sessionRoot
+    })
+    if (!fork) {
+      const err = new Error(`session marker matched multiple Codex session files: ${candidates.map(item => item.file).join(', ')}`)
+      err.code = 'AMBIGUOUS_SESSION_MARKER'
+      err.candidates = candidates
+      throw err
+    }
+    selected = fork
+    reason = 'session_marker_match_fork_descendant'
+  }
+
+  const analyzed = analyzeCodexSessionFile(selected.file, {
+    ...options,
+    marker: null,
+    maxBytes: options.maxBytes || DEFAULT_WINDOW_BYTES
+  }) || {}
+  return {
+    ...analyzed,
+    ...selected,
+    codex_session_id: analyzed.codex_session_id || selected.sessionId,
+    reason,
+    candidates: options.includeCandidates ? candidates : []
+  }
+}
+
 module.exports = {
   DEFAULT_SESSION_SCAN_LIMIT,
   DEFAULT_WINDOW_BYTES,
   analyzeCodexSessionFile,
+  CodexAppServerClient,
+  codexHomeForSessionsRoot,
+  codexSessionIdFromFile,
+  codexStateDbFiles,
+  compactError,
   defaultCodexSessionRoot,
+  DiagnosticsStore,
   findCodexSessionsContainingMarker,
   fileContainsLiteral,
   latestCodexSessionFile,
+  buildCodexExecArgs,
   parseToolArguments,
+  parseJsonl,
+  readCodexThreadSpawnEdges,
   readFileWindow,
+  recentSessionFileItems,
+  reconcileThreadRecord,
+  renderForTool,
+  resolveCodexSessionForMarker,
+  resolveForkedMarkerCandidate,
+  runCodexExec,
+  scoreCodexSessionMarkerFile,
+  sessionMarkerScanLimit,
+  toolResult,
   walkJsonlFiles
 }

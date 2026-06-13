@@ -87,7 +87,7 @@ Search uses the existing conversation_history index. There is no fallback search
 
 `search` and `browse` never summarize or import source sessions on demand. For normal retrieval questions, search the existing index first. Use `start_indexing_session` only when the user explicitly asks to index, refresh, or watch a session, or after permission when the needed index is absent; it starts a watcher running in the background indexing new turns as they occur, so that upon compaction the user and model do not experience reindexing latency.
 
-When resolving the current session, use `--this-chat --session-marker conversation_history-session-{guid}`. The resolver searches source session files for that literal marker, refuses to choose a session from recency alone, and fails if the marker appears in more than one file.
+When resolving the current session, use `--this-chat --session-marker conversation_history-session-{guid}`. The resolver searches source session files for that literal marker and refuses to choose a session from recency alone. If the marker appears in multiple Codex files because a session was forked, CodexSessionTools uses Codex's thread spawn graph to choose the descendant thread when there is exactly one leaf candidate; otherwise duplicate marker matches still fail closed.
 
 The indexer is makefile-like. Compacted spans are logged internally as summary targets keyed by their source content and summary options. Completed targets are reused on later passes, active targets are claimed in a shared per-session target store, and `indexStatus` reports compact operational state, target counts, active/stale claims, and summarized-token counts without starting work.
 
