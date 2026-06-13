@@ -1,6 +1,6 @@
 # AgentDoc
 
-AgentDoc is a small gate for responsible agent-maintained documentation.
+AgentDoc is a small gate for responsible agent-maintained documentation. Large .md files bloat the models context and cost the user tokens, meanwhile compaction causes the model to forget about documentation and let it rot. We organize docs in incremental sections that an agent can ingest without regret and check on git operations that the agent has paid attention to keeping them up to date.
 
 The git hook does not check docs. It only rejects an operation unless the AgentDoc MCP server has already recorded that the agent checked the exact staged change set.
 
