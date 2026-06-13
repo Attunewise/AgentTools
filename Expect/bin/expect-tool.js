@@ -19,6 +19,8 @@ Options:
   --shell file            Shell executable. Defaults to SHELL or /bin/bash.
   --no-login              Do not pass -l to the shell on Unix.
   --keep-open             Do not kill the process after the script finishes.
+  --log-file file         Write the full raw PTY transcript to this file.
+  --log-append            Append to --log-file instead of replacing it.
   --max-output-chars n    Truncate returned transcript buffers. Defaults to 20000.
   --json file             Read run options from a JSON file. Use - for stdin.
 `.trim()
@@ -51,6 +53,8 @@ const parseArgs = argv => {
     else if (arg === '--shell') opts.shell = next()
     else if (arg === '--no-login') opts.login = false
     else if (arg === '--keep-open') opts.kill_on_finish = false
+    else if (arg === '--log-file') opts.log_path = path.resolve(next())
+    else if (arg === '--log-append') opts.log_append = true
     else if (arg === '--max-output-chars') opts.max_output_chars = Number(next())
     else if (arg === '--json') opts.json = next()
     else throw new Error(`unknown argument: ${arg}`)

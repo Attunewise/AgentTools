@@ -15,6 +15,8 @@ Run scripts from this skill directory:
 node bin/expect-tool.js run --cmd 'command here' --script-file /tmp/script.expect --workdir /path/to/project
 ```
 
+Use `--log-file /path/to/transcript.log` when the full raw PTY transcript should be saved without returning it through the model context. Programmatic callers can pass `log_path`.
+
 For small scripts, `--script` is fine:
 
 ```bash

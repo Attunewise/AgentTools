@@ -8,13 +8,16 @@ const {
   USAGE_FIELDS
 } = require('../ir.js')
 const {
+  fileContainsLiteral,
+  latestCodexSessionFile: latestCodexSessionFileFromTools,
+  walkJsonlFiles: walkCodexJsonlFiles
+} = require('codex-session-tools')
+const {
   hashString,
   preview,
   readJsonlRows,
   readLines,
-  stableStringify,
-  walkFiles,
-  newestFile
+  stableStringify
 } = require('../util.js')
 
 const DEFAULT_SESSIONS_ROOT = path.join(os.homedir(), '.codex', 'sessions')
@@ -48,7 +51,7 @@ const readSessionNames = file => {
   return names
 }
 
-const codexSessionFiles = (root = DEFAULT_SESSIONS_ROOT) => walkFiles(root, file => file.endsWith('.jsonl'))
+const codexSessionFiles = (root = DEFAULT_SESSIONS_ROOT) => walkCodexJsonlFiles(root).map(item => item.file)
 
 const fallbackSessionIdFromFile = file => {
   const match = path.basename(file).match(/([0-9a-f]{8}-[0-9a-f-]{27,})/)
@@ -96,21 +99,9 @@ const codexSessionFingerprint = file => {
   return fingerprintFromCompactions({ sessionId, compactions })
 }
 
-const latestCodexSessionFile = (root = DEFAULT_SESSIONS_ROOT) => {
-  const latest = newestFile(codexSessionFiles(root))
-  return latest && latest.file
-}
+const latestCodexSessionFile = (root = DEFAULT_SESSIONS_ROOT) => latestCodexSessionFileFromTools(root)
 
-const codexSessionFileItems = (root = DEFAULT_SESSIONS_ROOT) => codexSessionFiles(root)
-  .map(file => {
-    try {
-      const stat = fs.statSync(file)
-      return { file, mtimeMs: stat.mtimeMs, size: stat.size }
-    } catch (_err) {
-      return null
-    }
-  })
-  .filter(Boolean)
+const codexSessionFileItems = (root = DEFAULT_SESSIONS_ROOT) => walkCodexJsonlFiles(root)
 
 const sessionMarkerScanLimit = opts => {
   const value = opts.sessionMarkerScanLimit === undefined
@@ -136,54 +127,6 @@ const normalizeSessionMarker = value => {
   const marker = String(value || '').trim()
   if (!marker) return ''
   return marker.startsWith(SESSION_MARKER_PREFIX) || marker.startsWith(LEGACY_SESSION_MARKER_PREFIX) ? marker : ''
-}
-
-const fileContainsLiteral = ({ file, literal, tailBytes = DEFAULT_SESSION_MARKER_SCAN_BYTES }) => {
-  const needle = Buffer.from(String(literal || ''))
-  if (!needle.length) return null
-  const fd = fs.openSync(file, 'r')
-  try {
-    const stat = fs.fstatSync(fd)
-    const readRegion = ({ start, end, scan }) => {
-      const length = Math.max(0, end - start)
-      if (!length) return null
-      const buffer = Buffer.allocUnsafe(length)
-      fs.readSync(fd, buffer, 0, length, start)
-      const index = buffer.indexOf(needle)
-      return index >= 0
-        ? {
-            byteOffset: start + index,
-            scan
-          }
-        : null
-    }
-    const tailStart = Math.max(0, stat.size - tailBytes - Math.max(0, needle.length - 1))
-    const tailMatch = readRegion({ start: tailStart, end: stat.size, scan: 'tail' })
-    if (tailMatch) return tailMatch
-    if (tailStart <= 0) return null
-
-    const chunkSize = 1024 * 1024
-    let position = 0
-    let carry = Buffer.alloc(0)
-    while (position < tailStart) {
-      const readSize = Math.min(chunkSize, tailStart - position)
-      const chunk = Buffer.allocUnsafe(readSize)
-      fs.readSync(fd, chunk, 0, readSize, position)
-      const combined = carry.length ? Buffer.concat([carry, chunk]) : chunk
-      const index = combined.indexOf(needle)
-      if (index >= 0) {
-        return {
-          byteOffset: position - carry.length + index,
-          scan: 'full'
-        }
-      }
-      carry = combined.slice(-Math.max(0, needle.length - 1))
-      position += readSize
-    }
-    return null
-  } finally {
-    fs.closeSync(fd)
-  }
 }
 
 const scoreSessionMarkerFile = (item, marker, opts = {}) => {

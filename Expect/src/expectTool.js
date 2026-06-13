@@ -1,4 +1,5 @@
 const path = require('path')
+const fs = require('fs')
 const { HybridExpectStream, runExpectScript } = require('./hybridExpect.js')
 
 let ptyModule = null
@@ -39,7 +40,9 @@ class ExpectTool {
     cols = 80,
     rows = 24,
     login = true,
-    shell: shellOverride
+    shell: shellOverride,
+    log_path,
+    log_append = false
   } = {}) {
     if (!cmd) throw new Error('cmd is required')
 
@@ -61,25 +64,49 @@ class ExpectTool {
       write: text => child.write(text),
       kill: () => child.kill()
     })
+    const resolvedLogPath = log_path ? path.resolve(log_path) : null
+    let logStream = null
+    if (resolvedLogPath) {
+      fs.mkdirSync(path.dirname(resolvedLogPath), { recursive: true })
+      logStream = fs.createWriteStream(resolvedLogPath, {
+        flags: log_append ? 'a' : 'w'
+      })
+    }
     const session = {
       id: this.nextSessionId++,
       cmd,
       child,
       stream,
+      logPath: resolvedLogPath,
+      logStream,
+      logClosed: Promise.resolve(),
       exited: false,
       exitCode: null
     }
-    child.onData(data => stream.append(data))
+    const closeLog = () => {
+      if (!session.logStream) return session.logClosed
+      const streamToClose = session.logStream
+      session.logStream = null
+      session.logClosed = new Promise(resolve => streamToClose.end(resolve))
+      return session.logClosed
+    }
+    child.onData(data => {
+      if (session.logStream) session.logStream.write(String(data))
+      stream.append(data)
+    })
     child.onExit(({ exitCode }) => {
       session.exited = true
       session.exitCode = exitCode
+      closeLog()
       stream.end()
     })
+    session.closeLog = closeLog
     this.sessions.set(session.id, session)
 
     return {
       session_id: session.id,
-      process_running: true
+      process_running: true,
+      log_path: session.logPath || undefined
     }
   }
 
@@ -106,7 +133,8 @@ class ExpectTool {
       transcript: this.truncate(result.transcript, max_output_chars),
       remainingBuffer: this.truncate(result.remainingBuffer, max_output_chars),
       process_exited: session.exited,
-      process_exit_code: session.exitCode
+      process_exit_code: session.exitCode,
+      log_path: session.logPath || undefined
     }
   }
 
@@ -119,6 +147,7 @@ class ExpectTool {
     } catch (_err) {
       // node-pty kill can throw after process exit.
     }
+    await session.closeLog()
     this.sessions.delete(session_id)
     return { closed: true }
   }
@@ -131,10 +160,12 @@ class ExpectTool {
     rows = 24,
     login = true,
     shell,
+    log_path,
+    log_append = false,
     kill_on_finish = true,
     max_output_chars = 20000
   } = {}, context = {}) {
-    const spawned = await this.spawn({ cmd, workdir, cols, rows, login, shell })
+    const spawned = await this.spawn({ cmd, workdir, cols, rows, login, shell, log_path, log_append })
     try {
       return await this.eval({
         session_id: spawned.session_id,

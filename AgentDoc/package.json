@@ -1,0 +1,20 @@
+{
+  "name": "agent-tools-agentdoc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "bin": {
+    "agentdoc-mcp": "bin/agentdoc-mcp.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check bin/*.js src/*.js scripts/*.js",
+    "test:codex-cli": "node scripts/test-codex-cli-agentdoc.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "chokidar": "^4.0.3",
+    "codex-session-tools": "file:../CodexSessionTools",
+    "zod": "^3.25.67"
+  }
+}

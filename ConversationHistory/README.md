@@ -1,6 +1,6 @@
 # Conversation History
 
-- Keeeps a hierarchical index of the transcript up to the last compaction record.
+- Keeps a hierarchical index of the transcript up to the last compaction record.
 - It supports incremental search and browse, with paging and token-budgeted opening.
 - Higher zoom levels are compressed/navigation layers.
 - The lowest zoom level is lossless, so exact recovery is possible.

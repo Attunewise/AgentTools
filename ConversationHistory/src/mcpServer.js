@@ -6,6 +6,10 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const { z } = require('zod')
+const {
+  readFileWindow,
+  walkJsonlFiles: walkCodexJsonlFiles
+} = require('codex-session-tools')
 
 const REPO_ROOT = path.resolve(__dirname, '..')
 const CLI_PATH = path.join(REPO_ROOT, 'bin', 'session-indexer.js')
@@ -44,64 +48,20 @@ const defaultSourceRoot = source => source === 'claude'
   ? path.join(os.homedir(), '.claude', 'projects')
   : path.join(os.homedir(), '.codex', 'sessions')
 
-const walkJsonlFiles = root => {
-  const files = []
-  const visit = dir => {
-    let entries
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true })
-    } catch (_err) {
-      return
-    }
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name)
-      if (entry.isDirectory()) visit(full)
-      else if (entry.isFile() && full.endsWith('.jsonl')) {
-        try {
-          const stat = fs.statSync(full)
-          files.push({ file: full, mtimeMs: stat.mtimeMs, size: stat.size })
-        } catch (_err) {
-          // Ignore files that disappear while the session log tree is changing.
-        }
-      }
-    }
-  }
-  visit(root)
-  return files.sort((a, b) => b.mtimeMs - a.mtimeMs || b.size - a.size || a.file.localeCompare(b.file))
-}
-
 const lastSessionMarkerInFile = file => {
-  let fd
-  try {
-    fd = fs.openSync(file.file, 'r')
-    const start = Math.max(0, file.size - SESSION_MARKER_SCAN_BYTES)
-    const length = Math.max(0, file.size - start)
-    if (!length) return ''
-    const buffer = Buffer.allocUnsafe(length)
-    fs.readSync(fd, buffer, 0, length, start)
-    const text = buffer.toString('utf8')
-    let last = null
-    for (const match of text.matchAll(SESSION_MARKER_PATTERN)) {
-      last = {
-        marker: match[0],
-        file: file.file,
-        mtimeMs: file.mtimeMs,
-        size: file.size,
-        byteOffset: start + match.index
-      }
-    }
-    return last
-  } catch (_err) {
-    return null
-  } finally {
-    if (fd !== undefined) {
-      try {
-        fs.closeSync(fd)
-      } catch (_err) {
-        // Nothing useful to report from cleanup.
-      }
+  const window = readFileWindow(file.file, SESSION_MARKER_SCAN_BYTES)
+  if (!window || !window.text) return null
+  let last = null
+  for (const match of window.text.matchAll(SESSION_MARKER_PATTERN)) {
+    last = {
+      marker: match[0],
+      file: file.file,
+      mtimeMs: file.mtimeMs,
+      size: file.size,
+      byteOffset: window.start + match.index
     }
   }
+  return last
 }
 
 const shouldResolveThisChat = (args = {}) => (args.this_chat !== false && !args.session && !args.latest && !isAllScope(args)) || args.this_chat
@@ -110,7 +70,7 @@ const discoverExistingSessionMarker = (args = {}) => {
   if (!shouldResolveThisChat(args) || stringArg(args.session_marker)) return null
   const source = args.source || defaultSource()
   const root = args.source_root || defaultSourceRoot(source)
-  const latest = walkJsonlFiles(root)
+  const latest = walkCodexJsonlFiles(root)
     .slice(0, SESSION_MARKER_SCAN_LIMIT)
     .map(lastSessionMarkerInFile)
     .filter(Boolean)

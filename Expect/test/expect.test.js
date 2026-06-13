@@ -64,6 +64,39 @@ expect {
   assert.match(result.transcript, /Hello Ada/)
 })
 
+test('writes full raw PTY transcript to log_path while returned transcript stays bounded', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-tools-expect-log-'))
+  try {
+    const logPath = path.join(root, 'transcript.log')
+    const program = "console.log('alpha'); console.log('beta');"
+    const cmd = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(program)}`
+    const tool = new ExpectTool()
+    const result = await tool.run({
+      cmd,
+      log_path: logPath,
+      max_output_chars: 6,
+      script: `
+set timeout 5
+expect {
+  -re {beta\\r?\\n} {
+    js {
+      return { ok: true }
+    }
+  }
+}
+`
+    })
+
+    assert.equal(result.log_path, logPath)
+    assert.equal(result.transcript.length <= 6, true)
+    const logged = fs.readFileSync(logPath, 'utf8')
+    assert.match(logged, /alpha/)
+    assert.match(logged, /beta/)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('deploy helper installs skill copies to selected harness directories', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-tools-expect-deploy-'))
   const priorCodexHome = process.env.CODEX_HOME
