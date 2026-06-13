@@ -5,10 +5,15 @@
   "type": "commonjs",
   "main": "src/index.js",
   "bin": {
-    "worktree-server": "bin/worktree-server.js"
+    "worktree-server": "bin/worktree-server.js",
+    "worktree-mcp": "bin/worktree-mcp.js"
   },
   "scripts": {
     "test": "node --test test/*.test.js",
     "check": "node --check bin/*.js src/*.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.67"
   }
 }

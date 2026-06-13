@@ -90,11 +90,16 @@ const sessionScopedShape = {
 }
 
 const registerTools = (server, state) => {
+  const readyState = async () => {
+    await state.start()
+    return state
+  }
+
   server.registerTool('agentdoc_start_session', {
     title: 'Start AgentDoc Session',
     description: 'Start AgentDoc for this Codex session. Returns a generated id/marker that AgentDoc uses to bind to the recorded Codex session log.',
     inputSchema: {}
-  }, async () => toolResult(await state.startAgentDocSession()))
+  }, async () => toolResult(await (await readyState()).startAgentDocSession()))
 
   server.registerTool('agentdoc_status', {
     title: 'AgentDoc Status',
@@ -103,7 +108,8 @@ const registerTools = (server, state) => {
       refresh: z.boolean().optional().describe('Refresh live state before returning it.')
     }
   }, async args => {
-    const snapshot = args.refresh ? await state.refresh('mcp:status') : await state.getSnapshot()
+    const current = await readyState()
+    const snapshot = args.refresh ? await current.refresh('mcp:status') : await current.getSnapshot()
     return toolResult(snapshot)
   })
 
@@ -112,7 +118,8 @@ const registerTools = (server, state) => {
     description: 'Prepare a bounded staged-change documentation review file. This does not stamp the check.',
     inputSchema: sessionScopedShape
   }, async args => {
-    const result = await state.prepareReview(args)
+    const current = await readyState()
+    const result = await current.prepareReview(args)
     return toolResult({
       schema: 'agentdoc.prepare.v1',
       message: result.message,
@@ -132,7 +139,8 @@ const registerTools = (server, state) => {
       ...sessionScopedShape
     }
   }, async args => {
-    const result = await state.recordCheck({
+    const current = await readyState()
+    const result = await current.recordCheck({
       result: args.result,
       reviewed: args.reviewed || [],
       updated: args.updated || [],
@@ -152,17 +160,18 @@ const registerTools = (server, state) => {
     title: 'AgentDoc Gate Status',
     description: 'Check whether the current staged state has a valid AgentDoc stamp without printing hook text.',
     inputSchema: sessionScopedShape
-  }, async args => toolResult(await state.gateStatus(args)))
+  }, async args => toolResult(await (await readyState()).gateStatus(args)))
 
   server.registerTool('agentdoc_direct_status', {
     title: 'AgentDoc Repository Status',
     description: 'Return bounded status for the repository/worktree resolved from the AgentDoc session.',
     inputSchema: sessionScopedShape
   }, async args => {
-    const root = await state.resolveWorkdir(args)
+    const current = await readyState()
+    const root = await current.resolveWorkdir(args)
     return toolResult({
       schema: 'agentdoc.repository-status.v1',
-      repository: state.repoSnapshot(root)
+      repository: current.repoSnapshot(root)
     })
   })
 
@@ -172,7 +181,7 @@ const registerTools = (server, state) => {
     inputSchema: sessionScopedShape
   }, async args => toolResult({
     schema: 'agentdoc.install-hook.v1',
-    ...(await state.installHook(args))
+    ...(await (await readyState()).installHook(args))
   }))
 }
 
@@ -187,7 +196,6 @@ const createMcpServer = ({ state = new AgentDocServerState() } = {}) => {
 
 const startStdioServer = async (options = {}) => {
   const state = new AgentDocServerState(options)
-  await state.start()
   const shutdown = async () => {
     await state.stop()
   }

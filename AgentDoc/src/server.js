@@ -121,6 +121,8 @@ class AgentDocServerState {
     this.events = []
     this.startedAt = new Date().toISOString()
     this.snapshot = null
+    this.started = false
+    this.startPromise = null
   }
 
   async ensureCodexSessions() {
@@ -140,9 +142,20 @@ class AgentDocServerState {
   }
 
   async start() {
-    await this.ensureCodexSessions()
-    await this.refresh('start')
-    return this
+    if (this.started) return this
+    if (this.startPromise) return this.startPromise
+    this.startPromise = (async () => {
+      await this.ensureCodexSessions()
+      await this.refresh('start')
+      this.started = true
+      return this
+    })()
+    try {
+      return await this.startPromise
+    } catch (err) {
+      this.startPromise = null
+      throw err
+    }
   }
 
   async stop() {
@@ -154,6 +167,8 @@ class AgentDocServerState {
     this.watchers = []
     this.repoWatchers.clear()
     await Promise.all(closing)
+    this.started = false
+    this.startPromise = null
   }
 
   pushEvent(reason) {

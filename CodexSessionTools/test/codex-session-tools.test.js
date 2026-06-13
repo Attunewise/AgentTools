@@ -3,6 +3,8 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
+const { Client } = require('@modelcontextprotocol/sdk/client/index.js')
+const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js')
 
 const {
   analyzeCodexSessionFile,
@@ -17,6 +19,7 @@ const {
   resolveCodexSessionForMarker,
   walkJsonlFiles
 } = require('../src/index.js')
+const { createMcpServer } = require('../src/mcpServer.js')
 const { CodexSessionServerState } = require('../src/server.js')
 
 const writeJsonl = (file, rows) => {
@@ -347,5 +350,82 @@ test('server state resolves markers from its shared snapshot and fork graph', ()
     assert.equal(resolved.reason, 'session_marker_match_fork_descendant')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('MCP tools expose compact session entry points without transcript evidence', async () => {
+  const fakeClient = {
+    status: async () => ({
+      session_root: '/tmp/codex/sessions',
+      session_count: 2,
+      thread_spawn_edge_count: 1,
+      app_server: { available: true, initialized: false },
+      latest_session: { file: '/tmp/codex/sessions/latest.jsonl', mtimeMs: 1, size: 20 }
+    }),
+    refresh: async () => fakeClient.status(),
+    resolveMarker: async () => ({
+      status: 'resolved',
+      reason: 'session_marker_match',
+      codex_session_id: '019ebf51-aaaa-bbbb-cccc-111111111111',
+      file: '/tmp/codex/sessions/latest.jsonl',
+      signals: { rawTranscriptEvidence: 'must not leak' }
+    }),
+    latestMarker: async () => ({
+      marker: 'codex-session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      file: '/tmp/codex/sessions/latest.jsonl',
+      byteOffset: 42,
+      mtimeMs: 1
+    }),
+    appServerThreadList: async () => ({
+      ok: true,
+      status: 'resolved',
+      result: { data: [{ id: 'thread-1', sensitivePayload: 'must not leak' }] }
+    }),
+    diagnostics: async () => ({
+      events: [{ code: 'repair_attempt', status: 'succeeded' }]
+    })
+  }
+  const server = createMcpServer({ clientFactory: async () => fakeClient })
+  const client = new Client({ name: 'codex-session-tools-test', version: '0.1.0' })
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+  await Promise.all([
+    server.connect(serverTransport),
+    client.connect(clientTransport)
+  ])
+  try {
+    const listed = await client.listTools()
+    assert.ok(listed.tools.some(tool => tool.name === 'codex_session_start_binding'))
+    assert.ok(listed.tools.some(tool => tool.name === 'codex_session_resolve_marker'))
+
+    const bound = await client.callTool({
+      name: 'codex_session_start_binding',
+      arguments: {}
+    })
+    assert.match(bound.content[0].text, /^ok status=ok marker=codex-session-/)
+    assert.match(bound.structuredContent.result.codex_session_marker, /^codex-session-/)
+
+    const status = await client.callTool({
+      name: 'codex_session_status',
+      arguments: { refresh: true }
+    })
+    assert.equal(status.structuredContent.result.session_count, 2)
+    assert.equal(Object.hasOwn(status.structuredContent.result, 'sessions'), false)
+
+    const resolved = await client.callTool({
+      name: 'codex_session_resolve_marker',
+      arguments: { marker: bound.structuredContent.result.codex_session_marker }
+    })
+    assert.match(resolved.content[0].text, /^ok thread=019ebf51/)
+    assert.equal(Object.hasOwn(resolved.structuredContent.result, 'signals'), false)
+    assert.equal(Object.hasOwn(resolved.structuredContent.result, 'raw_matches'), false)
+
+    const appServer = await client.callTool({
+      name: 'codex_session_app_server_status',
+      arguments: {}
+    })
+    assert.equal(appServer.structuredContent.result.thread_count, 1)
+    assert.equal(Object.hasOwn(appServer.structuredContent.result, 'result'), false)
+  } finally {
+    await client.close()
   }
 })

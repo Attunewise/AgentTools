@@ -15,7 +15,7 @@ const { CodexAppServerClient } = require('./appServerClient.js')
 const { DiagnosticsStore } = require('./diagnostics.js')
 const { reconcileThreadRecord } = require('./reconcile.js')
 
-const DEFAULT_MARKER_PATTERN = /(?:conversation_history-session-|session-indexer-session-|agentdoc-session-)[0-9a-fA-F-]{36}/g
+const DEFAULT_MARKER_PATTERN = /(?:conversation_history-session-|session-indexer-session-|agentdoc-session-|codex-session-)[0-9a-fA-F-]{36}/g
 
 const parseMarkerPattern = value => {
   if (!value) return DEFAULT_MARKER_PATTERN

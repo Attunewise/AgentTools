@@ -4,9 +4,12 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
+const { Client } = require('@modelcontextprotocol/sdk/client/index.js')
+const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js')
 
 const { CodexSessionServerState } = require('codex-session-tools/src/server.js')
 const { gitPrivatePath, installHook, prepareReview, recordCheck, verifyGate } = require('../src/agentdoc.js')
+const { createMcpServer } = require('../src/mcpServer.js')
 const { AgentDocServerState, scanCodexSessionTail } = require('../src/server.js')
 
 const git = (cwd, args) => childProcess.execFileSync('git', args, {
@@ -237,5 +240,43 @@ scope:
   } finally {
     cleanup(root)
     fs.rmSync(codexRoot, { recursive: true, force: true })
+  }
+})
+
+test('MCP server lists AgentDoc tools before starting shared session state', async () => {
+  let starts = 0
+  const fakeState = {
+    start: async () => {
+      starts += 1
+      return fakeState
+    },
+    getSnapshot: async () => ({
+      schema: 'agentdoc.server-state.v1',
+      sessions: [],
+      watched_repositories: []
+    }),
+    stop: async () => {}
+  }
+  const server = createMcpServer({ state: fakeState })
+  const client = new Client({ name: 'agentdoc-test', version: '0.1.0' })
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+  await Promise.all([
+    server.connect(serverTransport),
+    client.connect(clientTransport)
+  ])
+  try {
+    const listed = await client.listTools()
+    assert.ok(listed.tools.some(tool => tool.name === 'agentdoc_start_session'))
+    assert.ok(listed.tools.some(tool => tool.name === 'agentdoc_status'))
+    assert.equal(starts, 0)
+
+    const status = await client.callTool({
+      name: 'agentdoc_status',
+      arguments: {}
+    })
+    assert.equal(status.structuredContent.result.sessions, 0)
+    assert.equal(starts, 1)
+  } finally {
+    await client.close()
   }
 })

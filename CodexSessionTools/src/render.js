@@ -35,6 +35,8 @@ const renderSessionResolve = result => {
 const renderHealth = result => oneLine([
   result && result.ok === false ? 'degraded' : 'ok',
   result && result.status ? `status=${result.status}` : null,
+  result && result.codex_session_marker ? `marker=${result.codex_session_marker}` : null,
+  result && result.thread_count !== undefined ? `threads=${result.thread_count}` : null,
   result && result.warnings ? `warnings=${result.warnings.length}` : null
 ])
 

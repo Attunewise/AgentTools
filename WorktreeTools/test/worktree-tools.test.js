@@ -4,6 +4,8 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
+const { Client } = require('@modelcontextprotocol/sdk/client/index.js')
+const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js')
 
 const {
   gitPath,
@@ -83,5 +85,42 @@ test('safe snapshot and server state do not throw for non-repositories', () => {
     assert.equal(state.status().cached_worktree_count, 0)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('MCP worktree_status returns only compact entry-point data', async () => {
+  const root = makeRepo()
+  try {
+    fs.writeFileSync(path.join(root, 'README.md'), '# Changed\n')
+    git(root, ['add', 'README.md'])
+
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [path.join(__dirname, '..', 'bin', 'worktree-mcp.js')],
+      cwd: root,
+      stderr: 'pipe'
+    })
+    const client = new Client({ name: 'worktree-tools-test', version: '0.1.0' })
+    await client.connect(transport)
+    try {
+      const listed = await client.listTools()
+      assert.ok(listed.tools.some(tool => tool.name === 'worktree_status'))
+      const result = await client.callTool({
+        name: 'worktree_status',
+        arguments: { workdir: root }
+      })
+      assert.match(result.content[0].text, /^ok repo=/)
+      const entry = result.structuredContent.result
+      assert.equal(fs.realpathSync(entry.repo), fs.realpathSync(root))
+      assert.equal(entry.staged_file_count, 1)
+      assert.match(entry.staged_change_fingerprint, /^sha256:/)
+      assert.equal(Object.hasOwn(entry, 'diff'), false)
+      assert.equal(Object.hasOwn(entry, 'git_dir'), false)
+      assert.equal(Object.hasOwn(entry, 'private_paths'), false)
+    } finally {
+      await client.close()
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
   }
 })
