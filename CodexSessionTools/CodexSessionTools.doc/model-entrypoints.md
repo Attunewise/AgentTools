@@ -31,10 +31,13 @@ Disallowed model-facing evidence:
 
 ConversationHistory owns bounded transcript retrieval. CodexSessionTools only tells the model which Codex session or thread handle should be used by that next bounded tool.
 
+`codex_session_latest_marker` is a hint-only tool. It can help recover a recent marker family, but it is not proof that the current model run is bound to that session. Current-session binding requires a fresh `codex_session_start_binding` marker followed by `codex_session_resolve_marker` for that exact marker.
+
 The default render should fit on one line, for example:
 
 ```text
 ok thread=019ebf51 reason=session_marker_match file=...rollout.jsonl
+hint proof=0 marker=codex-session-... warn=not_current_session_binding
 blocked reason=ambiguous_fork
 degraded reason=app_server_unavailable
 ```

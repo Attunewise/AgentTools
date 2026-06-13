@@ -54,7 +54,12 @@ const summarizeResolve = result => {
 const summarizeMarker = result => result
   ? {
       schema: 'codex-session-tools.latest-marker.v1',
-      status: 'resolved',
+      status: 'hint',
+      ok: true,
+      binding_proof: false,
+      current_session_proof: false,
+      warning: 'not_current_session_binding',
+      instruction: 'Use codex_session_start_binding, then codex_session_resolve_marker with that marker, to prove the current model run is bound.',
       marker: result.marker,
       file: result.file,
       byte_offset: result.byteOffset,
@@ -64,6 +69,8 @@ const summarizeMarker = result => result
       schema: 'codex-session-tools.latest-marker.v1',
       ok: false,
       status: 'blocked',
+      binding_proof: false,
+      current_session_proof: false,
       reason: 'not_found'
     }
 
@@ -134,13 +141,13 @@ const registerTools = (server, clientFactory) => {
 
   server.registerTool('codex_session_latest_marker', {
     title: 'Latest Codex Session Marker',
-    description: 'Find the latest recent marker for a known AgentTools marker family. Prefer explicit markers when available.',
+    description: 'Find a recent marker hint for a known AgentTools marker family. This is not evidence that the current model run is bound. To prove current-session binding, call codex_session_start_binding and then codex_session_resolve_marker with that fresh marker.',
     inputSchema: {
       marker_prefix: z.enum(['codex-session', 'agentdoc-session', 'conversation_history-session']).optional(),
       limit: z.number().int().positive().max(100).optional()
     }
   }, async args => toolResult(
-    'codex_session_resolve_current',
+    'codex_session_latest_marker',
     summarizeMarker(await (await client()).latestMarker({
       pattern: markerPatternFor(args.marker_prefix || 'codex-session'),
       limit: args.limit || 50

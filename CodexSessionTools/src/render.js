@@ -32,6 +32,23 @@ const renderSessionResolve = result => {
   ])
 }
 
+const renderLatestMarker = result => {
+  if (!result) return 'blocked reason=not_found proof=0'
+  if (result.ok === false || result.status === 'blocked') return oneLine([
+    'blocked',
+    result.reason ? `reason=${result.reason}` : null,
+    'proof=0'
+  ])
+  return oneLine([
+    'hint',
+    'proof=0',
+    result.marker ? `marker=${shortenMiddle(result.marker, 52)}` : null,
+    result.file ? `file=${shortenMiddle(result.file, 80)}` : null,
+    result.warning ? `warn=${result.warning}` : 'warn=not_current_session_binding',
+    'use=start_binding_then_resolve'
+  ])
+}
+
 const renderHealth = result => oneLine([
   result && result.ok === false ? 'degraded' : 'ok',
   result && result.status ? `status=${result.status}` : null,
@@ -53,6 +70,7 @@ const renderDiagnosticsPage = result => {
 const renderForTool = (toolName, result) => {
   if (toolName === 'codex_session_status') return renderStatus(result)
   if (toolName === 'codex_session_resolve_current') return renderSessionResolve(result)
+  if (toolName === 'codex_session_latest_marker') return renderLatestMarker(result)
   if (toolName === 'codex_session_health') return renderHealth(result)
   if (toolName === 'codex_session_diagnostics') return renderDiagnosticsPage(result)
   if (toolName === 'agentdoc_binding') return renderSessionResolve(result)
@@ -74,6 +92,7 @@ module.exports = {
   renderDiagnosticsPage,
   renderForTool,
   renderHealth,
+  renderLatestMarker,
   renderSessionResolve,
   renderStatus,
   shortenMiddle,

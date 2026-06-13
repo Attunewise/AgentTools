@@ -66,6 +66,19 @@ test('compact renderers keep model-facing output small and fixed', () => {
     reason: 'ambiguous_fork',
     evidence: 'this must not render'
   }), 'blocked reason=ambiguous_fork')
+
+  const markerHint = renderForTool('codex_session_latest_marker', {
+    schema: 'codex-session-tools.latest-marker.v1',
+    status: 'hint',
+    marker: 'codex-session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    file: `/tmp/${'x'.repeat(200)}/rollout.jsonl`,
+    binding_proof: false,
+    current_session_proof: false,
+    warning: 'not_current_session_binding'
+  })
+  assert.match(markerHint, /^hint proof=0 marker=codex-session-/)
+  assert.doesNotMatch(markerHint, /^ok/)
+  assert.doesNotMatch(markerHint, /thread=/)
 })
 
 test('diagnostics store pages compact events without exposing full evidence', () => {
@@ -396,6 +409,8 @@ test('MCP tools expose compact session entry points without transcript evidence'
     const listed = await client.listTools()
     assert.ok(listed.tools.some(tool => tool.name === 'codex_session_start_binding'))
     assert.ok(listed.tools.some(tool => tool.name === 'codex_session_resolve_marker'))
+    const latestTool = listed.tools.find(tool => tool.name === 'codex_session_latest_marker')
+    assert.match(latestTool.description, /not evidence that the current model run is bound/)
 
     const bound = await client.callTool({
       name: 'codex_session_start_binding',
@@ -418,6 +433,16 @@ test('MCP tools expose compact session entry points without transcript evidence'
     assert.match(resolved.content[0].text, /^ok thread=019ebf51/)
     assert.equal(Object.hasOwn(resolved.structuredContent.result, 'signals'), false)
     assert.equal(Object.hasOwn(resolved.structuredContent.result, 'raw_matches'), false)
+
+    const latestMarker = await client.callTool({
+      name: 'codex_session_latest_marker',
+      arguments: { marker_prefix: 'codex-session' }
+    })
+    assert.match(latestMarker.content[0].text, /^hint proof=0 /)
+    assert.equal(latestMarker.structuredContent.result.status, 'hint')
+    assert.equal(latestMarker.structuredContent.result.binding_proof, false)
+    assert.equal(latestMarker.structuredContent.result.current_session_proof, false)
+    assert.equal(Object.hasOwn(latestMarker.structuredContent.result, 'codex_session_id'), false)
 
     const appServer = await client.callTool({
       name: 'codex_session_app_server_status',
