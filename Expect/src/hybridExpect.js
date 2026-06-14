@@ -324,15 +324,31 @@ class ExpectExit extends Error {
   }
 }
 
+const EXPECT_CONTROL = Symbol('expect.control')
+
+const expectContinue = ({ continue_timer, continueTimer } = {}) => ({
+  [EXPECT_CONTROL]: true,
+  type: 'continue',
+  continueTimer: Boolean(continue_timer || continueTimer)
+})
+
+const isExpectControl = value => Boolean(value && value[EXPECT_CONTROL])
+
 const executeAction = async ({ action, stream, match, context, console }) => {
   let jsResult
+  let jsControl = null
+  const requestContinue = options => {
+    jsControl = expectContinue(options)
+    return jsControl
+  }
   const expect = {
     buffer: stream.buffer.slice(0, match.end),
     before: stream.buffer.slice(0, match.index),
     match: match.match,
     groups: match.groups,
     after: stream.buffer.slice(match.end),
-    stream: 'pty'
+    stream: 'pty',
+    exp_continue: requestContinue
   }
   const send = value => stream.write(String(value))
 
@@ -346,12 +362,18 @@ const executeAction = async ({ action, stream, match, context, console }) => {
       const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
       const fn = new AsyncFunction('context', 'expect', 'send', 'console', command.javascript)
       jsResult = await fn(context, expect, send, console)
+      if (isExpectControl(jsResult)) {
+        jsControl = jsResult
+        jsResult = undefined
+      }
     }
   }
 
   return {
     jsResult,
-    expect
+    expect,
+    expContinue: Boolean(action.expContinue || (jsControl && jsControl.type === 'continue')),
+    continueTimer: Boolean(action.continueTimer || (jsControl && jsControl.continueTimer))
   }
 }
 
@@ -362,15 +384,16 @@ const runExpectBlock = async ({ patterns, timeoutSeconds, stream, context, conso
   const normalPatterns = patterns.filter(pattern => !['timeout', 'eof', 'default'].includes(pattern.type))
   let timeoutDeadline = Date.now() + (timeoutSeconds * 1000)
 
+  expectLoop:
   while (true) {
     for (const pattern of normalPatterns) {
       const match = matchPattern(stream.buffer, pattern)
       if (!match) continue
       const actionResult = await executeAction({ action: pattern.action, stream, match, context, console })
       stream.buffer = stream.buffer.slice(match.end)
-      if (pattern.action.expContinue) {
-        if (!pattern.action.continueTimer) timeoutDeadline = Date.now() + (timeoutSeconds * 1000)
-        continue
+      if (actionResult.expContinue) {
+        if (!actionResult.continueTimer) timeoutDeadline = Date.now() + (timeoutSeconds * 1000)
+        continue expectLoop
       }
       return {
         type: 'match',
@@ -410,8 +433,8 @@ const runExpectBlock = async ({ patterns, timeoutSeconds, stream, context, conso
         context,
         console
       })
-      if (pattern.action.expContinue) {
-        if (!pattern.action.continueTimer) timeoutDeadline = Date.now() + (timeoutSeconds * 1000)
+      if (actionResult.expContinue) {
+        if (!actionResult.continueTimer) timeoutDeadline = Date.now() + (timeoutSeconds * 1000)
         continue
       }
       return {

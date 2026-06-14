@@ -100,6 +100,26 @@ expect {
 
 Without `exp_continue`, the first matching branch would end the script. With it, the script behaves like a small state machine over the PTY stream.
 
+Inside `js { ... }`, `expect.exp_continue()` may be used instead of the Tcl-style action when continuation depends on JavaScript state or a host lookup:
+
+```expect
+expect {
+  -re {event (\w+)} {
+    js {
+      context.events.push(expect.groups[0])
+      return expect.exp_continue()
+    }
+  }
+  -re {done} {
+    js {
+      return { events: context.events }
+    }
+  }
+}
+```
+
+Calling `expect.exp_continue()` without returning it also requests continuation. Pass `{ continue_timer: true }` to preserve the current timeout deadline, matching `exp_continue -continue_timer`. Returning any ordinary JavaScript value ends the current expect block with that value; there is no separate break primitive.
+
 Supported Expect syntax:
 
 - `set timeout N`
@@ -126,6 +146,7 @@ declare const expect: {
   groups: string[]
   after: string
   stream: "pty"
+  exp_continue(options?: { continue_timer?: boolean, continueTimer?: boolean }): unknown
 }
 declare function send(text: string): void
 ```

@@ -5,7 +5,7 @@ const path = require('node:path')
 const test = require('node:test')
 
 const { ExpectTool } = require('../src/expectTool.js')
-const { parseExpectScript } = require('../src/hybridExpect.js')
+const { HybridExpectStream, parseExpectScript, runExpectScript } = require('../src/hybridExpect.js')
 const { run: deploySkills } = require('../scripts/deploy-skills.js')
 
 test('parses expect syntax with regex, send, js, timeout, and exp_continue', () => {
@@ -62,6 +62,69 @@ expect {
   assert.deepEqual(result.result, { ok: true, match: 'Hello Ada\r\n' })
   assert.match(result.transcript, /Name: Ada/)
   assert.match(result.transcript, /Hello Ada/)
+})
+
+test('js actions can request exp_continue on a generic stream', async () => {
+  const stream = new HybridExpectStream()
+  stream.append('event first\n')
+  stream.append('event second\n')
+  stream.append('done\n')
+  stream.end()
+
+  const result = await runExpectScript({
+    stream,
+    context: { events: [] },
+    script: `
+set timeout 5
+expect {
+  -re {event (\\w+)\\n} {
+    js {
+      context.events.push(expect.groups[0])
+      return expect.exp_continue()
+    }
+  }
+  -re {done\\n} {
+    js {
+      return { events: context.events }
+    }
+  }
+}
+`
+  })
+
+  assert.equal(result.exitCode, 0)
+  assert.deepEqual(result.result, { events: ['first', 'second'] })
+})
+
+test('js actions can request exp_continue without returning it', async () => {
+  const stream = new HybridExpectStream()
+  stream.append('tick\n')
+  stream.append('done\n')
+  stream.end()
+
+  const result = await runExpectScript({
+    stream,
+    context: { ticks: 0 },
+    script: `
+set timeout 5
+expect {
+  -re {tick\\n} {
+    js {
+      context.ticks += 1
+      expect.exp_continue()
+    }
+  }
+  -re {done\\n} {
+    js {
+      return { ticks: context.ticks }
+    }
+  }
+}
+`
+  })
+
+  assert.equal(result.exitCode, 0)
+  assert.deepEqual(result.result, { ticks: 1 })
 })
 
 test('writes full raw PTY transcript to log_path while returned transcript stays bounded', async () => {
