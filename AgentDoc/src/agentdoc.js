@@ -12,6 +12,7 @@ const {
 const TOOL_VERSION = '0.1.0'
 const ALLOW_RESULTS = new Set(['docs-current', 'docs-updated'])
 const FINAL_RESULTS = new Set([...ALLOW_RESULTS, 'needs-doc-update', 'blocked'])
+const CONSIDER_DOC_SECTION_MESSAGE = 'Consider creating new documentation for these source changes, but only if appropriate.'
 
 const repo = cwd => {
   const resolved = resolveWorktree(cwd || process.cwd())
@@ -211,6 +212,10 @@ const prepareReview = (opts = {}) => {
   const docs = discoverDocs(root)
   const changed = stagedNameStatus(root)
   const affected = affectedDocs(changed, docs)
+  const uncoveredSourceFiles = affected
+    .filter(item => item.kind === 'source' && item.docs.length === 0)
+    .map(item => item.path)
+  const suggestion = uncoveredSourceFiles.length ? CONSIDER_DOC_SECTION_MESSAGE : null
   const report = {
     schema: 'agentdoc.review.v1',
     created_at: new Date().toISOString(),
@@ -228,12 +233,11 @@ const prepareReview = (opts = {}) => {
     },
     changed_files: changed,
     affected,
-    uncovered_source_files: affected
-      .filter(item => item.kind === 'source' && item.docs.length === 0)
-      .map(item => item.path),
+    uncovered_source_files: uncoveredSourceFiles,
     next: [
       'Inspect the changed source and each affected doc section.',
       'Update self-contained section files when claims changed.',
+      ...(suggestion ? [suggestion] : []),
       'Use the AgentDoc MCP check tool with the final result after the review.'
     ]
   }
