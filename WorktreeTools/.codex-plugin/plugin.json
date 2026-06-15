@@ -1,0 +1,35 @@
+{
+  "name": "worktree-tools",
+  "version": "0.1.0",
+  "description": "Worktree Tools expose compact Git repository and worktree identity through MCP.",
+  "author": {
+    "name": "AgentTools"
+  },
+  "license": "UNLICENSED",
+  "keywords": [
+    "git",
+    "worktree",
+    "mcp",
+    "repository",
+    "coding-agents"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Worktree Tools",
+    "shortDescription": "Compact Git worktree identity checks.",
+    "longDescription": "Worktree Tools help Codex resolve canonical Git repository and worktree identity, staged fingerprints, and guard checks without dumping raw diffs or porcelain.",
+    "developerName": "AgentTools",
+    "category": "Productivity",
+    "capabilities": [
+      "Git",
+      "Worktrees",
+      "MCP"
+    ],
+    "defaultPrompt": [
+      "Check this worktree status.",
+      "Get the staged fingerprint.",
+      "Guard this write against the expected worktree."
+    ]
+  }
+}

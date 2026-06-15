@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "worktree_tools": {
+      "command": "node",
+      "args": [
+        "bin/worktree-mcp.js"
+      ],
+      "cwd": "."
+    }
+  }
+}

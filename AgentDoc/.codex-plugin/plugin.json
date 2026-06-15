@@ -1,0 +1,35 @@
+{
+  "name": "agentdoc",
+  "version": "0.1.0",
+  "description": "AgentDoc checks and stamps agent-maintained documentation before gated git operations.",
+  "author": {
+    "name": "AgentTools"
+  },
+  "license": "UNLICENSED",
+  "keywords": [
+    "agentdoc",
+    "documentation",
+    "git",
+    "mcp",
+    "coding-agents"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "AgentDoc",
+    "shortDescription": "Documentation checks for gated git operations.",
+    "longDescription": "AgentDoc helps Codex inspect staged changes, review scoped documentation, and record documentation checks for AgentDoc-gated repositories.",
+    "developerName": "AgentTools",
+    "category": "Productivity",
+    "capabilities": [
+      "Documentation",
+      "Git",
+      "MCP"
+    ],
+    "defaultPrompt": [
+      "Check AgentDoc status for this repo.",
+      "Prepare an AgentDoc review.",
+      "Record docs-current for staged changes."
+    ]
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "name": "codex-session-tools",
+  "version": "0.1.0",
+  "description": "Codex Session Tools bind model runs to recorded Codex sessions and expose compact session diagnostics.",
+  "author": {
+    "name": "AgentTools"
+  },
+  "license": "UNLICENSED",
+  "keywords": [
+    "codex",
+    "sessions",
+    "mcp",
+    "diagnostics",
+    "coding-agents"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Codex Session Tools",
+    "shortDescription": "Codex session binding and diagnostics.",
+    "longDescription": "Codex Session Tools help Codex bind a model run to the correct recorded session, inspect compact session status, and diagnose session authority issues without dumping transcripts.",
+    "developerName": "AgentTools",
+    "category": "Productivity",
+    "capabilities": [
+      "Session Binding",
+      "Diagnostics",
+      "MCP"
+    ],
+    "defaultPrompt": [
+      "Bind this run to the Codex session.",
+      "Check Codex session diagnostics.",
+      "Resolve this Codex session marker."
+    ]
+  }
+}

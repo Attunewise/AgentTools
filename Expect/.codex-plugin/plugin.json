@@ -1,0 +1,34 @@
+{
+  "name": "expect",
+  "version": "0.1.0",
+  "description": "Expect drives interactive terminal programs with PTY pattern matching and scripted sends.",
+  "author": {
+    "name": "AgentTools"
+  },
+  "license": "UNLICENSED",
+  "keywords": [
+    "expect",
+    "pty",
+    "terminal",
+    "tui",
+    "automation"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Expect",
+    "shortDescription": "PTY automation for interactive CLIs.",
+    "longDescription": "Expect lets Codex drive interactive CLIs, REPLs, TUIs, and login prompts through deterministic PTY pattern matching, sends, timeouts, and transcript capture.",
+    "developerName": "AgentTools",
+    "category": "Productivity",
+    "capabilities": [
+      "Terminal Automation",
+      "PTY",
+      "Testing"
+    ],
+    "defaultPrompt": [
+      "Automate this interactive CLI.",
+      "Drive this TUI with an Expect script.",
+      "Capture this REPL transcript."
+    ]
+  }
+}

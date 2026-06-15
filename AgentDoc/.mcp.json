@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "agentdoc": {
+      "command": "node",
+      "args": [
+        "bin/agentdoc-mcp.js"
+      ],
+      "cwd": "."
+    }
+  }
+}

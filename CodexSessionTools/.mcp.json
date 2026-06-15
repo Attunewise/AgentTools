@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "codex_session_tools": {
+      "command": "node",
+      "args": [
+        "bin/codex-session-mcp.js"
+      ],
+      "cwd": "."
+    }
+  }
+}
