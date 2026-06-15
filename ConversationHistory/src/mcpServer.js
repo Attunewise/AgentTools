@@ -11,6 +11,7 @@ const {
   walkJsonlFiles: walkCodexJsonlFiles
 } = require('codex-session-tools')
 const { connectOrStartCodexSessionServer } = require('codex-session-tools/src/client.js')
+const { CodexAppServerClient } = require('codex-session-tools/src/appServerClient.js')
 
 const REPO_ROOT = path.resolve(__dirname, '..')
 const CLI_PATH = path.join(REPO_ROOT, 'bin', 'session-indexer.js')
@@ -24,6 +25,7 @@ const SESSION_MARKER_PATTERN = /(?:conversation_history-session-|session-indexer
 const STATUS_POLL_INITIAL_MS = 15_000
 const STATUS_POLL_MAX_MS = 120_000
 const STATUS_POLL_ESTIMATE_BUFFER_MS = 1_000
+const CURRENT_THREAD_ID_ENV = 'CODEX_THREAD_ID'
 
 const statusPollMemory = new Map()
 const codexSessionClients = new Map()
@@ -115,6 +117,211 @@ const ensureStartSessionMarker = (args = {}) => {
     generated: true
   }
 }
+
+const compactErrorMessage = err => err && err.message ? String(err.message).slice(0, 240) : String(err || '').slice(0, 240)
+
+const currentThreadIdFrom = (args = {}) => stringArg(args.current_thread_id) ||
+  stringArg(process.env.SESSION_INDEXER_CURRENT_THREAD_ID) ||
+  stringArg(process.env[CURRENT_THREAD_ID_ENV])
+
+const threadFromAppServerRead = read => read && (
+  read.thread ||
+  read.result && read.result.thread ||
+  read.result && read.result.data && read.result.data.thread ||
+  read.result
+)
+
+const readCurrentThreadDirect = async threadId => {
+  const client = new CodexAppServerClient({
+    requestTimeoutMs: Number(process.env.SESSION_INDEXER_APP_SERVER_TIMEOUT_MS || 10000)
+  })
+  try {
+    return await client.threadRead(threadId, { includeTurns: false })
+  } finally {
+    await client.stop().catch(() => {})
+  }
+}
+
+const readCurrentThread = async ({ service, threadId }) => {
+  let fallbackReason = null
+  if (service && typeof service.appServerThreadRead === 'function') {
+    try {
+      const read = await service.appServerThreadRead({ threadId, includeTurns: false })
+      if (!(read && read.ok === false)) return read
+      fallbackReason = read.reason || read.status || 'shared_session_service_failed'
+    } catch (err) {
+      fallbackReason = compactErrorMessage(err) || 'shared_session_service_failed'
+    }
+  }
+  try {
+    const read = await readCurrentThreadDirect(threadId)
+    return {
+      ok: true,
+      status: fallbackReason ? 'degraded' : 'resolved',
+      warning: fallbackReason ? 'shared_session_service_app_server_failed' : undefined,
+      fallbackReason,
+      result: read
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      status: 'blocked',
+      reason: 'current_thread_lookup_failed',
+      fallbackReason,
+      error: compactErrorMessage(err)
+    }
+  }
+}
+
+const resolveCurrentThreadSession = async (args = {}) => {
+  const source = args.source || defaultSource()
+  if (source !== 'codex') {
+    return {
+      ok: false,
+      status: 'blocked',
+      reason: 'unsupported_current_thread_source',
+      message: 'Current-session MCP scoping is only available for Codex source sessions.'
+    }
+  }
+  const threadId = currentThreadIdFrom(args)
+  if (!threadId) {
+    return {
+      ok: false,
+      status: 'blocked',
+      reason: 'missing_current_thread_id',
+      message: `No ${CURRENT_THREAD_ID_ENV} binding was available, so conversation_history did not fall back to the global session catalog.`
+    }
+  }
+  try {
+    const root = args.source_root || defaultSourceRoot(source)
+    const service = args.codex_session_service || await codexSessionServiceFor(root)
+    const read = await readCurrentThread({ service, threadId })
+    if (read && read.ok === false) {
+      return {
+        ok: false,
+        status: read.status || 'blocked',
+        reason: read.reason || 'current_thread_lookup_failed',
+        threadId,
+        error: read.error,
+        fallbackReason: read.fallbackReason,
+        message: 'Codex app-server could not resolve the current thread, so conversation_history did not fall back to the global session catalog.'
+      }
+    }
+    const thread = threadFromAppServerRead(read)
+    const sessionId = thread && (thread.sessionId || thread.session_id || thread.id)
+    if (!sessionId) {
+      return {
+        ok: false,
+        status: 'blocked',
+        reason: 'current_thread_session_id_missing',
+        threadId,
+        message: 'Codex app-server resolved the thread without a session id, so conversation_history did not fall back to the global session catalog.'
+      }
+    }
+    return {
+      ok: true,
+      status: 'resolved',
+      source,
+      threadId,
+      sessionId,
+      warning: read && read.warning,
+      path: thread.path || thread.rollout_path || thread.rolloutPath || null
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      status: 'blocked',
+      reason: 'current_thread_lookup_failed',
+      threadId,
+      error: compactErrorMessage(err),
+      message: 'Codex app-server thread lookup failed, so conversation_history did not fall back to the global session catalog.'
+    }
+  }
+}
+
+const currentScopeForResult = scope => {
+  const out = {
+    kind: 'current_session',
+    status: scope && scope.status || (scope && scope.ok ? 'resolved' : 'blocked')
+  }
+  if (scope && scope.threadId) out.thread_id = scope.threadId
+  if (scope && scope.sessionId) out.session_id = scope.sessionId
+  if (scope && scope.source) out.source = scope.source
+  if (scope && scope.reason) out.reason = scope.reason
+  if (scope && scope.error) out.error = scope.error
+  return out
+}
+
+const emptyScopedStatus = (scope, args = {}) => ({
+  schema: 'session-indexer.index_status.v1',
+  status: scope && scope.status || 'blocked',
+  reason: scope && scope.reason || 'current_session_scope_unavailable',
+  message: scope && scope.message || 'Current session scope was unavailable, so no global sessions were returned.',
+  scope: currentScopeForResult(scope),
+  startAt: args.start_at || 0,
+  limit: args.limit || 10,
+  sessions: []
+})
+
+const emptyScopedBrowse = (scope, args = {}) => ({
+  schema: 'session-indexer.browse.v1',
+  status: scope && scope.status || 'blocked',
+  reason: scope && scope.reason || 'current_session_scope_unavailable',
+  message: scope && scope.message || 'Current session scope was unavailable, so no global sessions were returned.',
+  scope: currentScopeForResult(scope),
+  level: 'sessions',
+  page: {
+    start: args.start || args.start_at || 0,
+    limit: args.limit || 20,
+    returned: 0,
+    total: 0
+  },
+  sessions: []
+})
+
+const emptyScopedSearch = (scope, args = {}) => ({
+  schema: 'session-indexer.search.v1',
+  status: scope && scope.status || 'blocked',
+  reason: scope && scope.reason || 'current_session_scope_unavailable',
+  message: scope && scope.message || 'Current session scope was unavailable, so no global hits were returned.',
+  scope: currentScopeForResult(scope),
+  ...(args.query ? { query: args.query } : {}),
+  ...(args.topic ? { topic: args.topic } : {}),
+  ...(args.agent ? { agent: args.agent } : {}),
+  ...(args.start_at ? { startAt: args.start_at } : {}),
+  hits: []
+})
+
+const defaultToCurrentSessionScope = async args => {
+  if (args.all_sessions || stringArg(args.session_id) || stringArg(args.index_id)) return { scoped: false }
+  const current = await resolveCurrentThreadSession(args)
+  if (!current.ok) return { scoped: true, current }
+  args.session_id = current.sessionId
+  return { scoped: true, current }
+}
+
+const withCurrentScope = (result, scope) => {
+  if (!scope || !scope.scoped || !scope.current) return result
+  return {
+    ...result,
+    scope: currentScopeForResult(scope.current)
+  }
+}
+
+const withCurrentStatusScope = (result, scope) => {
+  const scoped = withCurrentScope(result, scope)
+  if (scope && scope.scoped && scope.current && scope.current.ok && Array.isArray(scoped.sessions) && scoped.sessions.length === 0) {
+    return {
+      ...scoped,
+      status: 'not_indexed',
+      reason: 'current_session_not_indexed',
+      message: 'The current Codex session is not indexed yet.'
+    }
+  }
+  return scoped
+}
+
+const currentSessionMissingFrom = err => /Unknown session browse target|Unknown index browse target|no indexed|not indexed/i.test(compactErrorMessage(err))
 
 const stripImplementationDetails = value => {
   if (Array.isArray(value)) return value.map(stripImplementationDetails)
@@ -439,13 +646,14 @@ const addSourceArgs = (argv, args = {}) => {
 const registerTools = (server, lifecycle = createPluginLifecycle()) => {
   server.registerTool('conversation_search', {
     title: 'Search Indexed Conversation',
-    description: 'Search existing conversation_history transcript indexes. This never indexes on demand.',
+    description: 'Search existing conversation_history transcript indexes. Defaults to the current Codex session when no scope is supplied. This never indexes on demand.',
     inputSchema: {
       query: z.string().optional().describe('Search query. Use this for old transcript facts, tool calls, and tool results.'),
       topic: z.string().optional().describe('Optional natural-language generated topic filter. Do not use the session title as a topic.'),
       agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
-      session_id: z.string().optional().describe('Optional visibility filter. Omit to search all indexed sessions.'),
+      session_id: z.string().optional().describe('Optional visibility filter. Omit to search only the current Codex session.'),
       index_id: z.string().optional().describe('Optional definitive indexed-content id. Use to narrow search to one index.'),
+      all_sessions: z.boolean().optional().describe('Explicitly search all indexed sessions. Use only when the user asks for cross-session history.'),
       within: z.string().optional().describe('Optional exact parent handle returned by search; search only one level within that node.'),
       filter: searchFilterShape.describe('Structured exact filters such as {agent:"codex"}, {messageId}, {inReplyToMessageId}, {toolCallId}, {role:"assistant"}, {mip:0}, or {mipLevel:"leaf"}. Avoid exact filters for broad semantic search.'),
       ...commonSearchShape
@@ -453,6 +661,8 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
   }, async args => {
     lifecycle.rememberIndexRoot()
     if (!stringArg(args.query) && !stringArg(args.topic) && !stringArg(args.agent) && !stringArg(args.session_id) && !stringArg(args.index_id) && !args.filter) throw new Error('conversation_search requires query, topic, agent, index_id, session_id, or filter')
+    const scope = await defaultToCurrentSessionScope(args)
+    if (scope.scoped && !scope.current.ok) return toolResult(emptyScopedSearch(scope.current, args))
     const argv = ['search']
     pushFlag(argv, '--query', args.query)
     pushFlag(argv, '--topic', args.topic)
@@ -462,16 +672,17 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     pushFlag(argv, '--within', args.within)
     if (args.filter) pushFlag(argv, '--filter', JSON.stringify(args.filter))
     addCommonSearchArgs(argv, args)
-    return toolResult(await callConversationHistory(argv))
+    return toolResult(withCurrentScope(await callConversationHistory(argv), scope))
   })
 
   server.registerTool('conversation_browse', {
     title: 'Browse Indexed Conversation',
-    description: 'Browse existing conversation indexes without indexing on demand. Omit index_id for a paged compact session catalog. Use index_id, optionally topic_id:"root", to drill into one transcript hierarchy. session_id is only a visibility filter.',
+    description: 'Browse existing conversation indexes without indexing on demand. Defaults to the current Codex session when no scope is supplied. Use index_id, optionally topic_id:"root", to drill into one transcript hierarchy. session_id is only a visibility filter.',
     inputSchema: {
-      query: z.string().optional().describe('Optional title/session catalog filter used only when index_id is omitted.'),
-      index_id: z.string().optional().describe('Definitive indexed-content id returned by search, catalog browse, or index status. Omit for the top-level session catalog.'),
+      query: z.string().optional().describe('Optional title/session catalog filter used only when all_sessions is true and index_id is omitted.'),
+      index_id: z.string().optional().describe('Definitive indexed-content id returned by search, catalog browse, or index status. Omit to browse the current Codex session.'),
       session_id: z.string().optional().describe('Optional visibility filter.'),
+      all_sessions: z.boolean().optional().describe('Explicitly browse the compact catalog of all indexed sessions. Use only when the user asks for cross-session history.'),
       agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
       topic_id: z.string().optional().describe('Opaque topic id returned by a previous conversation_browse response. Use "root" or omit for the root browse.'),
       zoom: z.enum(['children', 'in', 'out', 'siblings']).optional().describe('Navigation mode. Defaults to children, or in when topic_id is supplied.'),
@@ -480,6 +691,8 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     }
   }, async args => {
     lifecycle.rememberIndexRoot()
+    const scope = await defaultToCurrentSessionScope(args)
+    if (scope.scoped && !scope.current.ok) return toolResult(emptyScopedBrowse(scope.current, args))
     const argv = ['browse']
     pushFlag(argv, '--query', args.query)
     pushFlag(argv, '--index-id', args.index_id)
@@ -489,7 +702,19 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     pushFlag(argv, '--zoom', args.zoom)
     pushFlag(argv, '--start', args.start)
     pushFlag(argv, '--limit', args.limit)
-    return toolResult(await callConversationHistory(argv))
+    try {
+      return toolResult(withCurrentScope(await callConversationHistory(argv), scope))
+    } catch (err) {
+      if (scope.scoped && scope.current && scope.current.ok && currentSessionMissingFrom(err)) {
+        return toolResult(emptyScopedBrowse({
+          ...scope.current,
+          status: 'not_indexed',
+          reason: 'current_session_not_indexed',
+          message: 'The current Codex session is not indexed yet.'
+        }, args))
+      }
+      throw err
+    }
   })
 
   server.registerTool('conversation_openLink', {
@@ -511,19 +736,22 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
 
   server.registerTool('conversation_index_status', {
     title: 'Conversation Index Status',
-    description: 'Read compact conversation_history index statuses without importing or summarizing.',
+    description: 'Read compact conversation_history index status without importing or summarizing. Defaults to the current Codex session when no scope is supplied.',
     inputSchema: {
       start_at: z.number().int().min(0).describe('Zero-based session-status page offset. Required.'),
       limit: z.number().int().positive().max(100).describe('Maximum session-status records to return. Required.'),
-      session_id: z.string().optional().describe('Optional indexed session id. If supplied and not indexed, sessions is empty.')
+      session_id: z.string().optional().describe('Optional indexed session id. If supplied and not indexed, sessions is empty.'),
+      all_sessions: z.boolean().optional().describe('Explicitly return a paged status catalog of all indexed sessions. Use only when the user asks for cross-session status.')
     }
   }, async args => {
     lifecycle.rememberIndexRoot()
+    const scope = await defaultToCurrentSessionScope(args)
+    if (scope.scoped && !scope.current.ok) return toolResult(emptyScopedStatus(scope.current, args))
     const argv = ['index_status']
     pushFlag(argv, '--start-at', args.start_at)
     pushFlag(argv, '--limit', args.limit)
     pushFlag(argv, '--session-id', args.session_id)
-    return toolResult(withStatusPollHints(await callConversationHistory(argv)))
+    return toolResult(withCurrentStatusScope(withStatusPollHints(await callConversationHistory(argv)), scope))
   })
 
   server.registerTool('start_indexing_session', {
@@ -666,6 +894,7 @@ module.exports = {
   startStdioServer,
   __testing: {
     discoverExistingSessionMarker,
-    ensureStartSessionMarker
+    ensureStartSessionMarker,
+    resolveCurrentThreadSession
   }
 }

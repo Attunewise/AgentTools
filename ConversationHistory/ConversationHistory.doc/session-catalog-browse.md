@@ -13,7 +13,9 @@ scope:
 
 ConversationHistory supports a top-level browse above individual sessions.
 
-Calling `conversation_browse` without `index_id` returns a manifest-backed session catalog. This path must not import transcripts, start indexing, query Typesense, read every IR file, or inspect full session trees. It reads only the persisted manifest and returns a compact page.
+The CLI `browse` command without `--index-id` returns a manifest-backed session catalog. In the MCP surface, `conversation_browse` defaults to the current Codex session when neither `index_id` nor `session_id` is supplied; callers must pass `all_sessions: true` to request the shared session catalog. If the MCP cannot resolve the current thread through Codex app-server metadata, it returns an empty scoped result rather than substituting the global catalog.
+
+The catalog path must not import transcripts, start indexing, query Typesense, read every IR file, or inspect full session trees. It reads only the persisted manifest and returns a compact page.
 
 The catalog rows include the minimum fields needed to decide where to drill down:
 

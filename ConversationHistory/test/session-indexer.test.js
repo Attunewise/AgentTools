@@ -3551,6 +3551,35 @@ test('MCP marker discovery uses only the last marker as definitive', async () =>
   }), latestMarker)
 })
 
+test('MCP current-thread scope resolves through Codex app-server metadata', async () => {
+  const { __testing: mcpTesting } = require('../src/mcpServer.js')
+  const calls = []
+  const resolved = await mcpTesting.resolveCurrentThreadSession({
+    source: 'codex',
+    current_thread_id: 'thread-current-123',
+    codex_session_service: {
+      appServerThreadRead: async args => {
+        calls.push(args)
+        return {
+          ok: true,
+          status: 'resolved',
+          result: {
+            thread: {
+              id: 'thread-current-123',
+              sessionId: 'session-current-123',
+              path: '/tmp/current-session.jsonl'
+            }
+          }
+        }
+      }
+    }
+  })
+  assert.equal(resolved.ok, true)
+  assert.equal(resolved.threadId, 'thread-current-123')
+  assert.equal(resolved.sessionId, 'session-current-123')
+  assert.deepEqual(calls, [{ threadId: 'thread-current-123', includeTurns: false }])
+})
+
 test('MCP server exposes native conversation search and openLink tools', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-mcp-'))
   const ir = importCodexJsonl(fixture)
@@ -3615,10 +3644,12 @@ test('MCP server exposes native conversation search and openLink tools', async (
     const searchTool = listed.tools.find(tool => tool.name === 'conversation_search')
     assert.ok(searchTool.inputSchema.properties.agent)
     assert.ok(searchTool.inputSchema.properties.filter.properties.agent)
+    assert.ok(searchTool.inputSchema.properties.all_sessions)
     const browseTool = listed.tools.find(tool => tool.name === 'conversation_browse')
     assert.ok(browseTool.inputSchema.properties.query)
     assert.ok(browseTool.inputSchema.properties.agent)
     assert.ok(browseTool.inputSchema.properties.index_id)
+    assert.ok(browseTool.inputSchema.properties.all_sessions)
     assert.ok(browseTool.inputSchema.properties.topic_id)
     assert.ok(browseTool.inputSchema.properties.zoom)
     assert.ok(browseTool.inputSchema.properties.start)
@@ -3629,6 +3660,8 @@ test('MCP server exposes native conversation search and openLink tools', async (
 
     const indexingTool = listed.tools.find(tool => tool.name === 'start_indexing_session')
     assert.deepEqual(Object.keys(indexingTool.inputSchema.properties || {}), ['all'])
+    const statusTool = listed.tools.find(tool => tool.name === 'conversation_index_status')
+    assert.ok(statusTool.inputSchema.properties.all_sessions)
     // Redeploy target is decided by the install context, never a model argument.
     const redeployTool = listed.tools.find(tool => tool.name === 'redeploy_session_index_mcp')
     assert.equal(Object.hasOwn(redeployTool.inputSchema.properties || {}, 'target'), false)
@@ -3646,9 +3679,48 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.doesNotMatch(prompt.messages[0].content.text, /start_indexing_session first/)
     assert.doesNotMatch(prompt.messages[0].content.text, /typesense|backend|serverIndex|search_backend|search-backend/i)
 
+    const scopedBrowse = (await client.callTool({
+      name: 'conversation_browse',
+      arguments: {
+        limit: 1
+      }
+    })).structuredContent.result
+    assert.equal(scopedBrowse.schema, 'session-indexer.browse.v1')
+    assert.equal(scopedBrowse.status, 'blocked')
+    assert.equal(scopedBrowse.reason, 'missing_current_thread_id')
+    assert.deepEqual(scopedBrowse.sessions, [])
+    assert.doesNotMatch(JSON.stringify(scopedBrowse), /mini-session|clientRevision|atlas/)
+
+    const scopedStatus = (await client.callTool({
+      name: 'conversation_index_status',
+      arguments: {
+        start_at: 0,
+        limit: 1
+      }
+    })).structuredContent.result
+    assert.equal(scopedStatus.schema, 'session-indexer.index_status.v1')
+    assert.equal(scopedStatus.status, 'blocked')
+    assert.equal(scopedStatus.reason, 'missing_current_thread_id')
+    assert.deepEqual(scopedStatus.sessions, [])
+    assert.doesNotMatch(JSON.stringify(scopedStatus), /mini-session|clientRevision|atlas/)
+
+    const scopedSearch = (await client.callTool({
+      name: 'conversation_search',
+      arguments: {
+        query: 'clientRevision atlas',
+        limit: 1
+      }
+    })).structuredContent.result
+    assert.equal(scopedSearch.schema, 'session-indexer.search.v1')
+    assert.equal(scopedSearch.status, 'blocked')
+    assert.equal(scopedSearch.reason, 'missing_current_thread_id')
+    assert.deepEqual(scopedSearch.hits, [])
+    assert.doesNotMatch(JSON.stringify(scopedSearch), /mini-session/)
+
     const catalogBrowse = (await client.callTool({
       name: 'conversation_browse',
       arguments: {
+        all_sessions: true,
         limit: 1
       }
     })).structuredContent.result
