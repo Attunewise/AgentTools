@@ -331,7 +331,17 @@ const assertToolBehavior = root => {
       mcpResults.push({ tool, isError: Boolean(ok && ok.isError) })
     }
   }
-  assert.ok(mcpResults.length >= 6, 'expected recorded MCP results for negative scenario')
+  for (const required of [
+    'codex_session_status',
+    'worktree_status',
+    'conversation_browse'
+  ]) {
+    assert.ok(mcpResults.some(result => result.tool === required), `expected recorded MCP result for ${required}`)
+  }
+  assert.ok(
+    mcpResults.some(result => String(result.tool || '').startsWith('agentdoc_')),
+    'expected recorded MCP result for an AgentDoc source-of-truth tool'
+  )
   for (const result of mcpResults) {
     assert.equal(result.isError, false, `expected ${result.tool} not to return isError`)
   }

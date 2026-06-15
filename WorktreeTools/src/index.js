@@ -28,6 +28,14 @@ const runGit = (args, cwd, options = {}) => {
 
 const absoluteGitPath = (root, value) => path.isAbsolute(value) ? value : path.resolve(root, value)
 
+const realPath = value => {
+  try {
+    return fs.realpathSync.native ? fs.realpathSync.native(value) : fs.realpathSync(value)
+  } catch (_) {
+    return path.resolve(value)
+  }
+}
+
 const gitPath = (root, rel) => {
   const value = runGit(['rev-parse', '--git-path', rel], root).trim()
   return absoluteGitPath(root, value)
@@ -64,17 +72,30 @@ const resolveWorktree = cwd => {
   const gitDir = absoluteGitPath(root, runGit(['rev-parse', '--git-dir'], root).trim())
   const commonGitDir = absoluteGitPath(root, runGit(['rev-parse', '--git-common-dir'], root).trim())
   const superproject = runGit(['rev-parse', '--show-superproject-working-tree'], root).trim()
+  const privatePaths = {
+    index: gitPath(root, 'index'),
+    head: gitPath(root, 'HEAD')
+  }
+  const identityMaterial = {
+    schema: 'worktree-tools.identity-key.v1',
+    root: realPath(root),
+    git_dir: realPath(gitDir),
+    common_git_dir: realPath(commonGitDir),
+    superproject: superproject ? realPath(superproject) : null,
+    private_paths: {
+      index: realPath(privatePaths.index),
+      head: realPath(privatePaths.head)
+    }
+  }
   return {
     schema: 'worktree-tools.identity.v1',
     root,
+    worktree_id: `sha256:${sha256(JSON.stringify(identityMaterial))}`,
     git_dir: gitDir,
     common_git_dir: commonGitDir,
     is_linked_worktree: path.resolve(gitDir) !== path.resolve(commonGitDir),
     superproject: superproject || null,
-    private_paths: {
-      index: gitPath(root, 'index'),
-      head: gitPath(root, 'HEAD')
-    }
+    private_paths: privatePaths
   }
 }
 
@@ -201,10 +222,11 @@ const renderWorktreeCompact = snapshot => {
   const bits = [
     'ok',
     `repo=${shorten(snapshot.root)}`,
+    snapshot.worktree_id ? `id=${shorten(snapshot.worktree_id, 18)}` : null,
     snapshot.branch ? `branch=${snapshot.branch}` : 'branch=detached',
     `staged=${snapshot.staged_file_count}`,
     `dirty=${snapshot.status ? snapshot.status.dirty : 0}`
-  ]
+  ].filter(Boolean)
   if (snapshot.is_linked_worktree) bits.push('linked=1')
   return bits.join(' ')
 }
@@ -229,6 +251,100 @@ const safeSnapshotWorktree = cwd => {
   }
 }
 
+const worktreeRef = (snapshot, source) => snapshot
+  ? {
+      source,
+      repo: snapshot.root || snapshot.repo,
+      worktree_id: snapshot.worktree_id
+    }
+  : null
+
+const worktreeGuard = ({
+  workdir = process.cwd(),
+  expectedWorkdir,
+  expected_workdir,
+  expectedWorktreeId,
+  expected_worktree_id,
+  sessionSnapshot,
+  session_snapshot,
+  intent
+} = {}) => {
+  const actualResult = safeSnapshotWorktree(workdir)
+  if (!actualResult.ok) {
+    return {
+      schema: 'worktree-tools.guard.v1',
+      ok: false,
+      status: 'blocked',
+      reason: 'actual_not_git_repo',
+      intent: intent || null,
+      actual: {
+        source: 'actual',
+        workdir,
+        status: actualResult.status,
+        reason: actualResult.reason
+      },
+      expected: null
+    }
+  }
+
+  let expected = null
+  const explicitExpectedId = expectedWorktreeId || expected_worktree_id
+  const explicitExpectedWorkdir = expectedWorkdir || expected_workdir
+  const session = sessionSnapshot || session_snapshot
+
+  if (explicitExpectedId) {
+    expected = {
+      source: 'expected_worktree_id',
+      worktree_id: explicitExpectedId
+    }
+  } else if (explicitExpectedWorkdir) {
+    const expectedResult = safeSnapshotWorktree(explicitExpectedWorkdir)
+    if (!expectedResult.ok) {
+      return {
+        schema: 'worktree-tools.guard.v1',
+        ok: false,
+        status: 'blocked',
+        reason: 'expected_not_git_repo',
+        intent: intent || null,
+        actual: worktreeRef(actualResult.snapshot, 'actual'),
+        expected: {
+          source: 'expected_workdir',
+          workdir: explicitExpectedWorkdir,
+          status: expectedResult.status,
+          reason: expectedResult.reason
+        }
+      }
+    }
+    expected = worktreeRef(expectedResult.snapshot, 'expected_workdir')
+  } else if (session && session.worktree_id) {
+    expected = worktreeRef(session, 'session_worktree')
+  }
+
+  if (!expected || !expected.worktree_id) {
+    return {
+      schema: 'worktree-tools.guard.v1',
+      ok: false,
+      status: 'blocked',
+      reason: 'missing_expected_worktree',
+      intent: intent || null,
+      actual: worktreeRef(actualResult.snapshot, 'actual'),
+      expected: null
+    }
+  }
+
+  const actual = worktreeRef(actualResult.snapshot, 'actual')
+  const matched = actual.worktree_id === expected.worktree_id
+  return {
+    schema: 'worktree-tools.guard.v1',
+    ok: matched,
+    status: matched ? 'matched' : 'blocked',
+    reason: matched ? null : 'worktree_mismatch',
+    intent: intent || null,
+    actual,
+    expected
+  }
+}
+
 module.exports = {
   NULL_HEAD,
   currentBranch,
@@ -239,6 +355,7 @@ module.exports = {
   parseNameStatusZ,
   parseWorktreeList,
   porcelainV2,
+  realPath,
   renderWorktreeCompact,
   resolveWorktree,
   runGit,
@@ -247,5 +364,7 @@ module.exports = {
   stagedFingerprint,
   stagedNameStatus,
   statusCounts,
-  upstreamBranch
+  upstreamBranch,
+  worktreeGuard,
+  worktreeRef
 }

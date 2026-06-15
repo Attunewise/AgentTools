@@ -4,7 +4,8 @@ const { z } = require('zod')
 
 const {
   renderWorktreeCompact,
-  safeSnapshotWorktree
+  safeSnapshotWorktree,
+  worktreeGuard
 } = require('./index.js')
 
 const shortenMiddle = (value, max = 96) => {
@@ -29,6 +30,7 @@ const summarizeSnapshot = result => {
     ok: true,
     status: 'resolved',
     repo: snapshot.root,
+    worktree_id: snapshot.worktree_id,
     branch: snapshot.branch,
     upstream: snapshot.upstream,
     linked_worktree: snapshot.is_linked_worktree,
@@ -47,6 +49,7 @@ const renderSummary = result => {
   const bits = [
     'ok',
     `repo=${shortenMiddle(result.repo, 80)}`,
+    result.worktree_id ? `id=${shortenMiddle(result.worktree_id, 28)}` : null,
     result.branch ? `branch=${result.branch}` : 'branch=detached',
     `staged=${result.staged_file_count}`,
     `dirty=${result.dirty}`,
@@ -56,10 +59,27 @@ const renderSummary = result => {
   return bits.join(' ')
 }
 
-const toolResult = result => ({
+const renderGuardSummary = result => {
+  if (!result || result.ok === false) {
+    const bits = [
+      'blocked',
+      `reason=${result && result.reason || 'unknown'}`,
+      result && result.actual && result.actual.worktree_id ? `actual=${shortenMiddle(result.actual.worktree_id, 28)}` : null,
+      result && result.expected && result.expected.worktree_id ? `expected=${shortenMiddle(result.expected.worktree_id, 28)}` : null
+    ].filter(Boolean)
+    return bits.join(' ')
+  }
+  return [
+    'matched',
+    result.actual && result.actual.worktree_id ? `id=${shortenMiddle(result.actual.worktree_id, 28)}` : null,
+    result.actual && result.actual.repo ? `repo=${shortenMiddle(result.actual.repo, 80)}` : null
+  ].filter(Boolean).join(' ')
+}
+
+const toolResult = (result, render = renderSummary) => ({
   content: [{
     type: 'text',
-    text: renderSummary(result)
+    text: render(result)
   }],
   structuredContent: {
     result
@@ -96,6 +116,17 @@ const registerTools = server => {
           staged_files_omitted: summary.staged_files_omitted
         })
   })
+
+  server.registerTool('worktree_guard', {
+    title: 'Worktree Identity Guard',
+    description: 'Compare a target workdir against an expected worktree identity. Returns only identity match/mismatch; use worktree_status for dirty or staged state.',
+    inputSchema: {
+      workdir: z.string().optional().describe('Path the next write or command intends to target. Defaults to the MCP server working directory.'),
+      expected_workdir: z.string().optional().describe('Path inside the expected worktree. The tool resolves it to a canonical worktree id.'),
+      expected_worktree_id: z.string().optional().describe('Previously observed canonical worktree id from worktree_status.'),
+      intent: z.string().optional().describe('Short optional label for the guarded action.')
+    }
+  }, async args => toolResult(worktreeGuard(args), renderGuardSummary))
 }
 
 const createMcpServer = () => {
@@ -115,6 +146,7 @@ const startStdioServer = async () => {
 module.exports = {
   createMcpServer,
   registerTools,
+  renderGuardSummary,
   renderSummary,
   startStdioServer,
   summarizeSnapshot
