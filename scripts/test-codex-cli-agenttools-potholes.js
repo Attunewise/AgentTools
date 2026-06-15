@@ -211,18 +211,29 @@ createMcpServer({ clientFactory: () => fakeClient })
 `, 0o755)
 
 const mcpScripts = ({ root, conversationIndexRoot }) => ({
-  agentdoc: path.join(REPO_ROOT, 'AgentDoc', 'bin', 'agentdoc-mcp.js'),
+  agentdoc: makeWrapper({
+    root,
+    name: 'agentdoc-mcp',
+    env: { AGENTTOOLS_MCP_LOG_DIR: path.join(root, '.mcp-logs') },
+    modulePath: path.join(REPO_ROOT, 'AgentDoc', 'bin', 'agentdoc-mcp.js')
+  }),
   conversation_history: makeWrapper({
     root,
     name: 'conversation-history-mcp',
     env: {
+      AGENTTOOLS_MCP_LOG_DIR: path.join(root, '.mcp-logs'),
       SESSION_INDEXER_STATE_DIR: conversationIndexRoot,
       SESSION_INDEXER_SUMMARY_MODE: 'off'
     },
     modulePath: path.join(REPO_ROOT, 'ConversationHistory', 'bin', 'session-indexer-mcp.js')
   }),
   codex_session: makeDegradedCodexSessionWrapper(root),
-  worktree: path.join(REPO_ROOT, 'WorktreeTools', 'bin', 'worktree-mcp.js')
+  worktree: makeWrapper({
+    root,
+    name: 'worktree-mcp',
+    env: { AGENTTOOLS_MCP_LOG_DIR: path.join(root, '.mcp-logs') },
+    modulePath: path.join(REPO_ROOT, 'WorktreeTools', 'bin', 'worktree-mcp.js')
+  })
 })
 
 const EXPECTED_MCP_TOOLS = {
@@ -238,6 +249,10 @@ const preflightMcpTools = async ({ root, conversationIndexRoot }) => {
       command: process.execPath,
       args: [script],
       cwd: root,
+      env: {
+        ...process.env,
+        AGENTTOOLS_MCP_LOG_DIR: path.join(root, '.mcp-logs')
+      },
       stderr: 'pipe'
     })
     const client = new Client({ name: `agenttools-potholes-preflight-${name}`, version: '0.1.0' })
@@ -269,6 +284,7 @@ Finish only after ${JSON.stringify(report)} exists and is valid JSON.
   const args = [
     'env',
     'TERM=xterm-256color',
+    `AGENTTOOLS_MCP_LOG_DIR=${path.join(root, '.mcp-logs')}`,
     'codex',
     '--no-alt-screen',
     '--cd', root,

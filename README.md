@@ -26,3 +26,13 @@ node scripts/install-codex-plugins.js --skip-upgrade
 ```
 
 Use `node scripts/install-codex-plugins.js --deploy --skip-upgrade` to do both steps in one command.
+
+## MCP Server Logs
+
+AgentTools MCP servers write small lifecycle/error JSONL logs to:
+
+```sh
+~/.local/share/agenttools/mcp-logs/
+```
+
+Set `AGENTTOOLS_MCP_LOG_DIR` to override the directory. Logs are intentionally sparse and rotate at 256 KiB per server; they record startup, connection, stdin close, shutdown signals, process exit, and uncaught/unhandled errors.

@@ -7,6 +7,7 @@ const {
   safeSnapshotWorktree,
   worktreeGuard
 } = require('./index.js')
+const { createMcpLogger, installMcpProcessLogging } = require('./mcpLog.js')
 
 const shortenMiddle = (value, max = 96) => {
   const text = String(value || '')
@@ -139,8 +140,22 @@ const createMcpServer = () => {
 }
 
 const startStdioServer = async () => {
+  const logger = createMcpLogger('worktree_tools')
+  installMcpProcessLogging(logger)
+  logger.info('start', {
+    cwd: process.cwd(),
+    node: process.version,
+    execPath: process.execPath,
+    log: logger.file
+  })
   const server = createMcpServer()
-  await server.connect(new StdioServerTransport())
+  try {
+    await server.connect(new StdioServerTransport())
+    logger.info('connected')
+  } catch (err) {
+    logger.error('startup_error', err)
+    throw err
+  }
 }
 
 module.exports = {

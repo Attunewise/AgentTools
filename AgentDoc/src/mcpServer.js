@@ -3,6 +3,7 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const { z } = require('zod')
 
 const { AgentDocServerState } = require('./server.js')
+const { createMcpLogger, installMcpProcessLogging } = require('./mcpLog.js')
 
 const shorten = (value, max = 88) => {
   const text = String(value || '')
@@ -195,14 +196,29 @@ const createMcpServer = ({ state = new AgentDocServerState() } = {}) => {
 }
 
 const startStdioServer = async (options = {}) => {
+  const logger = createMcpLogger('agentdoc')
+  installMcpProcessLogging(logger)
+  logger.info('start', {
+    cwd: process.cwd(),
+    node: process.version,
+    execPath: process.execPath,
+    log: logger.file
+  })
   const state = new AgentDocServerState(options)
   const shutdown = async () => {
+    logger.info('shutdown')
     await state.stop()
   }
   process.once('SIGINT', shutdown)
   process.once('SIGTERM', shutdown)
   const server = createMcpServer({ state })
-  await server.connect(new StdioServerTransport())
+  try {
+    await server.connect(new StdioServerTransport())
+    logger.info('connected')
+  } catch (err) {
+    logger.error('startup_error', err)
+    throw err
+  }
 }
 
 module.exports = {

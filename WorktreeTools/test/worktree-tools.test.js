@@ -139,6 +139,10 @@ test('MCP worktree_status returns only compact entry-point data', async () => {
       command: process.execPath,
       args: [path.join(__dirname, '..', 'bin', 'worktree-mcp.js')],
       cwd: root,
+      env: {
+        ...process.env,
+        AGENTTOOLS_MCP_LOG_DIR: path.join(root, 'mcp-logs')
+      },
       stderr: 'pipe'
     })
     const client = new Client({ name: 'worktree-tools-test', version: '0.1.0' })

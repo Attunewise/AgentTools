@@ -3595,6 +3595,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     args: [path.join(__dirname, '..', 'bin', 'session-indexer-mcp.js')],
     cwd: path.join(__dirname, '..'),
     env: {
+      AGENTTOOLS_MCP_LOG_DIR: path.join(root, 'mcp-logs'),
       SESSION_INDEXER_STATE_DIR: root,
       SESSION_INDEXER_SUMMARY_MODE: 'off'
     },

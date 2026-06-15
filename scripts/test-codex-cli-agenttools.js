@@ -103,15 +103,33 @@ ${envLines}require(${JSON.stringify(modulePath)})
 }
 
 const mcpScripts = ({ root, conversationIndexRoot }) => ({
-  agentdoc: path.join(REPO_ROOT, 'AgentDoc', 'bin', 'agentdoc-mcp.js'),
+  agentdoc: makeWrapper({
+    root,
+    name: 'agentdoc-mcp',
+    env: { AGENTTOOLS_MCP_LOG_DIR: path.join(root, '.mcp-logs') },
+    modulePath: path.join(REPO_ROOT, 'AgentDoc', 'bin', 'agentdoc-mcp.js')
+  }),
   conversation_history: makeWrapper({
     root,
     name: 'conversation-history-mcp',
-    env: { SESSION_INDEXER_STATE_DIR: conversationIndexRoot },
+    env: {
+      AGENTTOOLS_MCP_LOG_DIR: path.join(root, '.mcp-logs'),
+      SESSION_INDEXER_STATE_DIR: conversationIndexRoot
+    },
     modulePath: path.join(REPO_ROOT, 'ConversationHistory', 'bin', 'session-indexer-mcp.js')
   }),
-  codex_session: path.join(REPO_ROOT, 'CodexSessionTools', 'bin', 'codex-session-mcp.js'),
-  worktree: path.join(REPO_ROOT, 'WorktreeTools', 'bin', 'worktree-mcp.js')
+  codex_session: makeWrapper({
+    root,
+    name: 'codex-session-mcp',
+    env: { AGENTTOOLS_MCP_LOG_DIR: path.join(root, '.mcp-logs') },
+    modulePath: path.join(REPO_ROOT, 'CodexSessionTools', 'bin', 'codex-session-mcp.js')
+  }),
+  worktree: makeWrapper({
+    root,
+    name: 'worktree-mcp',
+    env: { AGENTTOOLS_MCP_LOG_DIR: path.join(root, '.mcp-logs') },
+    modulePath: path.join(REPO_ROOT, 'WorktreeTools', 'bin', 'worktree-mcp.js')
+  })
 })
 
 const EXPECTED_MCP_TOOLS = {
@@ -132,6 +150,10 @@ const preflightMcpTools = async ({ root, conversationIndexRoot }) => {
       command: process.execPath,
       args: [script],
       cwd: root,
+      env: {
+        ...process.env,
+        AGENTTOOLS_MCP_LOG_DIR: path.join(root, '.mcp-logs')
+      },
       stderr: 'pipe'
     })
     const client = new Client({ name: `agenttools-preflight-${name}`, version: '0.1.0' })
@@ -171,6 +193,7 @@ Finish only after the JSON file exists.
   const args = [
     'env',
     'TERM=xterm-256color',
+    `AGENTTOOLS_MCP_LOG_DIR=${path.join(root, '.mcp-logs')}`,
     'codex',
     '--no-alt-screen',
     '--cd', root,

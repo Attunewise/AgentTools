@@ -5,6 +5,7 @@ const { z } = require('zod')
 
 const { connectOrStartCodexSessionServer } = require('./client.js')
 const { defaultCodexSessionRoot } = require('./index.js')
+const { createMcpLogger, installMcpProcessLogging } = require('./mcpLog.js')
 const { renderForTool, shortenMiddle } = require('./render.js')
 
 const MARKER_PREFIXES = {
@@ -190,8 +191,22 @@ const createMcpServer = ({
 }
 
 const startStdioServer = async options => {
+  const logger = createMcpLogger('codex_session_tools')
+  installMcpProcessLogging(logger)
+  logger.info('start', {
+    cwd: process.cwd(),
+    node: process.version,
+    execPath: process.execPath,
+    log: logger.file
+  })
   const server = createMcpServer(options)
-  await server.connect(new StdioServerTransport())
+  try {
+    await server.connect(new StdioServerTransport())
+    logger.info('connected')
+  } catch (err) {
+    logger.error('startup_error', err)
+    throw err
+  }
 }
 
 module.exports = {

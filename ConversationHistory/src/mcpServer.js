@@ -12,6 +12,7 @@ const {
 } = require('codex-session-tools')
 const { connectOrStartCodexSessionServer } = require('codex-session-tools/src/client.js')
 const { CodexAppServerClient } = require('codex-session-tools/src/appServerClient.js')
+const { createMcpLogger, installMcpProcessLogging } = require('./mcpLog.js')
 
 const REPO_ROOT = path.resolve(__dirname, '..')
 const CLI_PATH = path.join(REPO_ROOT, 'bin', 'session-indexer.js')
@@ -878,10 +879,24 @@ const createMcpServer = ({ lifecycle = createPluginLifecycle() } = {}) => {
 }
 
 const startStdioServer = async () => {
+  const logger = createMcpLogger('conversation_history')
+  installMcpProcessLogging(logger)
+  logger.info('start', {
+    cwd: process.cwd(),
+    node: process.version,
+    execPath: process.execPath,
+    log: logger.file
+  })
   const lifecycle = createPluginLifecycle()
   installShutdownHandlers(lifecycle)
   const server = createMcpServer({ lifecycle })
-  await server.connect(new StdioServerTransport())
+  try {
+    await server.connect(new StdioServerTransport())
+    logger.info('connected')
+  } catch (err) {
+    logger.error('startup_error', err)
+    throw err
+  }
 }
 
 module.exports = {
