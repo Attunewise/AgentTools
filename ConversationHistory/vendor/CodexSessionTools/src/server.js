@@ -2,11 +2,10 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const {
-  DEFAULT_WINDOW_BYTES,
   codexHomeForSessionsRoot,
   defaultCodexSessionRoot,
+  fileLatestPatternMatch,
   readCodexThreadSpawnEdges,
-  readFileWindow,
   resolveCodexSessionForMarker,
   walkJsonlFiles
 } = require('./index.js')
@@ -39,6 +38,7 @@ class CodexSessionServerState {
       dir: options.diagnosticsDir,
       persist: options.persistDiagnostics !== false
     })
+    this.markerLookupCache = options.markerLookupCache || new Map()
     this.events = []
     this.watchers = []
     this.pollTimer = null
@@ -198,30 +198,35 @@ class CodexSessionServerState {
     return resolveCodexSessionForMarker(args.root || this.sessionRoot, args.marker, {
       ...args,
       sessionFiles: this.sessions,
-      threadSpawnEdges: this.threadSpawnEdges
+      threadSpawnEdges: this.threadSpawnEdges,
+      markerLookupCache: this.markerLookupCache
     })
   }
 
   latestMarker(args = {}) {
     const pattern = parseMarkerPattern(args.pattern)
-    const maxBytes = args.maxBytes || DEFAULT_WINDOW_BYTES
+    const maxBytes = Number(args.maxBytes)
     const limit = args.limit || 100
     const candidates = this.sessions.slice(0, limit)
     const matches = []
     for (const item of candidates) {
-      const window = readFileWindow(item.file, maxBytes)
-      if (!window || !window.text) continue
-      let last = null
-      for (const match of window.text.matchAll(pattern)) {
-        last = {
-          marker: match[0],
-          file: item.file,
-          mtimeMs: item.mtimeMs,
-          size: item.size,
-          byteOffset: window.start + match.index
-        }
-      }
-      if (last) matches.push(last)
+      const startOffset = Number.isFinite(maxBytes) && maxBytes > 0
+        ? Math.max(0, item.size - maxBytes)
+        : 0
+      const match = fileLatestPatternMatch({
+        file: item.file,
+        pattern,
+        startOffset
+      })
+      if (!match) continue
+      matches.push({
+        marker: match.marker,
+        file: item.file,
+        mtimeMs: item.mtimeMs,
+        size: item.size,
+        byteOffset: match.byteOffset,
+        scan: match.scan
+      })
     }
     matches.sort((a, b) =>
       b.mtimeMs - a.mtimeMs ||

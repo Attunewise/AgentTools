@@ -21,6 +21,7 @@ const {
 const DEFAULT_SESSION_SCAN_LIMIT = 100
 const DEFAULT_WINDOW_BYTES = 8 * 1024 * 1024
 const DEFAULT_PREVIEW_CHARS = 240
+const MARKER_SCAN_CHUNK_BYTES = 64 * 1024
 
 const defaultCodexSessionRoot = () => path.join(os.homedir(), '.codex', 'sessions')
 
@@ -44,7 +45,7 @@ const walkJsonlFiles = root => {
       else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
         try {
           const stat = fs.statSync(full)
-          files.push({ file: full, mtimeMs: stat.mtimeMs, size: stat.size })
+          files.push({ file: full, mtimeMs: stat.mtimeMs, size: stat.size, dev: stat.dev, ino: stat.ino })
         } catch (_) {
           // Ignore files that disappear while Codex is writing session logs.
         }
@@ -88,50 +89,208 @@ const readFileWindow = (file, maxBytes = DEFAULT_WINDOW_BYTES) => {
   }
 }
 
-const fileContainsLiteral = ({ file, literal, tailBytes = DEFAULT_WINDOW_BYTES }) => {
+const fileFingerprintFromStat = stat => stat
+  ? {
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      dev: stat.dev,
+      ino: stat.ino
+    }
+  : null
+
+const fileFingerprint = item => {
+  if (item && Number.isFinite(item.size) && Number.isFinite(item.mtimeMs)) {
+    return {
+      size: item.size,
+      mtimeMs: item.mtimeMs,
+      dev: item.dev,
+      ino: item.ino
+    }
+  }
+  try {
+    return fileFingerprintFromStat(fs.statSync(item.file || item))
+  } catch (_) {
+    return null
+  }
+}
+
+const sameFingerprint = (left, right) => Boolean(left && right) &&
+  left.size === right.size &&
+  left.mtimeMs === right.mtimeMs &&
+  (left.dev === undefined || right.dev === undefined || left.dev === right.dev) &&
+  (left.ino === undefined || right.ino === undefined || left.ino === right.ino)
+
+const markerCacheKey = (root, marker) => `${path.resolve(root || defaultCodexSessionRoot())}\0${marker}`
+
+const markerCacheEntry = (cache, root, marker) => {
+  if (!cache || typeof cache.get !== 'function' || typeof cache.set !== 'function') return null
+  const key = markerCacheKey(root, marker)
+  let entry = cache.get(key)
+  if (!entry) {
+    entry = {
+      matches: new Map(),
+      misses: new Map()
+    }
+    cache.set(key, entry)
+  }
+  return entry
+}
+
+const readRangeContainsLiteral = ({ file, literal, start, end }) => {
   const needle = Buffer.from(String(literal || ''))
   if (!needle.length) return null
   let fd
   try {
     fd = fs.openSync(file, 'r')
     const stat = fs.fstatSync(fd)
-    const readRegion = ({ start, end, scan }) => {
-      const length = Math.max(0, end - start)
-      if (!length) return null
-      const buffer = Buffer.allocUnsafe(length)
-      fs.readSync(fd, buffer, 0, length, start)
-      const index = buffer.indexOf(needle)
-      return index >= 0
-        ? {
-            byteOffset: start + index,
-            scan
-          }
-        : null
+    const safeStart = Math.max(0, Math.min(Number(start) || 0, stat.size))
+    const safeEnd = Math.max(safeStart, Math.min(Number(end) || 0, stat.size))
+    const length = safeEnd - safeStart
+    if (!length) return null
+    const buffer = Buffer.allocUnsafe(length)
+    fs.readSync(fd, buffer, 0, length, safeStart)
+    const index = buffer.indexOf(needle)
+    if (index < 0) return null
+    return {
+      byteOffset: safeStart + index,
+      lineStart: safeStart,
+      lineEnd: safeEnd,
+      scan: 'cache_verified',
+      fingerprint: fileFingerprintFromStat(stat)
     }
+  } catch (_) {
+    return null
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd)
+      } catch (_) {
+        // Nothing useful to report.
+      }
+    }
+  }
+}
 
-    const tailStart = Math.max(0, stat.size - tailBytes - Math.max(0, needle.length - 1))
-    const tailMatch = readRegion({ start: tailStart, end: stat.size, scan: 'tail' })
-    if (tailMatch) return tailMatch
-    if (tailStart <= 0) return null
-
-    const chunkSize = 1024 * 1024
-    let position = 0
-    let carry = Buffer.alloc(0)
-    while (position < tailStart) {
-      const readSize = Math.min(chunkSize, tailStart - position)
-      const chunk = Buffer.allocUnsafe(readSize)
-      fs.readSync(fd, chunk, 0, readSize, position)
-      const combined = carry.length ? Buffer.concat([carry, chunk]) : chunk
-      const index = combined.indexOf(needle)
+const fileContainsLiteral = ({ file, literal, startOffset = 0, chunkBytes = MARKER_SCAN_CHUNK_BYTES }) => {
+  const needle = Buffer.from(String(literal || ''))
+  if (!needle.length) return null
+  let fd
+  try {
+    fd = fs.openSync(file, 'r')
+    const stat = fs.fstatSync(fd)
+    const floor = Math.max(0, Math.min(Number(startOffset) || 0, stat.size))
+    let position = stat.size
+    let tail = Buffer.alloc(0)
+    while (position > floor) {
+      const readStart = Math.max(floor, position - chunkBytes)
+      const length = position - readStart
+      const chunk = Buffer.allocUnsafe(length)
+      fs.readSync(fd, chunk, 0, length, readStart)
+      const combined = tail.length ? Buffer.concat([chunk, tail]) : chunk
+      let lineEnd = combined.length
+      for (let i = combined.length - 1; i >= 0; i--) {
+        if (combined[i] !== 0x0a) continue
+        const lineStart = i + 1
+        const line = combined.subarray(lineStart, lineEnd)
+        const index = line.indexOf(needle)
+        if (index >= 0) {
+          return {
+            byteOffset: readStart + lineStart + index,
+            lineStart: readStart + lineStart,
+            lineEnd: readStart + lineEnd,
+            scan: 'backward_line',
+            fingerprint: fileFingerprintFromStat(stat)
+          }
+        }
+        lineEnd = i
+      }
+      tail = combined.subarray(0, lineEnd)
+      position = readStart
+    }
+    if (tail.length) {
+      const index = tail.indexOf(needle)
       if (index >= 0) {
         return {
-          byteOffset: position - carry.length + index,
-          scan: 'full'
+          byteOffset: floor + index,
+          lineStart: floor,
+          lineEnd: floor + tail.length,
+          scan: 'backward_line',
+          fingerprint: fileFingerprintFromStat(stat)
         }
       }
-      carry = combined.slice(-Math.max(0, needle.length - 1))
-      position += readSize
     }
+    return null
+  } catch (_) {
+    return null
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd)
+      } catch (_) {
+        // Nothing useful to report.
+      }
+    }
+  }
+}
+
+const globalPatternForLine = pattern => {
+  const source = pattern instanceof RegExp ? pattern.source : String(pattern || '')
+  const inputFlags = pattern instanceof RegExp ? pattern.flags : ''
+  const flags = new Set(inputFlags.replace(/y/g, '').split('').filter(Boolean))
+  flags.add('g')
+  return new RegExp(source, Array.from(flags).join(''))
+}
+
+const latestRegexMatch = (pattern, text) => {
+  const regex = globalPatternForLine(pattern)
+  let latest = null
+  for (const match of text.matchAll(regex)) latest = match
+  return latest
+}
+
+const fileLatestPatternMatch = ({ file, pattern, startOffset = 0, chunkBytes = MARKER_SCAN_CHUNK_BYTES }) => {
+  let fd
+  try {
+    fd = fs.openSync(file, 'r')
+    const stat = fs.fstatSync(fd)
+    const floor = Math.max(0, Math.min(Number(startOffset) || 0, stat.size))
+    let position = stat.size
+    let tail = Buffer.alloc(0)
+    const inspectLine = (line, lineStart, lineEnd) => {
+      const text = line.toString('utf8')
+      const match = latestRegexMatch(pattern, text)
+      if (!match) return null
+      return {
+        marker: match[0],
+        byteOffset: lineStart + Buffer.byteLength(text.slice(0, match.index)),
+        lineStart,
+        lineEnd,
+        scan: 'backward_line',
+        fingerprint: fileFingerprintFromStat(stat)
+      }
+    }
+    while (position > floor) {
+      const readStart = Math.max(floor, position - chunkBytes)
+      const length = position - readStart
+      const chunk = Buffer.allocUnsafe(length)
+      fs.readSync(fd, chunk, 0, length, readStart)
+      const combined = tail.length ? Buffer.concat([chunk, tail]) : chunk
+      let lineEnd = combined.length
+      for (let i = combined.length - 1; i >= 0; i--) {
+        if (combined[i] !== 0x0a) continue
+        const lineStart = i + 1
+        const found = inspectLine(
+          combined.subarray(lineStart, lineEnd),
+          readStart + lineStart,
+          readStart + lineEnd
+        )
+        if (found) return found
+        lineEnd = i
+      }
+      tail = combined.subarray(0, lineEnd)
+      position = readStart
+    }
+    if (tail.length) return inspectLine(tail, floor, floor + tail.length)
     return null
   } catch (_) {
     return null
@@ -347,12 +506,64 @@ const recentSessionFileItems = (items, options = {}) => {
 }
 
 const scoreCodexSessionMarkerFile = (item, marker, options = {}) => {
+  const fingerprint = fileFingerprint(item)
+  const cacheEntry = markerCacheEntry(options.markerLookupCache, options.root, marker)
+  const cachedMatch = cacheEntry && cacheEntry.matches.get(item.file)
+  if (cachedMatch) {
+    const verified = readRangeContainsLiteral({
+      file: item.file,
+      literal: marker,
+      start: cachedMatch.lineStart,
+      end: cachedMatch.lineEnd
+    })
+    if (verified) {
+      cacheEntry.matches.set(item.file, { ...cachedMatch, ...verified, fingerprint: verified.fingerprint || fingerprint })
+      return {
+        file: item.file,
+        sessionId: codexSessionIdFromFile(item.file),
+        mtimeMs: item.mtimeMs,
+        size: item.size,
+        signals: {
+          sessionMarkerMatch: {
+            marker,
+            byteOffset: verified.byteOffset,
+            scan: verified.scan
+          }
+        }
+      }
+    }
+    cacheEntry.matches.delete(item.file)
+  }
+
+  let startOffset = 0
+  const cachedMiss = cacheEntry && cacheEntry.misses.get(item.file)
+  if (cachedMiss && sameFingerprint(cachedMiss.fingerprint, fingerprint)) return null
+  if (cachedMiss && cachedMiss.fingerprint && fingerprint && fingerprint.size > cachedMiss.fingerprint.size) {
+    startOffset = Math.max(0, cachedMiss.fingerprint.size - Buffer.byteLength(String(marker)) + 1)
+  }
+
   const match = fileContainsLiteral({
     file: item.file,
     literal: marker,
-    tailBytes: options.sessionMarkerScanBytes || options.maxBytes || DEFAULT_WINDOW_BYTES
+    startOffset,
+    chunkBytes: options.sessionMarkerChunkBytes || MARKER_SCAN_CHUNK_BYTES
   })
-  if (!match) return null
+  if (!match) {
+    if (cacheEntry) {
+      cacheEntry.misses.set(item.file, { fingerprint })
+      cacheEntry.matches.delete(item.file)
+    }
+    return null
+  }
+  if (cacheEntry) {
+    cacheEntry.matches.set(item.file, {
+      byteOffset: match.byteOffset,
+      lineStart: match.lineStart,
+      lineEnd: match.lineEnd,
+      fingerprint: match.fingerprint || fingerprint
+    })
+    cacheEntry.misses.delete(item.file)
+  }
   return {
     file: item.file,
     sessionId: codexSessionIdFromFile(item.file),
@@ -400,7 +611,10 @@ const resolveCodexSessionForMarker = (root, marker, options = {}) => {
   const sessionRoot = root || defaultCodexSessionRoot()
   const sessionFiles = Array.isArray(options.sessionFiles) ? options.sessionFiles : walkJsonlFiles(sessionRoot)
   const candidates = recentSessionFileItems(sessionFiles, options)
-    .map(item => scoreCodexSessionMarkerFile(item, marker, options))
+    .map(item => scoreCodexSessionMarkerFile(item, marker, {
+      ...options,
+      root: sessionRoot
+    }))
     .filter(Boolean)
   if (!candidates.length) return null
   candidates.sort((a, b) => a.file.localeCompare(b.file))
@@ -450,6 +664,7 @@ module.exports = {
   DiagnosticsStore,
   findCodexSessionsContainingMarker,
   fileContainsLiteral,
+  fileLatestPatternMatch,
   latestCodexSessionFile,
   buildCodexExecArgs,
   parseToolArguments,

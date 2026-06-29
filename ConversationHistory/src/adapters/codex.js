@@ -24,8 +24,6 @@ const {
 
 const DEFAULT_SESSIONS_ROOT = path.join(os.homedir(), '.codex', 'sessions')
 const DEFAULT_SESSION_INDEX = path.join(os.homedir(), '.codex', 'session_index.jsonl')
-const SESSION_MARKER_PREFIX = 'conversation_history-session-'
-const LEGACY_SESSION_MARKER_PREFIX = 'session-indexer-session-'
 const DEFAULT_SESSION_MARKER_SCAN_BYTES = 8 * 1024 * 1024
 const DEFAULT_SESSION_MARKER_SCAN_LIMIT = 100
 
@@ -105,8 +103,7 @@ const latestCodexSessionFile = (root = DEFAULT_SESSIONS_ROOT) => latestCodexSess
 
 const normalizeSessionMarker = value => {
   const marker = String(value || '').trim()
-  if (!marker) return ''
-  return marker.startsWith(SESSION_MARKER_PREFIX) || marker.startsWith(LEGACY_SESSION_MARKER_PREFIX) ? marker : ''
+  return marker
 }
 
 const rowPayload = row => row && !row.parseError && row.json && row.json.payload ? row.json.payload : {}

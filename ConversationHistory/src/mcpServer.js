@@ -7,13 +7,8 @@ const os = require('os')
 const path = require('path')
 const { z } = require('zod')
 const {
-  loadCodexSessionTools,
   loadCodexSessionToolsClient
 } = require('./codexSessionTools.js')
-const {
-  readFileWindow,
-  walkJsonlFiles: walkCodexJsonlFiles
-} = loadCodexSessionTools()
 const { connectOrStartCodexSessionServer } = loadCodexSessionToolsClient()
 const { createMcpLogger, installMcpProcessLogging } = require('./mcpLog.js')
 
@@ -21,11 +16,9 @@ const REPO_ROOT = path.resolve(__dirname, '..')
 const CLI_PATH = path.join(REPO_ROOT, 'bin', 'session-indexer.js')
 const MAX_CLI_OUTPUT_BYTES = 50 * 1024 * 1024
 const SESSION_MARKER_PREFIX = 'conversation_history-session-'
-const LEGACY_SESSION_MARKER_PREFIX = 'session-indexer-session-'
 const SHUTDOWN_TIMEOUT_MS = 10000
 const SESSION_MARKER_SCAN_LIMIT = 100
 const SESSION_MARKER_SCAN_BYTES = 8 * 1024 * 1024
-const SESSION_MARKER_PATTERN = /(?:conversation_history-session-|session-indexer-session-)[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g
 const STATUS_POLL_INITIAL_MS = 15_000
 const STATUS_POLL_MAX_MS = 120_000
 const STATUS_POLL_ESTIMATE_BUFFER_MS = 1_000
@@ -65,61 +58,7 @@ const codexSessionServiceFor = async root => {
   return codexSessionClients.get(resolved)
 }
 
-const lastSessionMarkerInFile = file => {
-  const window = readFileWindow(file.file, SESSION_MARKER_SCAN_BYTES)
-  if (!window || !window.text) return null
-  let last = null
-  for (const match of window.text.matchAll(SESSION_MARKER_PATTERN)) {
-    last = {
-      marker: match[0],
-      file: file.file,
-      mtimeMs: file.mtimeMs,
-      size: file.size,
-      byteOffset: window.start + match.index
-    }
-  }
-  return last
-}
-
 const shouldResolveThisChat = (args = {}) => (args.this_chat !== false && !args.session && !args.latest && !isAllScope(args)) || args.this_chat
-
-const discoverExistingSessionMarker = async (args = {}) => {
-  if (!shouldResolveThisChat(args) || stringArg(args.session_marker)) return null
-  const source = args.source || defaultSource()
-  const root = args.source_root || defaultSourceRoot(source)
-  if (source === 'codex') {
-    const service = args.codex_session_service || await codexSessionServiceFor(root)
-    const latest = await service.latestMarker({
-      pattern: SESSION_MARKER_PATTERN,
-      maxBytes: SESSION_MARKER_SCAN_BYTES,
-      limit: SESSION_MARKER_SCAN_LIMIT
-    })
-    return latest ? latest.marker : null
-  }
-  const latest = walkCodexJsonlFiles(root)
-    .slice(0, SESSION_MARKER_SCAN_LIMIT)
-    .map(lastSessionMarkerInFile)
-    .filter(Boolean)
-    .sort((a, b) =>
-      b.mtimeMs - a.mtimeMs ||
-      b.byteOffset - a.byteOffset ||
-      b.size - a.size ||
-      a.file.localeCompare(b.file)
-    )[0]
-  return latest ? latest.marker : null
-}
-
-const ensureStartSessionMarker = (args = {}) => {
-  delete args.session_marker
-  if (!shouldResolveThisChat(args)) return null
-  const sessionMarker = makeSessionMarker()
-  args.session_marker = sessionMarker
-  args.wait_for_session_marker = true
-  return {
-    sessionMarker,
-    generated: true
-  }
-}
 
 const compactErrorMessage = err => err && err.message ? String(err.message).slice(0, 240) : String(err || '').slice(0, 240)
 
@@ -138,13 +77,13 @@ const resolveCurrentMarkerSession = async (args = {}) => {
       message: 'Current-session MCP scoping by conversation_history marker is only available for Codex source sessions.'
     }
   }
-  const sessionMarker = stringArg(args.session_marker) || await discoverExistingSessionMarker(args)
+  const sessionMarker = stringArg(args.session_marker)
   if (!sessionMarker) {
     return {
       ok: false,
       status: 'blocked',
       reason: 'missing_current_session_marker',
-      message: 'No conversation_history session marker was found in recent Codex JSONL files, so conversation_history did not fall back to the global session catalog.'
+      message: 'No conversation_history response marker is bound in this MCP process, so conversation_history did not fall back to the global session catalog.'
     }
   }
   try {
@@ -231,7 +170,8 @@ const currentSessionNotIndexedBrowse = (scope, args = {}) => ({
   children: []
 })
 
-const defaultToCurrentSessionScope = async args => {
+const defaultToCurrentSessionScope = async (args, lifecycle) => {
+  bindLifecycleSessionMarker(args, lifecycle)
   const current = await resolveCurrentMarkerSession(args)
   if (!current.ok) return { scoped: true, current }
   args.session_id = current.sessionId
@@ -558,9 +498,20 @@ const runCliSyncQuiet = argv => {
 
 const createPluginLifecycle = () => {
   const indexRoots = new Set()
+  let currentSessionMarker = ''
   let cleaned = false
   const rootArgs = root => root ? ['--index-dir', root] : []
   return {
+    currentSessionMarker() {
+      return currentSessionMarker
+    },
+    setCurrentSessionMarker(marker) {
+      currentSessionMarker = stringArg(marker) || ''
+      return currentSessionMarker
+    },
+    clearCurrentSessionMarker(marker) {
+      if (!marker || marker === currentSessionMarker) currentSessionMarker = ''
+    },
     rememberIndexRoot(root) {
       indexRoots.add(root || '')
     },
@@ -607,6 +558,13 @@ const addCommonSearchArgs = (argv, args = {}) => {
   pushFlag(argv, '--limit', args.limit)
 }
 
+const bindLifecycleSessionMarker = (args = {}, lifecycle) => {
+  if (!stringArg(args.session_marker) && lifecycle && typeof lifecycle.currentSessionMarker === 'function') {
+    args.session_marker = lifecycle.currentSessionMarker()
+  }
+  return stringArg(args.session_marker)
+}
+
 const addSourceArgs = (argv, args = {}) => {
   const source = args.source || defaultSource()
   pushFlag(argv, '--source', source)
@@ -637,7 +595,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
   }, async args => {
     lifecycle.rememberIndexRoot()
     if (!stringArg(args.query) && !stringArg(args.agent) && !args.filter) throw new Error('conversation_search requires query, agent, or filter')
-    const scope = await defaultToCurrentSessionScope(args)
+    const scope = await defaultToCurrentSessionScope(args, lifecycle)
     if (scope.scoped && !scope.current.ok) {
       throw currentSessionScopeError(scope.current)
     }
@@ -663,7 +621,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     }
   }, async args => {
     lifecycle.rememberIndexRoot()
-    const scope = await defaultToCurrentSessionScope(args)
+    const scope = await defaultToCurrentSessionScope(args, lifecycle)
     if (scope.scoped && !scope.current.ok) {
       throw currentSessionScopeError(scope.current)
     }
@@ -695,7 +653,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     }
   }, async args => {
     lifecycle.rememberIndexRoot()
-    const scope = await defaultToCurrentSessionScope(args)
+    const scope = await defaultToCurrentSessionScope(args, lifecycle)
     if (scope.scoped && !scope.current.ok) {
       throw currentSessionScopeError(scope.current)
     }
@@ -718,7 +676,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     }
   }, async args => {
     lifecycle.rememberIndexRoot()
-    const scope = await defaultToCurrentSessionScope(args)
+    const scope = await defaultToCurrentSessionScope(args, lifecycle)
     if (scope.scoped && !scope.current.ok) {
       throw currentSessionScopeError(scope.current)
     }
@@ -737,30 +695,19 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
   }, async args => {
     lifecycle.rememberIndexRoot()
     args.source = defaultSource()
-    const existingMarker = await discoverExistingSessionMarker(args)
-    let markerControl = null
-    let resolvedExisting = null
-    if (existingMarker) {
-      args.session_marker = existingMarker
-      resolvedExisting = await resolveCurrentMarkerSession(args)
-      if (!resolvedExisting.ok) throw currentSessionScopeError(resolvedExisting)
-      if (resolvedExisting.path) args.session = resolvedExisting.path
-    } else {
-      markerControl = ensureStartSessionMarker(args)
-    }
+    const marker = makeSessionMarker()
+    lifecycle.setCurrentSessionMarker(marker)
+    args.session_marker = marker
+    args.wait_for_session_marker = true
     const argv = ['start_indexing_session']
     pushFlag(argv, '--scope', 'this_session_only')
-    pushBool(argv, '--wait-for-session-marker', args.wait_for_session_marker)
+    pushBool(argv, '--wait-for-session-marker', true)
     pushFlag(argv, '--timeout-ms', 0)
     pushFlag(argv, '--summary-mode', 'off')
-    const sessionMarker = addSourceArgs(argv, args)
+    addSourceArgs(argv, args)
     const result = await callConversationHistory(argv)
-    if (markerControl && markerControl.generated) result.generatedSessionMarker = true
-    if (markerControl && markerControl.generated && sessionMarker) result.sessionMarker = sessionMarker
-    if (existingMarker) {
-      delete result.sessionMarker
-      result.reusedSessionMarker = true
-    }
+    result.sessionMarker = marker
+    result.generatedSessionMarker = true
     return toolResult(result)
   })
 
@@ -771,23 +718,23 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
   }, async args => {
     lifecycle.rememberIndexRoot()
     args.source = defaultSource()
-    const discovered = await discoverExistingSessionMarker(args)
-    if (!discovered) {
+    bindLifecycleSessionMarker(args, lifecycle)
+    const current = await resolveCurrentMarkerSession(args)
+    if (!current.ok && current.reason === 'missing_current_session_marker') {
       return toolResult({
         schema: 'session-indexer.stop_indexing_session.v1',
         status: 'not_found',
-        message: 'No current conversation indexing marker was found.'
+        reason: current.reason,
+        stoppedCount: 0,
+        jobs: []
       })
     }
-    args.session_marker = discovered
-    const current = await resolveCurrentMarkerSession(args)
     if (!current.ok) throw currentSessionScopeError(current)
     if (current.path) args.session = current.path
     const argv = ['stop_indexing_session']
     pushFlag(argv, '--scope', 'this_session_only')
-    const sessionMarker = addSourceArgs(argv, args)
+    addSourceArgs(argv, args)
     const result = await callConversationHistory(argv)
-    if (sessionMarker) delete result.sessionMarker
     return toolResult(result)
   })
 
@@ -800,7 +747,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
   }, async args => {
     lifecycle.rememberIndexRoot()
     args.source = defaultSource()
-    const scope = await defaultToCurrentSessionScope(args)
+    const scope = await defaultToCurrentSessionScope(args, lifecycle)
     if (scope.scoped && !scope.current.ok) throw currentSessionScopeError(scope.current)
     const argv = ['reset_session_index']
     pushFlag(argv, '--scope', 'this_session_only')
@@ -877,8 +824,7 @@ module.exports = {
   createPluginLifecycle,
   startStdioServer,
   __testing: {
-    discoverExistingSessionMarker,
-    ensureStartSessionMarker,
+    makeSessionMarker,
     resolveCurrentMarkerSession
   }
 }

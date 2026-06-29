@@ -6,7 +6,6 @@ const path = require('node:path')
 const test = require('node:test')
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js')
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js')
-const { CodexSessionServerState } = require('codex-session-tools/src/server.js')
 
 const { codexSessionFingerprint, importCodexJsonl, resolveCurrentCodexSessionFile } = require('../src/adapters/codex.js')
 const { importClaudeJsonl, resolveCurrentClaudeSessionFile } = require('../src/adapters/claude.js')
@@ -2823,7 +2822,7 @@ test('Codex current-chat resolver finds markers before large tool-output tails',
     sessionMarkerScanBytes: 128
   })
   assert.equal(resolved.file, session)
-  assert.equal(resolved.signals.sessionMarkerMatch.scan, 'full')
+  assert.equal(resolved.signals.sessionMarkerMatch.scan, 'backward_line')
 })
 
 test('start indexing waits for a generated session marker to land in the Codex log', async () => {
@@ -3986,47 +3985,7 @@ test('redeploy target follows the install context, not the caller', async () => 
   }
 })
 
-test('MCP marker generation replaces supplied markers server-side', () => {
-  const { __testing: mcpTesting } = require('../src/mcpServer.js')
-  const supplied = 'conversation_history-session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-  const args = { session_marker: supplied }
-  const marker = mcpTesting.ensureStartSessionMarker(args)
-  assert.equal(marker.generated, true)
-  assert.match(marker.sessionMarker, /^conversation_history-session-[0-9a-f-]{36}$/)
-  assert.equal(args.session_marker, marker.sessionMarker)
-  assert.notEqual(args.session_marker, supplied)
-  assert.equal(args.wait_for_session_marker, true)
-
-  const allArgs = { all: true, session_marker: supplied }
-  assert.equal(mcpTesting.ensureStartSessionMarker(allArgs), null)
-  assert.equal(Object.hasOwn(allArgs, 'session_marker'), false)
-})
-
-test('MCP marker discovery uses only the last marker as definitive', async () => {
-  const { __testing: mcpTesting } = require('../src/mcpServer.js')
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-mcp-marker-'))
-  const session = path.join(root, 'session.jsonl')
-  const oldMarker = 'conversation_history-session-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
-  const latestMarker = 'conversation_history-session-cccccccc-cccc-4ccc-8ccc-cccccccccccc'
-  writeJsonl(session, [
-    { timestamp: '2026-06-05T00:00:00.000Z', type: 'response_item', payload: { type: 'function_call_output', output: JSON.stringify({ sessionMarker: oldMarker }) } },
-    { timestamp: '2026-06-05T00:00:01.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'forked work continues' } },
-    { timestamp: '2026-06-05T00:00:02.000Z', type: 'response_item', payload: { type: 'function_call_output', output: JSON.stringify({ sessionMarker: latestMarker }) } }
-  ])
-
-  const codexSessionService = new CodexSessionServerState({
-    sessionRoot: root,
-    watch: false
-  }).start()
-
-  assert.equal(await mcpTesting.discoverExistingSessionMarker({
-    source: 'codex',
-    source_root: root,
-    codex_session_service: codexSessionService
-  }), latestMarker)
-})
-
-test('MCP current-session scope resolves through the emitted session marker', async () => {
+test('MCP current-session scope resolves through the emitted response marker', async () => {
   const { __testing: mcpTesting } = require('../src/mcpServer.js')
   const calls = []
   const marker = 'conversation_history-session-dddddddd-dddd-4ddd-8ddd-dddddddddddd'
@@ -4035,6 +3994,9 @@ test('MCP current-session scope resolves through the emitted session marker', as
     source: 'codex',
     session_marker: marker,
     codex_session_service: {
+      latestMarker: async () => {
+        throw new Error('latestMarker must not be used for current-session binding')
+      },
       resolveMarker: async args => {
         calls.push(args)
         return {
@@ -4056,39 +4018,23 @@ test('MCP current-session scope resolves through the emitted session marker', as
   }])
 })
 
-test('MCP browse fails as a binding error when the current-session marker is missing', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-mcp-missing-marker-'))
-  const fakeHome = path.join(root, 'home')
-  fs.mkdirSync(path.join(fakeHome, '.codex', 'sessions'), { recursive: true })
+test('MCP current-session scope fails closed when no response marker is bound', async () => {
+  const { __testing: mcpTesting } = require('../src/mcpServer.js')
+  const resolved = await mcpTesting.resolveCurrentMarkerSession({
+    source: 'codex',
+    codex_session_service: {
+      resolveMarker: async () => {
+        throw new Error('resolveMarker must not run without a response marker')
+      }
+    }
+  }, {})
+  assert.equal(resolved.ok, false)
+  assert.equal(resolved.reason, 'missing_current_session_marker')
+})
 
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(__dirname, '..', 'bin', 'session-indexer-mcp.js')],
-    cwd: path.join(__dirname, '..'),
-    env: {
-      AGENTTOOLS_MCP_LOG_DIR: path.join(root, 'mcp-logs'),
-      HOME: fakeHome,
-      SESSION_INDEXER_STATE_DIR: root,
-      SESSION_INDEXER_SUMMARY_MODE: 'off'
-    },
-    stderr: 'pipe'
-  })
-  const client = new Client({
-    name: 'session-indexer-test',
-    version: '0.1.0'
-  })
-
-  await client.connect(transport)
-  try {
-    const result = await client.callTool({
-      name: 'conversation_browse',
-      arguments: { limit: 1 }
-    })
-    assert.equal(result.isError, true)
-    assert.match(result.content[0].text, /conversation_history current-session binding failed.*missing_current_session_marker/)
-  } finally {
-    await client.close()
-  }
+test('MCP response markers are generated server-side', () => {
+  const { __testing: mcpTesting } = require('../src/mcpServer.js')
+  assert.match(mcpTesting.makeSessionMarker(), /^conversation_history-session-[0-9a-f-]{36}$/)
 })
 
 test('MCP server exposes native conversation search and openLink tools', async () => {
@@ -4096,19 +4042,9 @@ test('MCP server exposes native conversation search and openLink tools', async (
   const fakeHome = path.join(root, 'home')
   const fakeSessionRoot = path.join(fakeHome, '.codex', 'sessions', '2026', '06', '05')
   fs.mkdirSync(fakeSessionRoot, { recursive: true })
-  const marker = 'conversation_history-session-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
   const currentSessionFile = path.join(fakeSessionRoot, 'rollout-2026-06-05T00-00-00-mini-session.jsonl')
   fs.copyFileSync(fixture, currentSessionFile)
-  appendJsonl(currentSessionFile, [{
-    timestamp: '2026-06-05T00:00:08.000Z',
-    type: 'response_item',
-    payload: {
-      type: 'function_call_output',
-      call_id: 'conversation_history_marker',
-      output: JSON.stringify({ sessionMarker: marker })
-    }
-  }])
-  const ir = importCodexJsonl(fixture)
+  const ir = importCodexJsonl(currentSessionFile)
   await writeSessionIndexWithBackend({
     root,
     ir,
@@ -4213,6 +4149,27 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.doesNotMatch(prompt.messages[0].content.text, /session_marker_required|conversation_history-session|session-indexer-session|retry\.session_marker/)
     assert.doesNotMatch(prompt.messages[0].content.text, /start_indexing_session first/)
     assert.doesNotMatch(prompt.messages[0].content.text, /typesense|backend|serverIndex|search_backend|search-backend/i)
+
+    const startTime = Date.now()
+    const startedIndexing = (await client.callTool({
+      name: 'start_indexing_session',
+      arguments: {}
+    })).structuredContent.result
+    assert.equal(startedIndexing.schema, 'session-indexer.start_indexing_session.v1')
+    assert.equal(startedIndexing.timeoutMs, 0)
+    assert.match(startedIndexing.sessionMarker, /^conversation_history-session-[0-9a-f-]{36}$/)
+    assert.equal(startedIndexing.generatedSessionMarker, true)
+    assert.equal(startedIndexing.job.waitForSessionMarker, true)
+    assert.ok(Date.now() - startTime < 5000)
+    appendJsonl(currentSessionFile, [{
+      timestamp: '2026-06-05T00:00:09.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call_output',
+        call_id: 'start_indexing_session',
+        output: JSON.stringify({ sessionMarker: startedIndexing.sessionMarker })
+      }
+    }])
 
     const browseRoot = (await client.callTool({
       name: 'conversation_browse',
@@ -4439,19 +4396,6 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.equal(openResult.schema, 'session-indexer.openLink.v1')
     assert.match(openResult.content, /clientRevision 7/i)
     assert.doesNotMatch(JSON.stringify(openResult), /mini-session|index_id|session_id/)
-
-    const startTime = Date.now()
-    const startedIndexing = (await client.callTool({
-      name: 'start_indexing_session',
-      arguments: {}
-    })).structuredContent.result
-    assert.equal(startedIndexing.schema, 'session-indexer.start_indexing_session.v1')
-    assert.equal(startedIndexing.timeoutMs, 0)
-    assert.equal(startedIndexing.sessionMarker, undefined)
-    assert.equal(startedIndexing.reusedSessionMarker, true)
-    assert.equal(startedIndexing.generatedSessionMarker, undefined)
-    assert.equal(startedIndexing.job.waitForSessionMarker, false)
-    assert.ok(Date.now() - startTime < 5000)
 
     const stoppedIndexing = (await client.callTool({
       name: 'stop_indexing_session',

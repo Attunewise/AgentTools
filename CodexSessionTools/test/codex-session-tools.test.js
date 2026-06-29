@@ -13,6 +13,7 @@ const {
   DiagnosticsStore,
   findCodexSessionsContainingMarker,
   fileContainsLiteral,
+  fileLatestPatternMatch,
   latestCodexSessionFile,
   reconcileThreadRecord,
   renderForTool,
@@ -265,7 +266,7 @@ test('finds sessions by bounded marker scan and raw match previews', () => {
   }
 })
 
-test('literal marker scan checks the tail first and falls back to the full file', () => {
+test('literal marker scan walks backward by JSONL line', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-session-tools-literal-'))
   try {
     const file = path.join(root, 'session.jsonl')
@@ -275,10 +276,59 @@ test('literal marker scan checks the tail first and falls back to the full file'
     const match = fileContainsLiteral({
       file,
       literal: marker,
-      tailBytes: 128
+      chunkBytes: 128
     })
-    assert.equal(match.scan, 'full')
+    assert.equal(match.scan, 'backward_line')
     assert.equal(match.byteOffset, 0)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('latest marker scan walks backward by JSONL line before large tails', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-session-tools-latest-marker-'))
+  try {
+    const file = path.join(root, 'session.jsonl')
+    const marker = 'codex-session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    writeJsonl(file, [
+      { type: 'session_meta', payload: { id: 'latest-marker-thread', cwd: root } },
+      { type: 'response_item', payload: { type: 'function_call_output', output: `started ${marker}` } },
+      { type: 'response_item', payload: { type: 'function_call_output', output: 'x'.repeat(512 * 1024) } }
+    ])
+
+    const match = fileLatestPatternMatch({
+      file,
+      pattern: /codex-session-[0-9a-fA-F-]{36}/g,
+      chunkBytes: 128
+    })
+    assert.equal(match.marker, marker)
+    assert.equal(match.scan, 'backward_line')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('server latest marker uses backward-line scan before large tails', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-session-tools-latest-state-'))
+  try {
+    const file = path.join(root, 'session.jsonl')
+    const marker = 'codex-session-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    writeJsonl(file, [
+      { type: 'session_meta', payload: { id: 'latest-state-thread', cwd: root } },
+      { type: 'response_item', payload: { type: 'function_call_output', output: `started ${marker}` } },
+      { type: 'response_item', payload: { type: 'function_call_output', output: 'x'.repeat(512 * 1024) } }
+    ])
+    const state = new CodexSessionServerState({
+      sessionRoot: root,
+      watch: false
+    })
+    state.sessions = walkJsonlFiles(root)
+
+    const latest = state.latestMarker({
+      pattern: /codex-session-[0-9a-fA-F-]{36}/g
+    })
+    assert.equal(latest.marker, marker)
+    assert.equal(latest.scan, 'backward_line')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -328,7 +378,49 @@ test('shared marker resolver finds markers before large output tails', () => {
       sessionMarkerScanBytes: 128
     })
     assert.equal(resolved.file, file)
-    assert.equal(resolved.signals.sessionMarkerMatch.scan, 'full')
+    assert.equal(resolved.signals.sessionMarkerMatch.scan, 'backward_line')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('marker resolver caches verified matches and unchanged misses', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-session-tools-marker-cache-'))
+  try {
+    const marker = 'conversation_history-session-dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+    const matched = path.join(root, 'matched.jsonl')
+    const missed = path.join(root, 'missed.jsonl')
+    writeJsonl(matched, [
+      { type: 'session_meta', payload: { id: 'matched-thread', cwd: root } },
+      { type: 'response_item', payload: { type: 'function_call_output', output: marker } }
+    ])
+    writeJsonl(missed, [
+      { type: 'session_meta', payload: { id: 'missed-thread', cwd: root } },
+      { type: 'response_item', payload: { type: 'function_call_output', output: 'no marker here' } }
+    ])
+
+    const markerLookupCache = new Map()
+    const first = resolveCodexSessionForMarker(root, marker, { markerLookupCache })
+    assert.equal(first.file, matched)
+    assert.equal(first.signals.sessionMarkerMatch.scan, 'backward_line')
+
+    const second = resolveCodexSessionForMarker(root, marker, { markerLookupCache })
+    assert.equal(second.file, matched)
+    assert.equal(second.signals.sessionMarkerMatch.scan, 'cache_verified')
+
+    fs.appendFileSync(missed, `${JSON.stringify({
+      type: 'response_item',
+      payload: { type: 'function_call_output', output: marker }
+    })}\n`)
+    const fork = resolveCodexSessionForMarker(root, marker, {
+      markerLookupCache,
+      threadSpawnEdges: [{
+        parentThreadId: 'matched-thread',
+        childThreadId: 'missed-thread'
+      }]
+    })
+    assert.equal(fork.file, missed)
+    assert.equal(fork.reason, 'session_marker_match_fork_descendant')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
