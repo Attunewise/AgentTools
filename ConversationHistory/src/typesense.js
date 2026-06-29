@@ -700,7 +700,7 @@ const pageWindow = ({ startAt = 0, limit = 20 }) => {
   return { start, requestedLimit, perPage, page, offset }
 }
 
-const exactDocument = async ({ indexId, sessionId, agent, handle, ...opts }) => {
+const exactDocument = async ({ indexId, sessionId, agent, handle, includeContent = false, ...opts }) => {
   const config = typesenseConfig(opts)
   await ensureCollection(config, opts)
   const filters = [
@@ -718,7 +718,7 @@ const exactDocument = async ({ indexId, sessionId, agent, handle, ...opts }) => 
   params.set('per_page', '1')
   const result = await request(config, 'GET', `/collections/${encodeURIComponent(config.collection)}/documents/search?${params.toString()}`)
   const doc = result.hits && result.hits[0] && result.hits[0].document || null
-  return hydrateDoc({ root: opts.indexDir || opts.root, doc })
+  return hydrateDoc({ root: opts.indexDir || opts.root, doc, includeContent })
 }
 
 const childDocuments = async ({ indexId, sessionId, agent, parentHandle, startAt = 0, limit = 20, topic, ...opts }) => {
@@ -839,6 +839,7 @@ const openLinkTypesense = async ({ link, budgetTokens, sessionId, agent, ...opts
     sessionId: sessionId || parsed.sessionId,
     agent,
     handle: parsed.handle,
+    includeContent: true,
     ...opts
   })
   if (!doc) throw new Error(`Unknown session handle: ${parsed.handle}`)

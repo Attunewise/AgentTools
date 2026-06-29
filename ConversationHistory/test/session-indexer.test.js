@@ -28,6 +28,7 @@ const {
   browseIndexWithBackend,
   browseSessionCatalog,
   indexStatus,
+  openLinkWithBackend,
   readSessionTree,
   reserveSummaryJobs,
   resetSessionIndex,
@@ -976,6 +977,74 @@ test('Typesense search failures reject instead of returning empty hits', async (
     typesenseInstall: false,
     typesenseCollection: `session_indexer_test_${process.pid}`
   }), /managed Typesense is not installed/)
+})
+
+test('Typesense openLink opens verbatim search-hit content handles', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-typesense-open-search-hit-'))
+  const typesenseCollection = `session_indexer_open_hit_${process.pid}_${Date.now()}`
+  const sentinel = 'verbatim_search_hit_probe_4917'
+  const sessionFile = path.join(root, 'open-hit.jsonl')
+  writeJsonl(sessionFile, [
+    {
+      timestamp: '2026-06-05T00:00:00.000Z',
+      type: 'session_meta',
+      payload: {
+        id: 'open-hit-session',
+        cwd: root,
+        model_provider: 'codex-test',
+        cli_version: 'test'
+      }
+    },
+    {
+      timestamp: '2026-06-05T00:00:01.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'user_message',
+        client_id: 'open-hit-user-1',
+        message: `remember ${sentinel} before compaction`
+      }
+    },
+    {
+      timestamp: '2026-06-05T00:00:02.000Z',
+      type: 'compacted',
+      payload: { message: 'provider compact marker' }
+    },
+    {
+      timestamp: '2026-06-05T00:00:03.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'user_message',
+        client_id: 'open-hit-user-2',
+        message: 'live tail should stay hidden'
+      }
+    }
+  ])
+  const ir = importCodexJsonl(sessionFile)
+  const indexed = await writeSessionIndexWithBackend({
+    root,
+    ir,
+    summaryMode: 'off',
+    typesenseCollection
+  })
+  const searched = await searchIndexWithBackend({
+    root,
+    sessionId: 'open-hit-session',
+    query: sentinel,
+    typesenseCollection,
+    limit: 5
+  })
+  const hit = searched.hits.find(item => item.openable && /\/content(?:\/|$)/.test(item.handle))
+  assert.ok(hit, 'search returns an openable content handle')
+  assert.equal(hit.line, 2)
+
+  const opened = await openLinkWithBackend({
+    root,
+    link: sessionLink({ indexId: indexed.indexId, handle: hit.handle }),
+    typesenseCollection,
+    budgetTokens: 10000
+  })
+  assert.equal(opened.result.isVerbatim, true)
+  assert.match(opened.result.content, new RegExp(sentinel))
 })
 
 test('Typesense backend imports no-compaction docs but hides live context from retrieval', async () => {

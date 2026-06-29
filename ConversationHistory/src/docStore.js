@@ -55,15 +55,45 @@ const readSessionDocMap = ({ root, sessionId }) => {
   return map
 }
 
-const hydrateDoc = ({ root, doc }) => {
-  if (!doc || !root || !doc.sessionId || !doc.handle) return doc
+const adapterNameForSourceKind = kind => {
+  const text = String(kind || '').toLowerCase()
+  if (text.startsWith('codex')) return 'codex'
+  if (text.startsWith('claude')) return 'claude'
+  return text
+}
+
+const hydrateSourceContent = doc => {
+  if (!doc || doc.content || !doc.isVerbatim || !doc.sourcePath || !doc.handle) return doc
   try {
-    const stored = readSessionDocMap({ root, sessionId: doc.sessionId }).get(doc.handle)
-    return stored ? { ...doc, ...stored } : doc
+    const { adapterFor } = require('./adapters/index.js')
+    const { buildMipTree } = require('./mip.js')
+    const adapter = adapterFor(adapterNameForSourceKind(doc.sourceKind))
+    const ir = adapter.importFile(doc.sourcePath)
+    if (doc.indexId) ir.indexId = doc.indexId
+    const tree = buildMipTree(ir)
+    const node = tree.byHandle && tree.byHandle.get(doc.handle)
+    if (!node || node.children && node.children.length) return doc
+    return { ...doc, content: node.raw }
   } catch (err) {
-    if (err && err.code === 'ENOENT') return doc
+    if (err && (
+      err.code === 'ENOENT' ||
+      /unknown source adapter/i.test(err.message || '')
+    )) return doc
     throw err
   }
+}
+
+const hydrateDoc = ({ root, doc, includeContent = false }) => {
+  if (!doc || !root || !doc.sessionId || !doc.handle) return doc
+  let hydrated = doc
+  try {
+    const stored = readSessionDocMap({ root, sessionId: doc.sessionId }).get(doc.handle)
+    hydrated = stored ? { ...doc, ...stored } : doc
+  } catch (err) {
+    if (err && err.code === 'ENOENT') hydrated = doc
+    else throw err
+  }
+  return includeContent ? hydrateSourceContent(hydrated) : hydrated
 }
 
 const hydrateDocs = ({ root, docs }) => (docs || []).map(doc => hydrateDoc({ root, doc }))

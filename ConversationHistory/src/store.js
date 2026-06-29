@@ -42,6 +42,7 @@ const {
   deleteSessionDocuments,
   exactDocument,
   importDocuments,
+  openLinkTypesense,
   resolveTypesenseConfig,
   searchTypesense
 } = require('./typesense.js')
@@ -1449,22 +1450,16 @@ const openLinkWithBackend = async ({
   if (searchBackend !== 'typesense') throw new Error('--search-backend must be typesense')
   const parsed = parseSessionLink(link)
   if (!parsed || !parsed.handle) throw new Error(`Unsupported conversation_history link: ${link}`)
-  let resolvedSessionId = sessionId || parsed.sessionId || ''
-  if (!resolvedSessionId) {
-    const doc = await exactDocument({
-      indexId: indexId || parsed.indexId,
-      agent,
-      handle: parsed.handle,
-      root: backendOpts.root,
-      indexDir: backendOpts.indexDir,
-      ...backendOpts
-    })
-    if (!doc) throw new Error(`Unknown session handle: ${parsed.handle}`)
-    resolvedSessionId = doc.sessionId
-  }
   const root = backendOpts.root || backendOpts.indexDir || DEFAULT_INDEX_DIR
-  const result = openLink(readSessionTree({ root, sessionId: resolvedSessionId }), link, {
-    budgetTokens
+  const result = await openLinkTypesense({
+    link,
+    indexId: indexId || parsed.indexId,
+    sessionId: sessionId || parsed.sessionId,
+    agent,
+    budgetTokens,
+    root,
+    indexDir: root,
+    ...backendOpts
   })
   const config = await resolveTypesenseConfig(backendOpts)
   return {
