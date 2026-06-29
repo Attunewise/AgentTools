@@ -399,8 +399,6 @@ const pathMatches = (left, right) => {
   }
 }
 
-const sameFingerprint = (left, right) => JSON.stringify(left || null) === JSON.stringify(right || null)
-
 const sessionIdFromSourcePath = sourcePath => {
   const match = String(sourcePath || '').match(/rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)
   return match ? match[1] : null
@@ -1201,20 +1199,6 @@ const writeSessionIndexWithBackend = async ({
     applyStoredSummaryJobs(tree, completedSummaryJobs({ root, sessionId: ir.session.id }))
   }
   const now = new Date().toISOString()
-  const previousManifest = readManifest(root)
-  const previousSession = previousManifest.sessions[ir.session.id] || null
-  const previousServerIndex = previousSession && previousSession.serverIndex || null
-  const previousServerStatus = previousServerIndex && previousServerIndex.status
-  const hasPublishedCurrentSource = Boolean(previousSession &&
-    previousServerIndex &&
-    ['ready', 'deferred'].includes(previousServerStatus) &&
-    sameFingerprint(previousSession.sourceFingerprint, ir.source.fingerprint))
-  const previousPublishedDocCount = previousServerStatus === 'deferred'
-    ? Number(previousServerIndex.previousDocCount || previousSession.docCount || 0)
-    : Number(previousSession && previousSession.docCount || 0)
-  const previousPublishedIndexedAt = previousServerStatus === 'deferred'
-    ? previousServerIndex.previousIndexedAt || previousSession.indexedAt || null
-    : previousSession && previousSession.indexedAt || null
   const serverIndex = {
     backend: searchBackend,
     status: 'not_requested'
@@ -1229,10 +1213,10 @@ const writeSessionIndexWithBackend = async ({
     sourcePath: ir.source.path,
     sourceFingerprint: ir.source.fingerprint,
     updatedAt: ir.session.updatedAt,
-    indexedAt: hasPublishedCurrentSource ? previousPublishedIndexedAt || now : now,
+    indexedAt: now,
     eventCount: ir.events.length,
     turnCount: turnCountForIR(ir),
-    docCount: hasPublishedCurrentSource ? previousPublishedDocCount : 0,
+    docCount: 0,
     rootHandle: tree.root.handle,
     shortSummary: preview(tree.root.head || ir.session.title || ir.session.id, 180),
     fullTokenCount: tree.root.fullTokenCount,
@@ -1243,52 +1227,31 @@ const writeSessionIndexWithBackend = async ({
     serverIndex
   }
   sessionRecord.indexingStats = indexingStats(sessionRecord)
-  const readinessBeforePublish = sessionIndexReadiness({ root, sessionRecord })
-  const deferPublish = summaryMode === 'model' &&
-    hasPublishedCurrentSource &&
-    !readinessBeforePublish.ready
-
-  if (deferPublish) {
-    serverIndex.status = 'deferred'
-    serverIndex.reason = 'summary_incomplete'
-    serverIndex.previousIndexedAt = previousPublishedIndexedAt
-    serverIndex.previousDocCount = previousPublishedDocCount
-    if (typeof onProgress === 'function') {
-      onProgress({
-        phase: 'index:documents:deferred',
-        sessionId: ir.session.id,
-        pendingTargetCount: readinessBeforePublish.pendingTargetCount,
-        completedTargetCount: readinessBeforePublish.completedTargetCount,
-        previousDocCount: serverIndex.previousDocCount
-      })
-    }
-  } else {
-    const docs = collectPublishedDocuments({ tree, sourceTree })
-    sessionRecord.docCount = docs.length
-    if (typeof onProgress === 'function') {
-      onProgress({
-        phase: 'index:documents',
-        sessionId: ir.session.id,
-        docCount: docs.length
-      })
-    }
-    writeSessionDocs({ root, sessionId: ir.session.id, docs })
-    const result = await importDocuments({
-      docs,
+  const docs = collectPublishedDocuments({ tree, sourceTree })
+  sessionRecord.docCount = docs.length
+  if (typeof onProgress === 'function') {
+    onProgress({
+      phase: 'index:documents',
       sessionId: ir.session.id,
-      agent: ir.session.agent,
-      onProgress,
-      ...typeOpts
+      docCount: docs.length
     })
-    serverIndex.status = 'ready'
-    serverIndex.result = result
-    const config = await resolveTypesenseConfig(typeOpts)
-    serverIndex.config = {
-      ...config,
-      apiKey: backendOpts.typesenseApiKey ? 'set' : config.apiKey ? 'default' : 'unset'
-    }
-    sessionRecord.indexedAt = now
   }
+  writeSessionDocs({ root, sessionId: ir.session.id, docs })
+  const result = await importDocuments({
+    docs,
+    sessionId: ir.session.id,
+    agent: ir.session.agent,
+    onProgress,
+    ...typeOpts
+  })
+  serverIndex.status = 'ready'
+  serverIndex.result = result
+  const config = await resolveTypesenseConfig(typeOpts)
+  serverIndex.config = {
+    ...config,
+    apiKey: backendOpts.typesenseApiKey ? 'set' : config.apiKey ? 'default' : 'unset'
+  }
+  sessionRecord.indexedAt = now
 
   withFileLock(manifestLockPath(root), () => {
     const latestJobs = summaryMode === 'model'

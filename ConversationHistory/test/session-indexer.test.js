@@ -1095,9 +1095,11 @@ test('Typesense backend imports no-compaction docs but hides live context from r
   assert.equal(claudeSearch.hits.length, 0)
 })
 
-test('Typesense publish defers repeated imports while model summaries are incomplete', async () => {
+test('Typesense publish keeps current index searchable while model summaries are incomplete', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-typesense-defer-'))
-  const ir = importCodexJsonl(fixture)
+  const sourceFile = path.join(root, 'codex-mini.jsonl')
+  fs.copyFileSync(fixture, sourceFile)
+  const ir = importCodexJsonl(sourceFile)
   const typesenseCollection = `session_indexer_defer_${process.pid}_${Date.now()}`
   const firstProgress = []
   const first = await writeSessionIndexWithBackend({
@@ -1131,41 +1133,52 @@ test('Typesense publish defers repeated imports while model summaries are incomp
     }]
   })
 
+  appendJsonl(sourceFile, [{
+    timestamp: '2026-06-05T00:00:04.000Z',
+    type: 'event_msg',
+    payload: {
+      type: 'user_message',
+      client_id: 'post-publish-live-tail',
+      message: 'post publish live tail changes the source material'
+    }
+  }])
+  const updatedIr = importCodexJsonl(sourceFile)
+  assert.notEqual(indexIdForIR(updatedIr), first.indexId)
+
   const secondProgress = []
   const second = await writeSessionIndexWithBackend({
     root,
-    ir,
+    ir: updatedIr,
     summaryMode: 'model',
     maxSummaryNodes: 0,
     typesenseCollection,
     onProgress: event => secondProgress.push(event)
   })
-  assert.equal(second.serverIndex.status, 'deferred')
-  assert.equal(second.serverIndex.reason, 'summary_incomplete')
+  assert.equal(second.serverIndex.status, 'ready')
   const secondStatus = indexStatus({ root, sessionId: first.sessionId })
+  assert.equal(secondStatus.sessions[0].indexId, second.indexId)
   assert.equal(secondStatus.sessions[0].summaryTargetStore.currentStoredFailedTargetCount, 1)
-  assert.equal(second.docCount, first.docCount)
-  assert.equal(second.serverIndex.previousDocCount, first.docCount)
-  assert.ok(secondProgress.some(event => event.phase === 'index:documents:deferred'))
-  assert.equal(secondProgress.some(event => event.phase === 'index:documents'), false)
+  assert.ok(second.serverIndex.result.imported > 0)
+  assert.ok(secondProgress.some(event => event.phase === 'index:documents'))
+  assert.ok(secondProgress.some(event => event.phase === 'index:documents:import:chunk'))
 
   const thirdProgress = []
   const third = await writeSessionIndexWithBackend({
     root,
-    ir,
+    ir: updatedIr,
     summaryMode: 'model',
     maxSummaryNodes: 0,
     typesenseCollection,
     onProgress: event => thirdProgress.push(event)
   })
-  assert.equal(third.serverIndex.status, 'deferred')
-  assert.equal(third.docCount, first.docCount)
-  assert.equal(thirdProgress.some(event => event.phase === 'index:documents'), false)
+  assert.equal(third.serverIndex.status, 'ready')
+  assert.ok(third.serverIndex.result.imported > 0)
+  assert.ok(thirdProgress.some(event => event.phase === 'index:documents'))
 
   const searched = await searchIndexWithBackend({
     root,
     query: 'clientRevision',
-    sessionId: 'mini-session',
+    indexId: second.indexId,
     typesenseCollection,
     limit: 1
   })
