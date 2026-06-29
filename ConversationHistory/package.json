@@ -5,11 +5,12 @@
   "type": "commonjs",
   "bin": {
     "session-indexer": "bin/session-indexer.js",
-    "session-indexer-mcp": "bin/session-indexer-mcp.js"
+    "session-indexer-mcp": "bin/session-indexer-mcp.js",
+    "session-indexer-web": "bin/session-indexer-web.js"
   },
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check bin/*.js && node --check src/*.js src/adapters/*.js src/index/*.js src/providers/*.js"
+    "check": "node --check bin/*.js && node --check src/*.js src/adapters/*.js src/index/*.js src/providers/*.js web/*.js"
   },
   "dependencies": {
     "@anthropic-ai/aws-sdk": "^0.3.1",

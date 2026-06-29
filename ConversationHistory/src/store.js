@@ -1195,9 +1195,7 @@ const writeSessionIndexWithBackend = async ({
     ownerId,
     jobs: summaryIndex.jobs
   })
-  if (summaryMode === 'model') {
-    applyStoredSummaryJobs(tree, completedSummaryJobs({ root, sessionId: ir.session.id }))
-  }
+  applyStoredSummaryJobs(tree, completedSummaryJobs({ root, sessionId: ir.session.id }))
   const now = new Date().toISOString()
   const serverIndex = {
     backend: searchBackend,
@@ -1254,9 +1252,7 @@ const writeSessionIndexWithBackend = async ({
   sessionRecord.indexedAt = now
 
   withFileLock(manifestLockPath(root), () => {
-    const latestJobs = summaryMode === 'model'
-      ? completedSummaryJobs({ root, sessionId: ir.session.id })
-      : []
+    const latestJobs = completedSummaryJobs({ root, sessionId: ir.session.id })
     if (latestJobs.length) applyStoredSummaryJobs(tree, latestJobs)
     sessionRecord.summaryJobs = summaryIndex.jobs
     sessionRecord.indexingStats = indexingStats(sessionRecord)

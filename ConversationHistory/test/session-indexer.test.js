@@ -13,6 +13,7 @@ const { importClaudeJsonl, resolveCurrentClaudeSessionFile } = require('../src/a
 const { deploySkill } = require('../src/deploy.js')
 const { createSessionIR, textBlock } = require('../src/ir.js')
 const {
+  browseNode,
   buildMipTree,
   collectIndexDocuments,
   compactedRetrievalHandles,
@@ -58,6 +59,7 @@ const { isPidRunning, stopIndexingJobs, waitForJob, writeJobState } = require('.
 const { piEntriesFromIr } = require('../src/pi.js')
 const { LOCAL_STATE_DIR, REPO_ROOT } = require('../src/paths.js')
 const { collectionSchema, docForTypesense, importDocuments } = require('../src/typesense.js')
+const { startWebServer } = require('../src/webServer.js')
 const {
   managedRuntimeInfo,
   managedTypesenseServerArgs,
@@ -115,6 +117,15 @@ const claudeFixture = path.join(__dirname, 'fixtures', 'claude-mini.jsonl')
 const writeJsonl = (file, rows) => fs.writeFileSync(file, `${rows.map(row => JSON.stringify(row)).join('\n')}\n`)
 const appendJsonl = (file, rows) => fs.appendFileSync(file, rows.map(row => `${JSON.stringify(row)}\n`).join(''))
 const sleepMs = ms => new Promise(resolve => setTimeout(resolve, ms))
+const fetchJson = async url => {
+  const response = await fetch(url)
+  const json = await response.json()
+  if (!response.ok) throw new Error(json.error || `HTTP ${response.status}`)
+  return json
+}
+const closeServer = server => new Promise((resolve, reject) => {
+  server.close(err => err ? reject(err) : resolve())
+})
 const waitUntil = async (fn, { timeoutMs = 10000, pollMs = 100, label = 'condition' } = {}) => {
   const deadline = Date.now() + timeoutMs
   let lastError = null
@@ -737,6 +748,27 @@ test('encrypted reasoning is replay-only and never model-facing', () => {
   assert.doesNotMatch(prompt, /Need to inspect the todo sync command output/)
 })
 
+test('browseNode discovers the single generated summary child as the semantic root', () => {
+  const ir = importCodexJsonl(fixture)
+  const tree = buildMipTree(ir)
+  const prepared = prepareCompactedSummaryLayer(tree, { summaryInputTokenBudget: 1000 })
+  assert.equal(prepared.nodes.length, 1)
+  const summaryNode = prepared.nodes[0]
+  summaryNode.head = 'Coherent in-memory root summary about the todo sync dry run and clientRevision 7 result.'
+  summaryNode.summaryMeta = {
+    ...summaryNode.summaryMeta,
+    status: 'completed',
+    strategy: 'compaction-contiguous-span-v1'
+  }
+
+  const browsed = browseNode(tree, { limit: 10 })
+  assert.equal(browsed.handle, tree.root.handle)
+  assert.match(browsed.text, /Coherent in-memory root summary/)
+  assert.equal(browsed.children.some(child => child.handle === summaryNode.handle), false)
+  assert.ok(browsed.children.some(child => /inspect the todo sync output/.test(child.text)))
+  assert.ok(browsed.children.some(child => /clientRevision 7/.test(child.text)))
+})
+
 test('Typesense schema supports exact conversation filters', () => {
   const fields = new Map(collectionSchema('test_docs').fields.map(field => [field.name, field]))
   assert.equal(fields.get('indexId').facet, true)
@@ -1274,6 +1306,164 @@ test('Typesense publish keeps current index searchable while model summaries are
   assert.ok(searched.hits.length > 0)
 })
 
+test('Typesense publish reuses stored summaries when model summarization is off', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-typesense-stored-summary-'))
+  const sourceFile = path.join(root, 'codex-mini.jsonl')
+  fs.copyFileSync(fixture, sourceFile)
+  const ir = importCodexJsonl(sourceFile)
+  const tree = buildMipTree(ir)
+  const prepared = prepareCompactedSummaryLayer(tree, { summaryInputTokenBudget: 1000 })
+  assert.ok(prepared.nodes.length)
+  const summaryNode = prepared.nodes[0]
+  commitSummaryJobs({
+    root,
+    sessionId: ir.session.id,
+    ownerId: 'test-stored-summary-owner',
+    jobs: [{
+      targetId: 'stored-span-summary-target',
+      targetMaterialHash: 'stored-span-summary-material',
+      handle: summaryNode.handle,
+      status: 'completed',
+      provider: 'test-provider',
+      model: 'test-summary-model',
+      strategy: 'compaction-contiguous-span-v1',
+      breadcrumb: 'stored span',
+      summary: 'Coherent stored span summary about the todo sync dry run.',
+      topics: ['todo sync dry run summary'],
+      inputTokenBudget: 1000,
+      inputTokenCount: summaryNode.summaryMeta.inputTokenCount,
+      completedAt: '2026-06-05T00:00:10.000Z'
+    }, {
+      targetId: 'stored-root-summary-target',
+      targetMaterialHash: 'stored-root-summary-material',
+      handle: tree.root.handle,
+      status: 'completed',
+      provider: 'test-provider',
+      model: 'test-summary-model',
+      strategy: 'compaction-root-summary-v1',
+      breadcrumb: 'session summary',
+      summary: 'Coherent stored root summary of the entire indexed conversation.',
+      topics: ['entire indexed conversation summary'],
+      inputTokenBudget: 1000,
+      inputTokenCount: 42,
+      completedAt: '2026-06-05T00:00:11.000Z'
+    }]
+  })
+  const typesenseCollection = `session_indexer_stored_summary_${process.pid}_${Date.now()}`
+  const indexed = await writeSessionIndexWithBackend({
+    root,
+    ir,
+    summaryMode: 'off',
+    typesenseCollection
+  })
+
+  assert.equal(indexed.summaryIndex.strategy, 'compaction-contiguous-span-v1')
+  assert.equal(indexed.summaryIndex.execution, 'stored-summary-reuse')
+  assert.equal(indexed.summaryIndex.reusedJobCount, 2)
+  const docs = readSessionDocs({ root, sessionId: ir.session.id })
+  const rootDoc = docs.find(doc => doc.handle === tree.root.handle)
+  assert.ok(rootDoc)
+  assert.match(rootDoc.summary, /Coherent stored root summary/)
+  const rootChildren = docs.filter(doc => doc.parentHandle === tree.root.handle && doc.retrievalVisible !== false)
+  assert.ok(rootChildren.length > 0)
+  assert.ok(rootChildren.every(doc => doc.kind === 'summary_span'))
+
+  const browsed = await browseIndexWithBackend({
+    root,
+    sessionId: ir.session.id,
+    agent: 'codex',
+    typesenseCollection,
+    limit: 10
+  })
+  assert.match(browsed.result.text, /Coherent stored root summary/)
+  assert.ok(browsed.result.children.length > 0)
+  assert.ok(browsed.result.children.every(child => /\/summary\//.test(child.handle)))
+  assert.match(browsed.result.children[0].text, /Coherent stored span summary/)
+  const spanBrowse = await browseIndexWithBackend({
+    root,
+    sessionId: ir.session.id,
+    agent: 'codex',
+    typesenseCollection,
+    handle: browsed.result.children[0].handle,
+    limit: 80
+  })
+  const messageChild = spanBrowse.result.children.find(child => child.openable && child.text)
+  assert.ok(messageChild, 'expected browse children to include hydrated user or assistant message text')
+  assert.doesNotMatch(messageChild.text, /No summary text returned/)
+  const searched = await searchIndexWithBackend({
+    root,
+    query: 'entire indexed conversation',
+    sessionId: ir.session.id,
+    agent: 'codex',
+    typesenseCollection,
+    limit: 5
+  })
+  assert.ok(searched.hits.some(hit => hit.handle === tree.root.handle))
+})
+
+test('Typesense root browse discovers the single generated summary child', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-typesense-root-discovery-'))
+  const sourceFile = path.join(root, 'codex-mini.jsonl')
+  fs.copyFileSync(fixture, sourceFile)
+  const ir = importCodexJsonl(sourceFile)
+  const tree = buildMipTree(ir)
+  const prepared = prepareCompactedSummaryLayer(tree, { summaryInputTokenBudget: 1000 })
+  assert.ok(prepared.nodes.length)
+  const summaryNode = prepared.nodes[0]
+  commitSummaryJobs({
+    root,
+    sessionId: ir.session.id,
+    ownerId: 'test-root-discovery-owner',
+    jobs: [{
+      targetId: 'stored-discovered-span-summary-target',
+      targetMaterialHash: 'stored-discovered-span-summary-material',
+      handle: summaryNode.handle,
+      status: 'completed',
+      provider: 'test-provider',
+      model: 'test-summary-model',
+      strategy: 'compaction-contiguous-span-v1',
+      breadcrumb: 'todo sync',
+      summary: 'Coherent discovered span summary about the todo sync dry run and clientRevision 7 result.',
+      topics: ['todo sync dry run clientRevision 7 summary'],
+      inputTokenBudget: 1000,
+      inputTokenCount: summaryNode.summaryMeta.inputTokenCount,
+      completedAt: '2026-06-05T00:00:10.000Z'
+    }]
+  })
+  const typesenseCollection = `session_indexer_root_discovery_${process.pid}_${Date.now()}`
+  const indexed = await writeSessionIndexWithBackend({
+    root,
+    ir,
+    summaryMode: 'off',
+    typesenseCollection
+  })
+
+  assert.equal(indexed.summaryIndex.execution, 'stored-summary-reuse')
+  assert.equal(indexed.summaryIndex.reusedJobCount, 1)
+  const docs = readSessionDocs({ root, sessionId: ir.session.id })
+  const rootDoc = docs.find(doc => doc.handle === tree.root.handle)
+  assert.ok(rootDoc)
+  assert.notEqual(rootDoc.summaryMeta && rootDoc.summaryMeta.status, 'completed')
+  const rootChildren = docs.filter(doc => doc.parentHandle === tree.root.handle && doc.retrievalVisible !== false)
+  assert.equal(rootChildren.length, 1)
+  assert.equal(rootChildren[0].handle, summaryNode.handle)
+
+  const browsed = await browseIndexWithBackend({
+    root,
+    sessionId: ir.session.id,
+    agent: 'codex',
+    typesenseCollection,
+    limit: 10
+  })
+  assert.equal(browsed.result.handle, tree.root.handle)
+  assert.match(browsed.result.text, /Coherent discovered span summary/)
+  assert.equal(browsed.result.children.some(child => child.handle === summaryNode.handle), false)
+  assert.equal(browsed.result.children.length, 2)
+  assert.ok(browsed.result.children.every(child => child.openable && child.text))
+  assert.ok(browsed.result.children.some(child => /inspect the todo sync output/.test(child.text)))
+  assert.ok(browsed.result.children.some(child => /clientRevision 7/.test(child.text)))
+})
+
 test('persisted state read failures throw instead of returning empty status', () => {
   const manifestRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-bad-manifest-'))
   fs.writeFileSync(path.join(manifestRoot, 'manifest.json'), '{not json')
@@ -1534,7 +1724,7 @@ test('summary planner batches only the compacted-away prefix before a compaction
 test('summary system prompt is the exact recovered prompt', () => {
   assert.equal(
     SUMMARY_SYSTEM_PROMPT,
-    'Copy the information, not the wording. Keep all concrete state. Remove filler, repetition, politeness padding, meta-commentary, and verbose restatements. Do not abstract. Do not decide salience unless something is clearly redundant or obsolete. For tool calls summarize the operation, input, and outcome'
+    'Preserve the turns in the conversation. Identify the speaker, user, assistant, or tool call. Copy the information, not the wording. Keep all concrete state. Remove filler, repetition, politeness padding, meta-commentary, and verbose restatements. Do not abstract. Do not decide salience unless something is clearly redundant or obsolete. For tool calls summarize the operation, input, and outcome'
   )
 })
 
@@ -3654,6 +3844,93 @@ test('shared Typesense collection isolates sessions by agent and session id', as
   assert.ok(scoped.hits.length > 0)
 })
 
+test('web app API lists indexed Codex sessions by recent date and supports retrieval', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-web-api-'))
+  const typesenseCollection = `session_indexer_web_${process.pid}_${Date.now()}`
+  const sourceFile = path.join(root, 'codex-mini.jsonl')
+  fs.copyFileSync(fixture, sourceFile)
+  const indexed = await writeSessionIndexWithBackend({
+    root,
+    ir: importCodexJsonl(sourceFile),
+    summaryMode: 'off',
+    typesenseCollection
+  })
+  writeSessionIndex({
+    root,
+    ir: createSessionIR({
+      source: { kind: 'test', path: path.join(root, 'newer-indexed.jsonl') },
+      session: {
+        id: 'newer-indexed-session',
+        agent: 'codex',
+        title: 'Newer Indexed Session',
+        updatedAt: '2026-06-06T00:00:00.000Z'
+      },
+      events: [{
+        type: 'message',
+        role: 'user',
+        content: [textBlock('newer indexed session for selector sorting')]
+      }]
+    })
+  })
+  writeSessionIndex({
+    root,
+    ir: createSessionIR({
+      source: { kind: 'test', path: path.join(root, 'older-indexed.jsonl') },
+      session: {
+        id: 'older-indexed-session',
+        agent: 'codex',
+        title: 'Older Indexed Session',
+        updatedAt: '2026-06-04T00:00:00.000Z'
+      },
+      events: [{
+        type: 'message',
+        role: 'user',
+        content: [textBlock('older indexed session for selector sorting')]
+      }]
+    })
+  })
+  writeJobState({
+    root,
+    state: {
+      jobId: 'index-web-unindexed',
+      scope: 'this_session_only',
+      source: 'codex',
+      sessions: [path.join(root, 'unindexed-session.jsonl')],
+      pid: process.pid,
+      status: 'indexing',
+      progress: { phase: 'indexing', indexed: 0, total: 1 },
+      startedAt: '2026-06-07T00:00:00.000Z'
+    }
+  })
+
+  const started = await startWebServer({
+    host: '127.0.0.1',
+    port: 0,
+    indexDir: root,
+    typesenseCollection
+  })
+  try {
+    const sessions = await fetchJson(`${started.url}api/sessions?agent=codex&q=${encodeURIComponent('Indexed Session')}&limit=10`)
+    assert.ok(sessions.sessions.length >= 2)
+    assert.equal(sessions.sessions[0].session_id, 'newer-indexed-session')
+    assert.ok(sessions.sessions.every(session => session.index_id))
+    assert.equal(sessions.sessions.some(session => session.session_id === 'unindexed-session'), false)
+
+    const browsed = await fetchJson(`${started.url}api/browse?session_id=mini-session&index_id=${encodeURIComponent(indexed.indexId)}&agent=codex&limit=5`)
+    assert.ok(browsed.children.length > 0)
+
+    const searched = await fetchJson(`${started.url}api/search?session_id=mini-session&index_id=${encodeURIComponent(indexed.indexId)}&agent=codex&q=${encodeURIComponent('clientRevision')}&limit=5`)
+    const hit = searched.hits.find(item => item.openable)
+    assert.ok(hit)
+
+    const opened = await fetchJson(`${started.url}api/open?session_id=mini-session&index_id=${encodeURIComponent(indexed.indexId)}&agent=codex&handle=${encodeURIComponent(hit.handle)}&budget_tokens=10000`)
+    assert.equal(opened.isVerbatim, true)
+    assert.match(opened.content, /clientRevision/)
+  } finally {
+    await closeServer(started.server)
+  }
+})
+
 test('search and browse missing indexed content do not create session artifacts', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-no-on-demand-'))
   const typesenseCollection = `session_indexer_no_demand_${process.pid}_${Date.now()}`
@@ -4293,6 +4570,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.equal(browseRoot.page.limit, 1)
     assert.equal(browseRoot.page.returned, 1)
     assert.equal(browseRoot.children[0].handle.startsWith('event/'), true)
+    assert.equal(browseRoot.children[0].index, '2/5')
     assert.equal(Object.hasOwn(browseRoot.children[0], 'session_id'), false)
     assert.equal(Object.hasOwn(browseRoot.children[0], 'index_id'), false)
     assert.equal(Object.hasOwn(browseRoot.children[0], 'resourceLinks'), false)
@@ -4332,7 +4610,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.equal(browseSecondPage.page.start, 1)
     assert.equal(browseSecondPage.page.returned, 1)
     assert.notEqual(browseSecondPage.children[0].handle, browseRoot.children[0].handle)
-    assert.equal(browseSecondPage.children[0].index, '2/5')
+    assert.equal(browseSecondPage.children[0].index, '5/5')
 
     const zoomedBrowse = (await client.callTool({
       name: 'conversation_browse',

@@ -41,7 +41,7 @@ const {
   topicsText
 } = require('./topics.js')
 
-const SUMMARY_SYSTEM_PROMPT = 'Copy the information, not the wording. Keep all concrete state. Remove filler, repetition, politeness padding, meta-commentary, and verbose restatements. Do not abstract. Do not decide salience unless something is clearly redundant or obsolete. For tool calls summarize the operation, input, and outcome'
+const SUMMARY_SYSTEM_PROMPT = 'Preserve the turns in the conversation. Identify the speaker, user, assistant, or tool call. Copy the information, not the wording. Keep all concrete state. Remove filler, repetition, politeness padding, meta-commentary, and verbose restatements. Do not abstract. Do not decide salience unless something is clearly redundant or obsolete. For tool calls summarize the operation, input, and outcome'
 
 const DEFAULT_SUMMARY_MODE = process.env.SESSION_INDEXER_SUMMARY_MODE || 'model'
 const DEFAULT_SUMMARY_PROVIDER = process.env.SESSION_INDEXER_SUMMARY_PROVIDER || 'openai-codex-responses'
@@ -1278,6 +1278,46 @@ const jobAccounting = jobs => {
   }
 }
 
+const summarizeTreeFromStoredJobs = (tree, opts = {}) => {
+  const jobs = (opts.previousSummaryJobs || []).filter(hasReusableSummary)
+  if (!jobs.length) return null
+  const inputTokenBudget = jobs.reduce((max, job) => {
+    const value = Number(job && job.inputTokenBudget || 0)
+    return value > max ? value : max
+  }, 0) || DEFAULT_SUMMARY_INPUT_TOKEN_BUDGET
+  const prepared = prepareCompactedSummaryLayer(tree, {
+    summaryInputTokenBudget: inputTokenBudget,
+    previousSummaryJobs: jobs
+  })
+  const applied = applyStoredSummaryJobs(tree, jobs)
+  if (!applied) return null
+  const providers = [...new Set(jobs.map(job => job.provider).filter(Boolean))]
+  const models = [...new Set(jobs.map(job => job.model).filter(Boolean))]
+  return {
+    summary: {
+      mode: opts.summaryMode || 'off',
+      provider: providers.length === 1 ? providers[0] : providers.length ? 'mixed' : null,
+      model: models.length === 1 ? models[0] : models.length ? 'mixed' : null,
+      strategy: SPAN_SUMMARY_STRATEGY,
+      execution: 'stored-summary-reuse',
+      status: 'completed',
+      generatedNodeCount: 0,
+      reusedJobCount: applied,
+      skippedJobCount: Math.max(0, jobs.length - applied),
+      candidateNodeCount: prepared.nodes.length,
+      compactedSpanCount: prepared.compactedSpanCount || 0,
+      compactedInputTokenCount: prepared.compactedInputTokenCount || 0,
+      compactionLog: compactionLogForNodes({
+        tree,
+        nodes: candidateSummaryNodes({ tree, prepared }),
+        jobs
+      }),
+      ...jobAccounting(jobs)
+    },
+    jobs: []
+  }
+}
+
 const updateSubmittedJobNodes = ({ jobs, batch, mode, resolved }) => {
   for (const job of jobs) {
     job.batchId = batch && batch.id
@@ -1639,7 +1679,10 @@ const summarizeTreeBatch = async ({ tree, opts, mode, resolved, candidateNodes, 
 
 const summarizeTree = async (tree, opts = {}) => {
   const mode = opts.summaryMode || DEFAULT_SUMMARY_MODE
-  if (mode === 'off' || mode === 'none') return markSummaryDisabled(tree, { summaryMode: mode })
+  if (mode === 'off' || mode === 'none') {
+    return summarizeTreeFromStoredJobs(tree, { ...opts, summaryMode: mode }) ||
+      markSummaryDisabled(tree, { summaryMode: mode })
+  }
   if (mode !== 'model') throw new Error(`unsupported summary mode: ${mode}`)
 
   const resolved = summaryProvider({

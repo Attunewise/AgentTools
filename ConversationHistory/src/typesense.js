@@ -634,6 +634,7 @@ const docRef = ({ doc, score } = {}) => {
     summaryModel: doc.summaryModel,
     summaryMeta,
     excerpt: doc.excerpt,
+    content: doc.content,
     fullTokenCount: metrics.fullTokenCount,
     renderedTokenCount: metrics.renderedTokenCount,
     nextLevelTokenCount: metrics.nextLevelTokenCount,
@@ -642,6 +643,11 @@ const docRef = ({ doc, score } = {}) => {
     resourceLinks
   }
 }
+
+const sourceMessageDoc = doc => Boolean(doc &&
+  (doc.role === 'user' || doc.role === 'assistant') &&
+  (doc.kind === 'message' || /^event_content(?:_chunk)?$/.test(String(doc.kind || '')))
+)
 
 const includeFields = fields => fields.join(',')
 
@@ -748,6 +754,7 @@ const childDocuments = async ({ indexId, sessionId, agent, parentHandle, startAt
     found: Number(result.found || 0),
     docs: hydrateDocs({
       root: opts.indexDir || opts.root,
+      includeContent: true,
       docs: hits.slice(window.offset, window.offset + window.requestedLimit).map(hit => hit.document)
     })
   }
@@ -759,7 +766,8 @@ const renderTypesenseNode = async ({ doc, sourceLink, budgetTokens = 1200, ...op
   const metrics = parseJsonField(doc.metricsJson, {}, 'metricsJson', doc.id)
   const content = doc.content || ''
   const contentTokens = estimateTokens(content)
-  if (doc.isVerbatim && content && budget >= Number(metrics.fullTokenCount || contentTokens)) {
+  const sourceMessage = content && sourceMessageDoc(doc)
+  if ((doc.isVerbatim || sourceMessage) && content && budget >= Number(metrics.fullTokenCount || contentTokens)) {
     return {
       sourceLink,
       ...ref,
@@ -770,7 +778,7 @@ const renderTypesenseNode = async ({ doc, sourceLink, budgetTokens = 1200, ...op
       omittedTokenCount: 0
     }
   }
-  if (doc.isVerbatim || !Number(metrics.childCount || 0)) {
+  if (doc.isVerbatim || sourceMessage || !Number(metrics.childCount || 0)) {
     const maxChars = Math.max(160, budget * 4)
     const excerpt = content ? content.slice(0, maxChars) : doc.excerpt || ''
     return {
@@ -859,11 +867,22 @@ const optionalString = value => {
   return text ? text : undefined
 }
 
+const sourceMessageRef = ref => Boolean(ref &&
+  (ref.role === 'user' || ref.role === 'assistant') &&
+  (ref.kind === 'message' || /^event_content(?:_chunk)?$/.test(String(ref.kind || '')))
+)
+
 const refText = ref => ref && ref.summaryMeta && ref.summaryMeta.status === 'completed'
   ? optionalString(ref.summary || ref.head)
-  : undefined
+  : sourceMessageRef(ref)
+    ? optionalString(ref.content || ref.excerpt || ref.summary || ref.head)
+    : undefined
 
-const refIsOpenable = ref => Boolean(ref && ref.isVerbatim && (ref.role === 'user' || ref.role === 'assistant'))
+const refIsOpenable = ref => Boolean(sourceMessageRef(ref) && (ref.isVerbatim || ref.content))
+
+const refIsBrowsable = ref => Boolean(refText(ref) || refIsOpenable(ref))
+
+const refIsGeneratedSummary = ref => Boolean(ref && ref.kind === 'summary_span')
 
 const browseRef = ref => {
   return {
@@ -977,29 +996,63 @@ const browseTypesense = async ({ indexId, sessionId, agent, handle, topicId, zoo
     throw new Error(`Reasoning records are not available through conversation_history: ${doc.handle}`)
   }
 
-  const ref = docRef({ doc })
+  let ref = docRef({ doc })
+  let childParentHandle = targetHandle
+  if (!refText(ref) && doc.kind === 'session' && resolvedZoom === 'children') {
+    const rootChildren = await childDocuments({
+      indexId: doc.indexId,
+      sessionId,
+      agent: agent || doc.agent,
+      parentHandle: targetHandle,
+      startAt: 0,
+      limit: 2,
+      ...opts
+    })
+    const rootChildRefs = rootChildren.docs
+      .map(child => docRef({ doc: child }))
+      .filter(refIsBrowsable)
+    if (rootChildren.found === 1 && rootChildRefs.length === 1 && refIsGeneratedSummary(rootChildRefs[0])) {
+      const topSummary = rootChildRefs[0]
+      ref = {
+        ...ref,
+        summary: topSummary.summary,
+        head: topSummary.head,
+        summaryMeta: topSummary.summaryMeta,
+        summaryModel: topSummary.summaryModel,
+        childCount: topSummary.childCount
+      }
+      childParentHandle = topSummary.handle
+    }
+  }
   const childResult = await childDocuments({
     indexId: doc.indexId,
     sessionId,
     agent: agent || doc.agent,
-    parentHandle: targetHandle,
+    parentHandle: childParentHandle,
     startAt: resolvedStart,
     limit,
     topic,
     ...opts
   })
-  const children = childResult.docs.map(child => browseRef(docRef({ doc: child })))
+  const childRefs = childResult.docs
+    .map(child => docRef({ doc: child }))
+    .filter(refIsBrowsable)
+  const children = childRefs.map(child => browseRef(child))
+  const ownRef = browseRef(ref)
   const startNumber = Math.max(0, Number(resolvedStart || 0))
   const limitNumber = Math.max(1, Number(limit || 20))
   const nextStart = startNumber + childResult.docs.length
+  const filteredTotal = childResult.found === childResult.docs.length
+    ? childRefs.length
+    : childResult.found
   return {
     zoom: resolvedZoom,
-    ...browseRef(ref),
+    ...ownRef,
     page: {
       start: startNumber,
       limit: limitNumber,
-      returned: childResult.docs.length,
-      total: childResult.found,
+      returned: children.length,
+      total: filteredTotal,
       next_start: nextStart < childResult.found ? nextStart : undefined
     },
     children
@@ -1034,6 +1087,7 @@ const searchTypesense = async (opts = {}) => {
   }
   return hydrateDocs({
     root: opts.indexDir || opts.root,
+    includeContent: true,
     docs: (result.hits || [])
       .slice(window.offset, window.offset + window.requestedLimit)
       .map(hit => ({

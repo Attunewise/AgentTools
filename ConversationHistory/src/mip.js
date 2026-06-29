@@ -206,7 +206,13 @@ const finalize = node => {
     return node
   }
   node.children.forEach(finalize)
-  const visibleChildren = modelVisibleChildren(node.children)
+  const nodeChildren = modelVisibleChildren(node.children)
+  const rootSummaryAlias = !modelTextForNode(node) &&
+    node.kind === 'session' &&
+    nodeChildren.length === 1 &&
+    nodeChildren[0].kind === 'summary_span'
+  const surfaceNode = rootSummaryAlias ? nodeChildren[0] : node
+  const visibleChildren = modelVisibleChildren(surfaceNode.children)
   node.ownUsage = normalizeUsage(node.ownUsage)
   node.usage = isSessionRoot && hasUsage(node.ownUsage)
     ? node.ownUsage
@@ -722,8 +728,9 @@ const truncateSearchText = (value, maxChars) => String(value || '').slice(0, max
 
 const nodeHasCompletedSummary = node => {
   const meta = node && node.summaryMeta || {}
-  return node && node.kind === 'summary_span' &&
+  return node && (node.kind === 'summary_span' || node.kind === 'session') &&
     meta.status === 'completed' &&
+    meta.strategy !== 'summary-disabled' &&
     compactText(node && node.head)
 }
 
@@ -783,7 +790,14 @@ const browseNode = (tree, opts = {}) => {
     if (parentHandle) node = tree.byHandle.get(parentHandle) || node
   }
   if (isModelHiddenNode(node)) throw new Error(`Reasoning records are not available through conversation_history: ${handle}`)
-  const visibleChildren = modelVisibleChildren(node.children)
+  const directChildren = modelVisibleChildren(node.children)
+  const discoveredRoot = !modelTextForNode(node) &&
+    node.kind === 'session' &&
+    directChildren.length === 1 &&
+    directChildren[0].kind === 'summary_span'
+      ? directChildren[0]
+      : node
+  const visibleChildren = modelVisibleChildren(discoveredRoot.children)
   const start = Math.max(0, Number(opts.start !== undefined ? opts.start : opts.startAt || opts.start_at || 0) || 0)
   const filteredChildren = visibleChildren.filter(child => topicMatches(child.topics, opts.topic))
   const pageChildren = filteredChildren
@@ -794,7 +808,7 @@ const browseNode = (tree, opts = {}) => {
     handle: node.handle,
     zoom,
     index_id: tree.ir.indexId,
-    text: modelTextForNode(node) || undefined,
+    text: modelTextForNode(discoveredRoot) || undefined,
     child_count: visibleChildren.length,
     page: {
       start,
@@ -818,6 +832,11 @@ const nodeSearchText = (node, opts = {}) => {
   return ''
 }
 
+const defaultRetrievalVisible = node => Boolean(node &&
+  !isModelHiddenNode(node) &&
+  (node.kind === 'session' || modelTextForNode(node))
+)
+
 const isModelHiddenDoc = doc => Boolean(doc && (
   doc.kind === 'reasoning' ||
   /\/reasoning(?:\/|$)/.test(String(doc.handle || ''))
@@ -828,7 +847,7 @@ const collectIndexDocuments = (tree, opts = {}) => {
   const indexId = tree.ir.indexId || indexIdForIR(tree.ir)
   const retrievalVisible = typeof opts.retrievalVisible === 'function'
     ? opts.retrievalVisible
-    : () => opts.retrievalVisible !== false
+    : node => opts.retrievalVisible !== false && defaultRetrievalVisible(node)
   const visit = (node, parent, depth) => {
     if (isModelHiddenNode(node)) return
     const isLeaf = !node.children.length

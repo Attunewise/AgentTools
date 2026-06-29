@@ -74,9 +74,12 @@ const sourceImportOptions = sourceKind => {
 }
 
 const nodeContent = node => {
-  if (!node || node.children && node.children.length) return ''
+  if (!node) return ''
   const { modelTextForNode } = require('./mip.js')
-  return modelTextForNode(node) || String(node.raw || '')
+  const text = modelTextForNode(node)
+  if (text) return text
+  if (node.children && node.children.length) return ''
+  return String(node.raw || '')
 }
 
 const findSourceNode = ({ tree, doc }) => {
@@ -93,15 +96,33 @@ const findSourceNode = ({ tree, doc }) => {
   return candidates.find(node => node.kind === doc.kind) || (candidates.length === 1 ? candidates[0] : null)
 }
 
-const hydrateSourceContent = doc => {
-  if (!doc || doc.content || !doc.isVerbatim || !doc.sourcePath || !doc.handle) return doc
+const isSourceMessageDoc = doc => Boolean(doc &&
+  (doc.role === 'user' || doc.role === 'assistant') &&
+  (doc.kind === 'message' || /^event_content(?:_chunk)?$/.test(String(doc.kind || '')))
+)
+
+const canHydrateSourceContent = doc => isSourceMessageDoc(doc)
+
+const sourceTreeCacheKey = ({ doc, opts }) => JSON.stringify({
+  sourceKind: doc.sourceKind || '',
+  sourcePath: doc.sourcePath || '',
+  opts
+})
+
+const hydrateSourceContent = (doc, treeCache = new Map()) => {
+  if (!doc || doc.content || !canHydrateSourceContent(doc) || !doc.sourcePath || !doc.handle) return doc
   try {
     const { adapterFor } = require('./adapters/index.js')
     const { buildMipTree } = require('./mip.js')
     const adapter = adapterFor(adapterNameForSourceKind(doc.sourceKind))
     for (const opts of sourceImportOptions(doc.sourceKind)) {
-      const ir = adapter.importFile(doc.sourcePath, opts)
-      const tree = buildMipTree(ir)
+      const cacheKey = sourceTreeCacheKey({ doc, opts })
+      let tree = treeCache.get(cacheKey)
+      if (!tree) {
+        const ir = adapter.importFile(doc.sourcePath, opts)
+        tree = buildMipTree(ir)
+        treeCache.set(cacheKey, tree)
+      }
       const node = findSourceNode({ tree, doc })
       const content = nodeContent(node)
       if (content) return { ...doc, content }
@@ -116,20 +137,50 @@ const hydrateSourceContent = doc => {
   }
 }
 
-const hydrateDoc = ({ root, doc, includeContent = false }) => {
+const hydrateDoc = ({ root, doc, includeContent = false, docMap, treeCache }) => {
   if (!doc || !root || !doc.sessionId || !doc.handle) return doc
   let hydrated = doc
-  try {
-    const stored = readSessionDocMap({ root, sessionId: doc.sessionId }).get(doc.handle)
+  if (docMap !== undefined) {
+    const stored = docMap && docMap.get(doc.handle)
     hydrated = stored ? { ...doc, ...stored } : doc
-  } catch (err) {
-    if (err && err.code === 'ENOENT') hydrated = doc
-    else throw err
+  } else {
+    try {
+      const stored = readSessionDocMap({ root, sessionId: doc.sessionId }).get(doc.handle)
+      hydrated = stored ? { ...doc, ...stored } : doc
+    } catch (err) {
+      if (err && err.code === 'ENOENT') hydrated = doc
+      else throw err
+    }
   }
-  return includeContent ? hydrateSourceContent(hydrated) : hydrated
+  return includeContent ? hydrateSourceContent(hydrated, treeCache) : hydrated
 }
 
-const hydrateDocs = ({ root, docs }) => (docs || []).map(doc => hydrateDoc({ root, doc }))
+const hydrateDocs = ({ root, docs, includeContent = false }) => {
+  const docMaps = new Map()
+  const treeCache = new Map()
+  const docMapFor = doc => {
+    if (!root || !doc || !doc.sessionId) return undefined
+    if (docMaps.has(doc.sessionId)) return docMaps.get(doc.sessionId)
+    try {
+      const map = readSessionDocMap({ root, sessionId: doc.sessionId })
+      docMaps.set(doc.sessionId, map)
+      return map
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        docMaps.set(doc.sessionId, null)
+        return null
+      }
+      throw err
+    }
+  }
+  return (docs || []).map(doc => hydrateDoc({
+    root,
+    doc,
+    includeContent,
+    docMap: docMapFor(doc),
+    treeCache
+  }))
+}
 
 module.exports = {
   DOC_STORE_SCHEMA,

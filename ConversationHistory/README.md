@@ -29,6 +29,7 @@ npm install
 npm test
 
 ./bin/session-indexer-mcp
+node bin/session-indexer-web.js
 
 node bin/session-indexer.js inspect --source codex --latest
 node bin/session-indexer.js search_server_status
@@ -47,6 +48,8 @@ node bin/session-indexer.js deploy --target claude-plugin
 node bin/session-indexer.js inspect --source claude --latest
 node bin/session-indexer.js watch --source codex --latest
 ```
+
+`session-indexer-web` starts a local browser UI for selecting indexed Codex sessions, searching the selected index, browsing the hierarchy, and opening bounded source text outside Codex.
 
 MCP tools:
 

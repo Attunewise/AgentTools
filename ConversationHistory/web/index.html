@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Conversation History</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sessions">
+      <header class="topbar">
+        <div>
+          <h1>Conversation History</h1>
+          <p id="health">Connecting</p>
+        </div>
+        <button id="refreshSessions" type="button" title="Refresh sessions">Refresh</button>
+      </header>
+      <div class="sessionControls">
+        <select id="agentFilter" aria-label="Agent">
+          <option value="codex" selected>Codex</option>
+          <option value="all">All</option>
+          <option value="claude">Claude</option>
+        </select>
+        <input id="sessionQuery" type="search" placeholder="Filter sessions" autocomplete="off">
+      </div>
+      <div id="sessionList" class="sessionList" aria-label="Indexed sessions"></div>
+    </aside>
+
+    <main class="workspace">
+      <section class="sessionBand">
+        <div>
+          <h2 id="sessionTitle">Select an indexed session</h2>
+          <div id="sessionMeta"></div>
+        </div>
+        <div class="sessionStats" id="sessionStats"></div>
+      </section>
+
+      <section class="toolBand">
+        <form id="searchForm" class="searchForm">
+          <input id="searchInput" type="search" placeholder="Search selected index" autocomplete="off">
+          <select id="roleFilter" aria-label="Role">
+            <option value="">Any role</option>
+            <option value="user">User</option>
+            <option value="assistant">Assistant</option>
+            <option value="tool">Tool</option>
+            <option value="system">System</option>
+            <option value="developer">Developer</option>
+          </select>
+          <button type="submit">Search</button>
+        </form>
+        <div class="browseControls">
+          <button id="backBrowse" type="button" disabled>Back</button>
+          <button id="rootBrowse" type="button">Root</button>
+          <button id="outBrowse" type="button">Out</button>
+          <button id="siblingsBrowse" type="button">Siblings</button>
+          <label>Budget <input id="budgetInput" type="number" min="1" max="200000" value="2000"></label>
+        </div>
+      </section>
+
+      <section class="panes">
+        <div class="pane">
+          <div class="paneHead">
+            <h3>Browse</h3>
+            <span id="browseCount"></span>
+          </div>
+          <div id="browseTrail" class="trail"></div>
+          <div class="browseSummary" role="region" aria-label="Current summary">
+            <div class="summaryLabel">Current summary</div>
+            <div id="browseSummaryText" class="summaryText"></div>
+          </div>
+          <div id="browseResults" class="resultList"></div>
+        </div>
+        <div class="pane">
+          <div class="paneHead">
+            <h3>Search</h3>
+            <span id="searchCount"></span>
+          </div>
+          <div id="searchResults" class="resultList"></div>
+        </div>
+        <div class="pane sourcePane">
+          <div class="paneHead">
+            <h3>Open</h3>
+            <span id="openMeta"></span>
+          </div>
+          <div id="sourceView" class="sourceView markdownBody"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
