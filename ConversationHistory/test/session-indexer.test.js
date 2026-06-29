@@ -997,6 +997,15 @@ test('Typesense openLink opens verbatim search-hit content handles', async () =>
     },
     {
       timestamp: '2026-06-05T00:00:01.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'assistant response item before target' }]
+      }
+    },
+    {
+      timestamp: '2026-06-05T00:00:02.000Z',
       type: 'event_msg',
       payload: {
         type: 'user_message',
@@ -1005,12 +1014,12 @@ test('Typesense openLink opens verbatim search-hit content handles', async () =>
       }
     },
     {
-      timestamp: '2026-06-05T00:00:02.000Z',
+      timestamp: '2026-06-05T00:00:03.000Z',
       type: 'compacted',
       payload: { message: 'provider compact marker' }
     },
     {
-      timestamp: '2026-06-05T00:00:03.000Z',
+      timestamp: '2026-06-05T00:00:04.000Z',
       type: 'event_msg',
       payload: {
         type: 'user_message',
@@ -1019,7 +1028,7 @@ test('Typesense openLink opens verbatim search-hit content handles', async () =>
       }
     }
   ])
-  const ir = importCodexJsonl(sessionFile)
+  const ir = importCodexJsonl(sessionFile, { includeResponseMessages: false })
   const indexed = await writeSessionIndexWithBackend({
     root,
     ir,
@@ -1035,7 +1044,7 @@ test('Typesense openLink opens verbatim search-hit content handles', async () =>
   })
   const hit = searched.hits.find(item => item.openable && /\/content(?:\/|$)/.test(item.handle))
   assert.ok(hit, 'search returns an openable content handle')
-  assert.equal(hit.line, 2)
+  assert.equal(hit.line, 3)
 
   const opened = await openLinkWithBackend({
     root,

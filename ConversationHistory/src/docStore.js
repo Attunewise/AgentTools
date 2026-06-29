@@ -62,18 +62,51 @@ const adapterNameForSourceKind = kind => {
   return text
 }
 
+const sourceImportOptions = sourceKind => {
+  const adapterName = adapterNameForSourceKind(sourceKind)
+  if (adapterName === 'codex') {
+    return [
+      { includeResponseMessages: false },
+      { includeResponseMessages: true }
+    ]
+  }
+  return [{}]
+}
+
+const nodeContent = node => {
+  if (!node || node.children && node.children.length) return ''
+  const { modelTextForNode } = require('./mip.js')
+  return modelTextForNode(node) || String(node.raw || '')
+}
+
+const findSourceNode = ({ tree, doc }) => {
+  if (!tree || !tree.byHandle) return null
+  const exact = tree.byHandle.get(doc.handle)
+  if (nodeContent(exact)) return exact
+  const sourceLineNumber = Number(doc.sourceLineNumber || 0)
+  if (!Number.isInteger(sourceLineNumber) || sourceLineNumber <= 0) return null
+  const candidates = []
+  for (const node of tree.byHandle.values()) {
+    const lineNumber = Number(node && node.meta && node.meta.source && node.meta.source.lineNumber || 0)
+    if (lineNumber === sourceLineNumber && nodeContent(node)) candidates.push(node)
+  }
+  return candidates.find(node => node.kind === doc.kind) || (candidates.length === 1 ? candidates[0] : null)
+}
+
 const hydrateSourceContent = doc => {
   if (!doc || doc.content || !doc.isVerbatim || !doc.sourcePath || !doc.handle) return doc
   try {
     const { adapterFor } = require('./adapters/index.js')
     const { buildMipTree } = require('./mip.js')
     const adapter = adapterFor(adapterNameForSourceKind(doc.sourceKind))
-    const ir = adapter.importFile(doc.sourcePath)
-    if (doc.indexId) ir.indexId = doc.indexId
-    const tree = buildMipTree(ir)
-    const node = tree.byHandle && tree.byHandle.get(doc.handle)
-    if (!node || node.children && node.children.length) return doc
-    return { ...doc, content: node.raw }
+    for (const opts of sourceImportOptions(doc.sourceKind)) {
+      const ir = adapter.importFile(doc.sourcePath, opts)
+      const tree = buildMipTree(ir)
+      const node = findSourceNode({ tree, doc })
+      const content = nodeContent(node)
+      if (content) return { ...doc, content }
+    }
+    return doc
   } catch (err) {
     if (err && (
       err.code === 'ENOENT' ||
