@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict')
 const childProcess = require('node:child_process')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -128,6 +129,44 @@ const waitUntil = async (fn, { timeoutMs = 10000, pollMs = 100, label = 'conditi
   }
   const suffix = lastError ? `: ${lastError.message}` : ''
   throw new Error(`timed out waiting for ${label}${suffix}`)
+}
+
+const nodeRuntimePlatform = () => {
+  const osName = process.platform === 'darwin'
+    ? 'darwin'
+    : process.platform === 'linux' ? 'linux' : process.platform
+  const arch = process.arch === 'arm64'
+    ? 'arm64'
+    : process.arch === 'x64' ? 'x64' : process.arch
+  return { osName, arch }
+}
+
+const createLocalNodeDist = root => {
+  const version = 'v99.0.0-test'
+  const { osName, arch } = nodeRuntimePlatform()
+  const pkg = `node-${version}-${osName}-${arch}`
+  const distRoot = path.join(root, 'node-dist')
+  const distVersionDir = path.join(distRoot, version)
+  const packageParent = path.join(root, 'node-package')
+  const packageRoot = path.join(packageParent, pkg)
+  const nodeBin = path.join(packageRoot, 'bin', 'node')
+  fs.mkdirSync(path.dirname(nodeBin), { recursive: true })
+  try {
+    fs.linkSync(process.execPath, nodeBin)
+  } catch (_err) {
+    fs.copyFileSync(process.execPath, nodeBin)
+  }
+  fs.chmodSync(nodeBin, 0o755)
+  fs.mkdirSync(distVersionDir, { recursive: true })
+  const tarball = path.join(distVersionDir, `${pkg}.tar.gz`)
+  childProcess.execFileSync('tar', ['-czf', tarball, '-C', packageParent, pkg])
+  const digest = crypto.createHash('sha256').update(fs.readFileSync(tarball)).digest('hex')
+  fs.writeFileSync(path.join(distVersionDir, 'SHASUMS256.txt'), `${digest}  ${pkg}.tar.gz\n`)
+  return {
+    version,
+    distBase: `file://${distRoot}`,
+    runtimeDir: path.join(root, 'node-runtime')
+  }
 }
 
 const readProgressEvents = file => {
@@ -3910,9 +3949,13 @@ test('deploys repo as a Codex plugin package with marketplace entry', () => {
   assert.equal(result.codexSkill, undefined)
   const mcpConfig = JSON.parse(fs.readFileSync(path.join(pluginDest, '.mcp.json'), 'utf8'))
   assert.equal(mcpConfig.mcpServers.conversation_history.cwd, '.')
-  assert.deepEqual(mcpConfig.mcpServers.conversation_history.args, ['bin/session-indexer-mcp.js'])
+  assert.equal(mcpConfig.mcpServers.conversation_history.command, './bin/session-indexer-mcp')
+  assert.deepEqual(mcpConfig.mcpServers.conversation_history.args, [])
   assert.equal(mcpConfig.mcpServers.conversation_history.env.SESSION_INDEXER_DEPLOY_TARGET, 'codex-plugin')
   assert.doesNotMatch(JSON.stringify(mcpConfig), /CLAUDE_PLUGIN_ROOT/)
+  const launcher = path.join(pluginDest, 'bin', 'session-indexer-mcp')
+  assert.ok(fs.existsSync(launcher))
+  assert.equal((fs.statSync(launcher).mode & 0o111) !== 0, true)
   const marketplace = JSON.parse(fs.readFileSync(marketplacePath, 'utf8'))
   assert.equal(marketplace.plugins[0].name, 'conversation-history')
   assert.equal(marketplace.plugins[0].source.path, './plugins/conversation-history')
@@ -4102,15 +4145,19 @@ test('MCP server exposes native conversation search and openLink tools', async (
     summaryMode: 'off'
   })
   const indexId = indexIdForIR(ir)
+  const nodeDist = createLocalNodeDist(root)
 
   const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(__dirname, '..', 'bin', 'session-indexer-mcp.js')],
+    command: path.join(__dirname, '..', 'bin', 'session-indexer-mcp'),
+    args: [],
     cwd: path.join(__dirname, '..'),
     env: {
       AGENTTOOLS_MCP_LOG_DIR: path.join(root, 'mcp-logs'),
       HOME: fakeHome,
       SESSION_INDEXER_STATE_DIR: root,
+      SESSION_INDEXER_NODE_VERSION: nodeDist.version,
+      SESSION_INDEXER_NODE_DIST_BASE: nodeDist.distBase,
+      SESSION_INDEXER_NODE_RUNTIME_DIR: nodeDist.runtimeDir,
       SESSION_INDEXER_SUMMARY_MODE: 'off'
     },
     stderr: 'pipe'
@@ -4123,6 +4170,13 @@ test('MCP server exposes native conversation search and openLink tools', async (
   await client.connect(transport)
   try {
     const listed = await client.listTools()
+    const downloadedNode = path.join(
+      nodeDist.runtimeDir,
+      `node-${nodeDist.version}-${nodeRuntimePlatform().osName}-${nodeRuntimePlatform().arch}`,
+      'bin',
+      'node'
+    )
+    assert.ok(fs.existsSync(downloadedNode))
     const names = listed.tools.map(tool => tool.name)
     assert.ok(names.includes('conversation_search'))
     assert.ok(names.includes('conversation_openLink'))

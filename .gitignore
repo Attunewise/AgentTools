@@ -4,6 +4,7 @@ coverage/
 *.log
 tmp/
 .session-indexer/
+.runtime/
 artifacts/model-sessions/
 *~
 \#*\#

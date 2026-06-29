@@ -92,6 +92,7 @@ const copyRepo = (dest) => {
       return ![
         '.git',
         'node_modules',
+        '.runtime',
         '.session-indexer',
         'coverage',
         'tmp'
@@ -112,6 +113,7 @@ const copyPackageDir = (sourceRoot, dest, { exclude = [] } = {}) => {
       return ![
         '.git',
         'node_modules',
+        '.runtime',
         'coverage',
         'tmp'
       ].some(name => rel === name || rel.startsWith(`${name}${path.sep}`)) &&

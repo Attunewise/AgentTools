@@ -1,0 +1,102 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+NODE_VERSION=${SESSION_INDEXER_NODE_VERSION:-v24.14.0}
+DIST_BASE=${SESSION_INDEXER_NODE_DIST_BASE:-https://nodejs.org/dist}
+
+case "$(uname -s)" in
+  Darwin) NODE_OS=darwin ;;
+  Linux) NODE_OS=linux ;;
+  *) echo "unsupported OS for conversation_history vendored Node: $(uname -s)" >&2; exit 1 ;;
+esac
+
+case "$(uname -m)" in
+  arm64|aarch64) NODE_ARCH=arm64 ;;
+  x86_64|amd64) NODE_ARCH=x64 ;;
+  *) echo "unsupported arch for conversation_history vendored Node: $(uname -m)" >&2; exit 1 ;;
+esac
+
+PKG="node-${NODE_VERSION}-${NODE_OS}-${NODE_ARCH}"
+RUNTIME_ROOT=${SESSION_INDEXER_NODE_RUNTIME_DIR:-"$ROOT/.runtime/node"}
+RUNTIME_DIR="$RUNTIME_ROOT/${PKG}"
+NODE_BIN="$RUNTIME_DIR/bin/node"
+LOCK_DIR="$RUNTIME_ROOT/.install-${PKG}.lock"
+
+download() {
+  url=$1
+  dest=$2
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$dest"
+  else
+    echo "conversation_history needs curl to download vendored Node runtime" >&2
+    return 127
+  fi
+}
+
+sha256_file() {
+  file=$1
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  else
+    echo "conversation_history needs shasum or sha256sum to verify vendored Node runtime" >&2
+    return 127
+  fi
+}
+
+install_node() {
+  mkdir -p "$RUNTIME_ROOT"
+  i=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -gt 600 ]; then
+      echo "timed out waiting for conversation_history Node runtime install lock" >&2
+      exit 1
+    fi
+    sleep 0.1
+    if [ -x "$NODE_BIN" ]; then return 0; fi
+  done
+  cleanup_lock() {
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  }
+  trap cleanup_lock EXIT HUP INT TERM
+
+  if [ -x "$NODE_BIN" ]; then
+    cleanup_lock
+    trap - EXIT HUP INT TERM
+    return 0
+  fi
+
+  tmp="$RUNTIME_ROOT/.tmp-${PKG}-$$"
+  rm -rf "$tmp"
+  mkdir -p "$tmp"
+  tarball="$tmp/${PKG}.tar.gz"
+  sums="$tmp/SHASUMS256.txt"
+
+  download "$DIST_BASE/$NODE_VERSION/${PKG}.tar.gz" "$tarball"
+  download "$DIST_BASE/$NODE_VERSION/SHASUMS256.txt" "$sums"
+
+  expected=$(awk -v f="${PKG}.tar.gz" '$2 == f {print $1}' "$sums")
+  actual=$(sha256_file "$tarball")
+  if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    echo "conversation_history Node runtime checksum mismatch for ${PKG}.tar.gz" >&2
+    echo "expected: $expected" >&2
+    echo "actual:   $actual" >&2
+    exit 1
+  fi
+
+  tar -xzf "$tarball" -C "$tmp"
+  rm -rf "$RUNTIME_DIR"
+  mv "$tmp/$PKG" "$RUNTIME_DIR"
+  rm -rf "$tmp"
+  cleanup_lock
+  trap - EXIT HUP INT TERM
+}
+
+if [ ! -x "$NODE_BIN" ]; then
+  install_node
+fi
+
+exec "$NODE_BIN" "$ROOT/bin/session-indexer-mcp.js" "$@"
