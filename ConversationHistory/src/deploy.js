@@ -6,6 +6,13 @@ const { REPO_ROOT } = require('./paths.js')
 
 const PLUGIN_NAME = 'conversation-history'
 const CONVERSATION_HISTORY_SKILL_NAME = 'conversation_history'
+const LOCAL_FILE_DEPENDENCIES = [{
+  packageName: 'codex-session-tools',
+  sourceDir: path.resolve(REPO_ROOT, '..', 'CodexSessionTools'),
+  oldPackageLockKey: '../CodexSessionTools',
+  vendorRelativeDir: path.join('vendor', 'CodexSessionTools'),
+  deployedSpec: 'file:vendor/CodexSessionTools'
+}]
 
 const defaultCodexSkillDir = () => {
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
@@ -84,6 +91,74 @@ const copyRepo = (dest) => {
   })
 }
 
+const copyPackageDir = (sourceRoot, dest) => {
+  fs.rmSync(dest, { recursive: true, force: true })
+  fs.cpSync(sourceRoot, dest, {
+    recursive: true,
+    filter: source => {
+      const rel = path.relative(sourceRoot, source)
+      if (!rel) return true
+      const base = path.basename(source)
+      if (base === '.DS_Store' || /^#.*#$/.test(base) || /^\.\#/.test(base)) return false
+      return ![
+        '.git',
+        'node_modules',
+        'coverage',
+        'tmp'
+      ].some(name => rel === name || rel.startsWith(`${name}${path.sep}`))
+    }
+  })
+}
+
+const readJsonFile = file => JSON.parse(fs.readFileSync(file, 'utf8'))
+
+const writeJsonFile = (file, value) => fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`)
+
+const rewritePackageJsonLocalDependencies = (target, dependency) => {
+  const packageJsonPath = path.join(target, 'package.json')
+  const packageJson = readJsonFile(packageJsonPath)
+  for (const field of ['dependencies', 'devDependencies', 'optionalDependencies']) {
+    if (packageJson[field] && packageJson[field][dependency.packageName]) {
+      packageJson[field][dependency.packageName] = dependency.deployedSpec
+    }
+  }
+  writeJsonFile(packageJsonPath, packageJson)
+}
+
+const rewritePackageLockLocalDependencies = (target, dependency) => {
+  const packageLockPath = path.join(target, 'package-lock.json')
+  if (!fs.existsSync(packageLockPath)) return
+  const packageLock = readJsonFile(packageLockPath)
+  const packages = packageLock.packages || {}
+  if (packages[''] && packages[''].dependencies && packages[''].dependencies[dependency.packageName]) {
+    packages[''].dependencies[dependency.packageName] = dependency.deployedSpec
+  }
+  const vendorKey = dependency.vendorRelativeDir.replace(/\\/g, '/')
+  if (packages[dependency.oldPackageLockKey] && !packages[vendorKey]) {
+    packages[vendorKey] = packages[dependency.oldPackageLockKey]
+  }
+  delete packages[dependency.oldPackageLockKey]
+  const nodeModuleKey = `node_modules/${dependency.packageName}`
+  if (packages[nodeModuleKey]) {
+    packages[nodeModuleKey].resolved = vendorKey
+    packages[nodeModuleKey].link = true
+  }
+  writeJsonFile(packageLockPath, packageLock)
+}
+
+const materializeLocalFileDependencies = target => {
+  for (const dependency of LOCAL_FILE_DEPENDENCIES) {
+    const source = dependency.sourceDir
+    if (!fs.existsSync(path.join(source, 'package.json'))) {
+      throw new Error(`missing local dependency package: ${source}`)
+    }
+    const vendorDest = path.join(target, dependency.vendorRelativeDir)
+    copyPackageDir(source, vendorDest)
+    rewritePackageJsonLocalDependencies(target, dependency)
+    rewritePackageLockLocalDependencies(target, dependency)
+  }
+}
+
 const maybeInstallRuntimeDependencies = ({ target, mode, installDependencies }) => {
   if (installDependencies === false || mode === 'symlink') return false
   installRuntimeDependencies({ cwd: target, stdio: 'inherit' })
@@ -99,6 +174,7 @@ const deployCodex = ({ dest, mode = 'copy', force = false, installDependencies =
     fs.symlinkSync(REPO_ROOT, target, 'dir')
   } else if (mode === 'copy') {
     copyRepo(target)
+    materializeLocalFileDependencies(target)
   } else {
     throw new Error('--mode must be symlink or copy')
   }
@@ -121,6 +197,7 @@ const deployPi = ({ dest, mode = 'copy', force = false, installDependencies = tr
     fs.symlinkSync(REPO_ROOT, target, 'dir')
   } else if (mode === 'copy') {
     copyRepo(target)
+    materializeLocalFileDependencies(target)
   } else {
     throw new Error('--mode must be symlink or copy')
   }
@@ -141,6 +218,7 @@ const installRepoAt = ({ target, mode, force }) => {
     fs.symlinkSync(REPO_ROOT, target, 'dir')
   } else if (mode === 'copy') {
     copyRepo(target)
+    materializeLocalFileDependencies(target)
   } else {
     throw new Error('--mode must be symlink or copy')
   }

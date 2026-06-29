@@ -27,9 +27,19 @@ const waitForLock = lockDir => {
   }
 }
 
+const packageHasFileDependencies = cwd => {
+  try {
+    const packageJson = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8'))
+    return ['dependencies', 'devDependencies', 'optionalDependencies']
+      .some(field => Object.values(packageJson[field] || {}).some(value => String(value).startsWith('file:')))
+  } catch (_err) {
+    return false
+  }
+}
+
 const installRuntimeDependencies = ({ cwd = repoRoot, stdio = 'pipe' } = {}) => {
   const packageLock = path.join(cwd, 'package-lock.json')
-  const args = fs.existsSync(packageLock)
+  const args = fs.existsSync(packageLock) && !packageHasFileDependencies(cwd)
     ? ['ci', '--omit=dev', '--ignore-scripts']
     : ['install', '--omit=dev', '--ignore-scripts']
   const env = {

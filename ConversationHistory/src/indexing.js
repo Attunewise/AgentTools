@@ -86,15 +86,27 @@ const readJobState = ({ root, jobId }) => {
   }
 }
 
+const normalizeJobState = state => {
+  const next = { ...state }
+  if (next.status && next.status !== 'error') delete next.error
+  if (next.status && next.status !== 'suspended') {
+    delete next.message
+    delete next.suspendedReason
+    delete next.suspension
+    delete next.summaryBudget
+  }
+  return next
+}
+
 const writeJobState = ({ root, state }) => {
   return withFileLock(jobLockPath(root, state.jobId), () => {
     const current = readJobState({ root, jobId: state.jobId }) || {}
-    writeJson(jobPath(root, state.jobId), {
+    writeJson(jobPath(root, state.jobId), normalizeJobState({
       ...current,
       ...state,
       schema: JOB_SCHEMA,
       updatedAt: now()
-    })
+    }))
   })
 }
 

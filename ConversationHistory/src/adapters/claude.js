@@ -285,12 +285,11 @@ const rowToEvents = ({ row, file }) => {
           type: 'reasoning',
           role: 'assistant',
           at,
-          title: 'reasoning',
+          title: 'reasoning record',
           reasoning: [{
             modelFamily: 'anthropic',
-            summary: block.thinking,
-            signature: block.signature,
-            raw: block
+            hasSummary: Boolean(block.thinking),
+            hasSignature: Boolean(block.signature)
           }],
           source,
           model,

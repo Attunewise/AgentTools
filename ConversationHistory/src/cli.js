@@ -987,8 +987,8 @@ const workerSuspensionForSummaryBudget = summaryBudget => {
   const targetCount = Number(budget && budget.deferredTargetCount || budget && budget.targetCount || 0)
   const status = budget && budget.status
   const message = status === 'budget_limited'
-    ? `summary budget consumed after completing affordable targets: approve remaining estimated spend $${remainingEstimate.toFixed(4)} for ${targetCount} target(s)`
-    : `summary budget approval required: approve estimated spend $${remainingEstimate.toFixed(4)} for ${targetCount} target(s)`
+    ? `summary budget consumed after completing affordable targets; remaining estimated spend is $${remainingEstimate.toFixed(4)} for ${targetCount} target(s)`
+    : `summary budget suspended; estimated spend is $${remainingEstimate.toFixed(4)} for ${targetCount} target(s)`
   const approval = remainingEstimate
     ? {
         type: 'summary_budget',
@@ -998,7 +998,7 @@ const workerSuspensionForSummaryBudget = summaryBudget => {
         currentCapUsd: current,
         additionalUsd: additional,
         targetCount,
-        prompt: `Approve conversation_history remaining summarization spend up to $${approvalCapText} for ${targetCount} target(s)?`,
+        prompt: `Resume conversation_history summarization with budget cap $${approvalCapText} for ${targetCount} target(s).`,
         resumeArgs: {
           summary_max_budget_usd: approvalCapText
         },
@@ -1007,7 +1007,7 @@ const workerSuspensionForSummaryBudget = summaryBudget => {
     : {
         type: 'summary_budget',
         status: 'required',
-        prompt: 'Approve a higher conversation_history summarization budget before resuming indexing.'
+        prompt: 'Resume conversation_history summarization with a higher budget cap.'
       }
   return {
     reason: 'summary_budget',
@@ -1016,8 +1016,8 @@ const workerSuspensionForSummaryBudget = summaryBudget => {
     summaryBudget: budget,
     approval,
     requiredAction: remainingEstimate
-      ? `Ask the user to approve conversation_history remaining summarization spend up to $${approvalCapText} for ${targetCount} target(s). After approval, resume with summary_max_budget_usd=${approvalCapText}.`
-      : 'Ask the user to approve a higher conversation_history summarization budget before resuming indexing.'
+      ? `Resume with summary_max_budget_usd=${approvalCapText} to cover ${targetCount} remaining target(s).`
+      : 'Resume with a higher conversation_history summarization budget cap.'
   }
 }
 
@@ -1171,7 +1171,8 @@ const startIndexingSession = async opts => {
   try {
     files = indexingFiles(opts)
   } catch (err) {
-    if (!opts.waitForSessionMarker || !opts.thisChat || !opts.sessionMarker || !/could not resolve current/.test(err.message)) {
+    const canWaitForMarker = /could not resolve current|no .* session files found/i.test(err.message)
+    if (!opts.waitForSessionMarker || !opts.thisChat || !opts.sessionMarker || !canWaitForMarker) {
       throw err
     }
     waitForSessionMarker = true

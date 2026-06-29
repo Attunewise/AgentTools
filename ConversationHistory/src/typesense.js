@@ -1,4 +1,5 @@
 const { compactText, estimateTokens, preview, stableStringify } = require('./util.js')
+const { hydrateDoc, hydrateDocs } = require('./docStore.js')
 const { normalizeTopics, parseTopicId, topicIdForHandle, topicsText } = require('./topics.js')
 const {
   DEFAULT_MANAGED_TYPESENSE_API_KEY,
@@ -190,20 +191,24 @@ const collectionSchema = collection => ({
     { name: 'at', type: 'string', optional: true, index: false },
     { name: 'timeRangeStart', type: 'string', optional: true, index: false },
     { name: 'timeRangeEnd', type: 'string', optional: true, index: false },
+    { name: 'sourceLineNumber', type: 'int32', optional: true, index: false },
+    { name: 'sourceLineEnd', type: 'int32', optional: true, index: false },
+    { name: 'sourceCharStart', type: 'int32', optional: true, index: false },
+    { name: 'sourceCharEnd', type: 'int32', optional: true, index: false },
     { name: 'nodeIndex', type: 'string', optional: true, index: false },
     { name: 'zoom', type: 'string', optional: true, index: false },
     { name: 'siblingIndex', type: 'int32', sort: true },
     { name: 'navigationJson', type: 'string', optional: true, index: false },
-    { name: 'title', type: 'string' },
-    { name: 'breadcrumb', type: 'string', optional: true },
-    { name: 'summary', type: 'string' },
+    { name: 'title', type: 'string', index: false },
+    { name: 'breadcrumb', type: 'string', optional: true, index: false },
+    { name: 'summary', type: 'string', store: false, index: false },
     { name: 'summaryModel', type: 'string', optional: true, facet: true },
     { name: 'summaryMetaJson', type: 'string', optional: true, index: false },
-    { name: 'topicsText', type: 'string', optional: true },
+    { name: 'topicsText', type: 'string', optional: true, store: false, index: false },
     { name: 'topicsJson', type: 'string', optional: true, index: false },
-    { name: 'searchText', type: 'string' },
-    { name: 'excerpt', type: 'string', optional: true },
-    { name: 'content', type: 'string', optional: true, index: false },
+    { name: 'hasSearchText', type: 'bool', facet: true },
+    { name: 'searchText', type: 'string', store: false },
+    { name: 'excerpt', type: 'string', optional: true, store: false, index: false },
     { name: 'resourceLinksJson', type: 'string', optional: true, index: false },
     { name: 'usageJson', type: 'string', optional: true, index: false },
     { name: 'metricsJson', type: 'string', optional: true, index: false },
@@ -218,6 +223,7 @@ const fieldSignature = (field, expected = field) => JSON.stringify({
   optional: Boolean(field.optional),
   facet: Boolean(field.facet),
   index: field.index === false ? false : true,
+  store: field.store === false ? false : true,
   ...(expected.sort !== undefined ? { sort: Boolean(field.sort) } : {})
 })
 
@@ -331,6 +337,10 @@ const docForTypesense = doc => {
     at: doc.at || '',
     timeRangeStart: timeRange.start || '',
     timeRangeEnd: timeRange.end || '',
+    sourceLineNumber: Number(doc.sourceLineNumber || 0) || undefined,
+    sourceLineEnd: Number(doc.sourceLineEnd || 0) || undefined,
+    sourceCharStart: Number.isInteger(doc.sourceCharStart) ? doc.sourceCharStart : undefined,
+    sourceCharEnd: Number.isInteger(doc.sourceCharEnd) ? doc.sourceCharEnd : undefined,
     nodeIndex: doc.index || '',
     zoom: doc.zoom || '',
     siblingIndex: Number(navigation.siblingIndex || 0),
@@ -348,9 +358,9 @@ const docForTypesense = doc => {
     summaryMetaJson: compactJson(compactSummaryMeta(doc.summaryMeta || {})),
     topicsText: topicsText(topics),
     topicsJson: compactJson(topics),
+    hasSearchText: Boolean(compactText(doc.searchText || '')),
     searchText: doc.searchText || '',
     excerpt: doc.excerpt || '',
-    content: doc.content || '',
     resourceLinksJson: compactJson(resourceLinks),
     usageJson: compactJson(doc.usage || {}),
     metricsJson: compactJson({
@@ -461,13 +471,24 @@ const importDocuments = async ({ docs, sessionId, agent, onProgress, ...opts }) 
       imported: 0
     }
   }
-  if (sessionId && emit) {
-    emit({
-      phase: 'index:documents:upsert:preserve-existing',
-      sessionId,
-      agent: expectedAgent || undefined,
-      docCount: docs.length
-    })
+  if (sessionId) {
+    if (emit) {
+      emit({
+        phase: 'index:documents:delete:start',
+        sessionId,
+        agent: expectedAgent || undefined,
+        docCount: docs.length
+      })
+    }
+    await deleteSessionDocumentsWithConfig(config, sessionId, expectedAgent)
+    if (emit) {
+      emit({
+        phase: 'index:documents:delete:done',
+        sessionId,
+        agent: expectedAgent || undefined,
+        docCount: docs.length
+      })
+    }
   }
   let imported = 0
   const chunkSize = importChunkSize(opts)
@@ -584,6 +605,7 @@ const docRef = ({ doc, score } = {}) => {
   return {
     ...(score === undefined ? {} : { score }),
     index_id: doc.indexId,
+    session_id: doc.sessionId,
     handle: doc.handle,
     agent: doc.agent,
     sourceKind: doc.sourceKind,
@@ -596,6 +618,8 @@ const docRef = ({ doc, score } = {}) => {
     inReplyToMessageId: doc.inReplyToMessageId,
     inReplyTo: doc.inReplyToMessageId ? { messageId: doc.inReplyToMessageId } : undefined,
     toolCallId: doc.toolCallId,
+    sourceLineNumber: Number(doc.sourceLineNumber || 0) || undefined,
+    sourceLineEnd: Number(doc.sourceLineEnd || 0) || undefined,
     index: doc.nodeIndex,
     zoom: doc.zoom,
     navigation: hasNavigation ? navigation : undefined,
@@ -633,6 +657,10 @@ const commonFields = [
   'at',
   'timeRangeStart',
   'timeRangeEnd',
+  'sourceLineNumber',
+  'sourceLineEnd',
+  'sourceCharStart',
+  'sourceCharEnd',
   'role',
   'messageId',
   'inReplyToMessageId',
@@ -657,7 +685,6 @@ const commonFields = [
 
 const readFields = includeFields([
   ...commonFields,
-  'content',
   'resourceLinksJson'
 ])
 
@@ -675,7 +702,7 @@ const pageWindow = ({ startAt = 0, limit = 20 }) => {
 
 const exactDocument = async ({ indexId, sessionId, agent, handle, ...opts }) => {
   const config = typesenseConfig(opts)
-  await ensureManagedTypesense(config, opts)
+  await ensureCollection(config, opts)
   const filters = [
     exactFilter('indexId', indexId || opts.index_id),
     exactFilter('sessionId', sessionId),
@@ -690,12 +717,13 @@ const exactDocument = async ({ indexId, sessionId, agent, handle, ...opts }) => 
   params.set('include_fields', readFields)
   params.set('per_page', '1')
   const result = await request(config, 'GET', `/collections/${encodeURIComponent(config.collection)}/documents/search?${params.toString()}`)
-  return result.hits && result.hits[0] && result.hits[0].document || null
+  const doc = result.hits && result.hits[0] && result.hits[0].document || null
+  return hydrateDoc({ root: opts.indexDir || opts.root, doc })
 }
 
 const childDocuments = async ({ indexId, sessionId, agent, parentHandle, startAt = 0, limit = 20, topic, ...opts }) => {
   const config = typesenseConfig(opts)
-  await ensureManagedTypesense(config, opts)
+  await ensureCollection(config, opts)
   const window = pageWindow({ startAt, limit })
   const filters = [exactFilter('parentHandle', parentHandle)]
   filters.push('retrievalVisible:=true')
@@ -708,7 +736,7 @@ const childDocuments = async ({ indexId, sessionId, agent, parentHandle, startAt
   const query = topic ? compactText(topic) : '*'
   const params = new URLSearchParams()
   params.set('q', query || '*')
-  params.set('query_by', topic ? 'topicsText,summary,title' : 'handle')
+  params.set('query_by', topic ? 'searchText' : 'handle')
   params.set('filter_by', filters.join(' && '))
   params.set('include_fields', readFields)
   params.set('per_page', String(window.perPage))
@@ -718,7 +746,10 @@ const childDocuments = async ({ indexId, sessionId, agent, parentHandle, startAt
   const hits = result.hits || []
   return {
     found: Number(result.found || 0),
-    docs: hits.slice(window.offset, window.offset + window.requestedLimit).map(hit => hit.document)
+    docs: hydrateDocs({
+      root: opts.indexDir || opts.root,
+      docs: hits.slice(window.offset, window.offset + window.requestedLimit).map(hit => hit.document)
+    })
   }
 }
 
@@ -827,66 +858,36 @@ const optionalString = value => {
   return text ? text : undefined
 }
 
-const browseTopics = refs => {
-  const out = []
-  const seen = new Set()
-  for (const ref of refs || []) {
-    const topics = normalizeTopics(ref.topics || [], { max: 0 })
-    const fallback = ref.summary || ref.head || ref.title || ref.breadcrumb || ''
-    const values = topics.length ? topics : fallback ? [fallback] : []
-    for (let index = 0; index < values.length; index += 1) {
-      const description = values[index]
-      const topicId = topicIdForHandle({ handle: ref.handle, topicIndex: topics.length ? index : -1 })
-      if (!topicId || seen.has(topicId)) continue
-      seen.add(topicId)
-      out.push({
-        topic_id: topicId,
-        label: optionalString(ref.breadcrumb) || optionalString(ref.title) || `topic ${out.length + 1}`,
-        description,
-        index: optionalString(ref.index)
-      })
-    }
-  }
-  return out
-}
+const refText = ref => ref && ref.summaryMeta && ref.summaryMeta.status === 'completed'
+  ? optionalString(ref.summary || ref.head)
+  : undefined
+
+const refIsOpenable = ref => Boolean(ref && ref.isVerbatim && (ref.role === 'user' || ref.role === 'assistant'))
 
 const browseRef = ref => {
-  const topics = browseTopics([ref])
   return {
-    topic_id: topicIdForHandle({ handle: ref.handle }),
+    _sessionId: ref.session_id,
     index_id: ref.index_id,
-    agent: ref.agent,
-    sourceKind: ref.sourceKind,
-    link: ref.link,
+    handle: ref.handle,
     index: optionalString(ref.index),
-    kind: ref.kind,
-    title: ref.title,
-    breadcrumb: optionalString(ref.breadcrumb),
-    summary: ref.summary || ref.head || undefined,
-    topics: topics.length ? topics : undefined,
-    isVerbatim: ref.isVerbatim,
-    child_count: Number(ref.childCount || 0),
-    full_token_count: Number(ref.fullTokenCount || 0) || undefined
+    line: ref.sourceLineNumber || undefined,
+    text: refText(ref),
+    openable: refIsOpenable(ref),
+    child_count: Number(ref.childCount || 0)
   }
 }
 
 const searchRef = ref => {
-  const topics = Array.isArray(ref.topics) && ref.topics.length ? ref.topics : undefined
   return {
+    _sessionId: ref.session_id,
     score: ref.score,
     index_id: ref.index_id,
     handle: ref.handle,
-    agent: ref.agent,
-    sourceKind: ref.sourceKind,
-    link: ref.link,
     index: optionalString(ref.index),
-    kind: ref.kind,
-    title: ref.title,
-    summary: ref.summary || ref.head || ref.excerpt || undefined,
-    topics,
-    isVerbatim: ref.isVerbatim,
-    childCount: Number(ref.childCount || 0),
-    fullTokenCount: Number(ref.fullTokenCount || 0) || undefined
+    line: ref.sourceLineNumber || undefined,
+    text: refText(ref),
+    openable: refIsOpenable(ref),
+    child_count: Number(ref.childCount || 0)
   }
 }
 
@@ -987,16 +988,12 @@ const browseTypesense = async ({ indexId, sessionId, agent, handle, topicId, zoo
     ...opts
   })
   const children = childResult.docs.map(child => browseRef(docRef({ doc: child })))
-  const childRefs = childResult.docs.map(child => docRef({ doc: child }))
   const startNumber = Math.max(0, Number(resolvedStart || 0))
   const limitNumber = Math.max(1, Number(limit || 20))
   const nextStart = startNumber + childResult.docs.length
   return {
-    topic_id: topicIdForHandle({ handle: ref.handle }),
-    selected_topic_id: selectedTopicId,
     zoom: resolvedZoom,
     ...browseRef(ref),
-    topics: browseTopics(childRefs),
     page: {
       start: startNumber,
       limit: limitNumber,
@@ -1004,14 +1001,13 @@ const browseTypesense = async ({ indexId, sessionId, agent, handle, topicId, zoo
       total: childResult.found,
       next_start: nextStart < childResult.found ? nextStart : undefined
     },
-    topic_filter: topic || undefined,
     children
   }
 }
 
 const searchTypesense = async (opts = {}) => {
   const config = typesenseConfig(opts)
-  await ensureManagedTypesense(config, opts)
+  await ensureCollection(config, opts)
   const query = compactText([
     opts.query,
     opts.topic
@@ -1022,12 +1018,12 @@ const searchTypesense = async (opts = {}) => {
   const window = pageWindow({ startAt, limit: opts.limit || 10 })
   const params = new URLSearchParams()
   params.set('q', query || '*')
-  params.set('query_by', 'title,summary,topicsText,searchText,excerpt,handle')
+  params.set('query_by', 'searchText')
   params.set('include_fields', searchFields)
   params.set('per_page', String(window.perPage))
   params.set('page', String(window.page))
   params.set('sort_by', '_text_match:desc,ts:asc')
-  if (filter) params.set('filter_by', filter)
+  params.set('filter_by', [filter, 'hasSearchText:=true'].filter(Boolean).join(' && '))
   const result = await request(config, 'GET', `/collections/${encodeURIComponent(config.collection)}/documents/search?${params.toString()}`)
   if (Number(result.found || 0) > 0 && startAt < Number(result.found || 0) && !(result.hits || []).length) {
     const logs = config.managed && config.managed.logs
@@ -1035,7 +1031,15 @@ const searchTypesense = async (opts = {}) => {
       : ''
     throw new Error(`Typesense returned found=${result.found} with no hits for query ${JSON.stringify(query || '*')};${logs} raw=${preview(JSON.stringify(result), 1000)}`)
   }
-  return (result.hits || []).slice(window.offset, window.offset + window.requestedLimit).map(mapHit)
+  return hydrateDocs({
+    root: opts.indexDir || opts.root,
+    docs: (result.hits || [])
+      .slice(window.offset, window.offset + window.requestedLimit)
+      .map(hit => ({
+        ...(hit.document || {}),
+        _textMatch: hit.text_match || 1
+      }))
+  }).map(doc => searchRef(docRef({ doc, score: doc._textMatch || 1 })))
 }
 
 const health = async opts => {

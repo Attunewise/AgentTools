@@ -64,6 +64,7 @@ const {
   stopManagedTypesense
 } = require('../src/typesenseManaged.js')
 const { normalizeConcurrency, runWorkQueue } = require('../src/workQueue.js')
+const { docStorePath, readSessionDocs } = require('../src/docStore.js')
 
 const testTempRoots = []
 const originalMkdtempSync = fs.mkdtempSync.bind(fs)
@@ -199,7 +200,11 @@ test('Codex adapter emits tool-independent coding session IR', () => {
   const reasoning = ir.events.find(event => event.type === 'reasoning')
   assert.ok(reasoning)
   assert.equal(reasoning.reasoning[0].modelFamily, 'openai')
-  assert.equal(reasoning.reasoning[0].encrypted, 'encrypted-openai-reasoning')
+  assert.equal(reasoning.reasoning[0].hasEncrypted, true)
+  assert.equal(reasoning.reasoning[0].hasSummary, true)
+  assert.equal(Object.hasOwn(reasoning.reasoning[0], 'encrypted'), false)
+  assert.equal(Object.hasOwn(reasoning.reasoning[0], 'summary'), false)
+  assert.equal(Object.hasOwn(reasoning.reasoning[0], 'raw'), false)
 
   const usage = ir.events.find(event => event.type === 'usage')
   assert.ok(usage)
@@ -369,7 +374,11 @@ test('Claude adapter emits tool-independent coding session IR', () => {
   const reasoning = ir.events.find(event => event.type === 'reasoning')
   assert.ok(reasoning)
   assert.equal(reasoning.reasoning[0].modelFamily, 'anthropic')
-  assert.equal(reasoning.reasoning[0].signature, 'sig-abc')
+  assert.equal(reasoning.reasoning[0].hasSignature, true)
+  assert.equal(reasoning.reasoning[0].hasSummary, true)
+  assert.equal(Object.hasOwn(reasoning.reasoning[0], 'signature'), false)
+  assert.equal(Object.hasOwn(reasoning.reasoning[0], 'summary'), false)
+  assert.equal(Object.hasOwn(reasoning.reasoning[0], 'raw'), false)
 
   // tool_use <-> tool_result pairing
   const toolCall = ir.events.find(event => event.type === 'tool_call')
@@ -656,9 +665,22 @@ test('Typesense schema supports exact conversation filters', () => {
   }
   assert.equal(fields.get('navigationJson').index, false)
   assert.equal(fields.get('metricsJson').index, false)
-  assert.equal(fields.get('content').index, false)
+  assert.equal(fields.has('content'), false)
+  assert.equal(fields.get('searchText').store, false)
+  assert.equal(fields.get('title').index, false)
+  assert.equal(fields.get('breadcrumb').index, false)
+  assert.equal(fields.get('summary').store, false)
+  assert.equal(fields.get('summary').index, false)
+  assert.equal(fields.get('excerpt').store, false)
+  assert.equal(fields.get('excerpt').index, false)
+  assert.equal(fields.get('topicsText').index, false)
   assert.equal(fields.get('topicsJson').index, false)
+  assert.equal(fields.get('hasSearchText').facet, true)
   assert.equal(fields.get('usageJson').index, false)
+  for (const name of ['sourceLineNumber', 'sourceLineEnd', 'sourceCharStart', 'sourceCharEnd']) {
+    assert.ok(fields.has(name), `${name} field exists`)
+    assert.equal(fields.get(name).index, false, `${name} is stored as a pointer, not indexed text`)
+  }
 
   const stored = docForTypesense({
     id: 'doc-1',
@@ -689,6 +711,8 @@ test('Typesense schema supports exact conversation filters', () => {
     },
     searchText: 'searchable text',
     content: 'exact source text',
+    sourceLineNumber: 7,
+    sourceLineEnd: 7,
     topics: ['API wiring.'],
     usage: { input: 1, output: 2, total: 3 },
     resourceLinks: ['tool:conversation_history://open?sessionId=mini-session&handle=session%2Fmini-session'],
@@ -699,7 +723,10 @@ test('Typesense schema supports exact conversation filters', () => {
   assert.equal(stored.payload, undefined)
   assert.equal(stored.indexId, 'idx-mini')
   assert.equal(stored.agent, 'codex')
-  assert.equal(stored.content, 'exact source text')
+  assert.equal(stored.content, undefined)
+  assert.equal(stored.hasSearchText, true)
+  assert.equal(stored.sourceLineNumber, 7)
+  assert.equal(stored.sourceLineEnd, 7)
   assert.equal(stored.nodeIndex, '1/2')
   assert.deepEqual(JSON.parse(stored.summaryMetaJson), {
     mode: 'off',
@@ -745,6 +772,7 @@ test('Typesense docs require a session id for shared-backend filtering', () => {
   assert.equal(stored.sessionId, 'mini-session')
   assert.equal(stored.indexId, 'idx-mini')
   assert.equal(stored.agent, 'codex')
+  assert.equal(stored.hasSearchText, false)
 
   assert.throws(() => docForTypesense({
     id: 'missing-agent',
@@ -780,7 +808,7 @@ test('Typesense docs replace lone surrogates before JSONL import', () => {
   assert.equal(stored.title, 'bad high \uFFFD and bad low \uFFFD but keep pair \uD83D\uDE00')
   assert.equal(stored.summary, 'summary \uFFFD')
   assert.equal(stored.searchText, 'search \uFFFD')
-  assert.equal(stored.content, 'content \uFFFD')
+  assert.equal(stored.content, undefined)
   assert.deepEqual(JSON.parse(stored.topicsJson), ['topic \uFFFD'])
   assert.deepEqual(JSON.parse(stored.resourceLinksJson), ['tool:conversation_history://open?handle=\uFFFD'])
   assert.doesNotMatch(JSON.stringify(stored), /\\ud(?:[89ab][0-9a-f]{2}|[cdef][0-9a-f]{2})/i)
@@ -1006,10 +1034,9 @@ test('Typesense publish defers repeated imports while model summaries are incomp
   assert.ok(first.serverIndex.result.imported > 0)
   assert.ok(first.indexingStats.pendingTargetCount > 0)
   assert.ok(firstProgress.some(event => event.phase === 'index:documents'))
-  assert.ok(firstProgress.some(event => event.phase === 'index:documents:upsert:preserve-existing'))
   assert.ok(firstProgress.some(event => event.phase === 'index:documents:import:chunk'))
-  assert.equal(firstProgress.some(event => event.phase === 'index:documents:delete:start'), false)
-  assert.equal(firstProgress.some(event => event.phase === 'index:documents:delete:done'), false)
+  assert.ok(firstProgress.some(event => event.phase === 'index:documents:delete:start'))
+  assert.ok(firstProgress.some(event => event.phase === 'index:documents:delete:done'))
   const firstManifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'))
   assert.equal(Object.hasOwn(firstManifest.sessions[first.sessionId], 'summaryJobs'), false)
   assert.equal(Object.hasOwn(firstManifest.sessions[first.sessionId], 'compactions'), false)
@@ -1092,7 +1119,9 @@ test('persisted state read failures throw instead of returning empty status', ()
 
 test('search documents preserve searchable navigation metadata', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-'))
-  const ir = importCodexJsonl(fixture)
+  const source = path.join(root, 'codex-mini-live.jsonl')
+  fs.copyFileSync(fixture, source)
+  const ir = importCodexJsonl(source)
   const indexed = writeSessionIndex({ root, ir })
   assert.equal(indexed.sessionId, 'mini-session')
   assert.ok(indexed.docCount > ir.events.length)
@@ -1101,7 +1130,31 @@ test('search documents preserve searchable navigation metadata', () => {
   assert.ok(fs.existsSync(path.join(root, 'sessions', 'mini-session.ir.jsonl')))
   assert.equal(fs.existsSync(path.join(root, 'sessions', 'mini-session.ir.json')), false)
   assert.equal(fs.existsSync(path.join(root, 'index', 'mini-session.docs.json')), false)
-  const docs = collectIndexDocuments(readSessionTree({ root, sessionId: 'mini-session' }))
+  const irRows = fs.readFileSync(path.join(root, 'sessions', 'mini-session.ir.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)
+  assert.deepEqual(irRows.map(row => row.recordType), ['session_ir_header'])
+  assert.equal(irRows[0].indexId, indexed.indexId)
+  assert.equal(Object.hasOwn(irRows[0], 'event'), false)
+  const storedDocs = readSessionDocs({ root, sessionId: 'mini-session' })
+  assert.equal(fs.existsSync(docStorePath(root, 'mini-session')), true)
+  assert.equal(storedDocs.some(doc => Object.hasOwn(doc, 'content')), false)
+  assert.equal(storedDocs.some(doc => doc.isVerbatim && Object.hasOwn(doc, 'summary')), false)
+  assert.ok(storedDocs.some(doc => doc.sourceLineNumber > 0))
+  const publishedRoot = storedDocs.find(doc => doc.handle === 'session/mini-session')
+  assert.ok(publishedRoot)
+  appendJsonl(source, [{
+    timestamp: '2026-06-05T00:00:08.000Z',
+    type: 'event_msg',
+    payload: {
+      type: 'user_message',
+      client_id: 'user_msg_live_tail',
+      message: 'new live tail after publish'
+    }
+  }])
+  const reloadedTree = readSessionTree({ root, sessionId: 'mini-session' })
+  assert.equal(reloadedTree.ir.indexId, indexed.indexId)
+  const openedPublishedLink = openLink(reloadedTree, publishedRoot.link, { budgetTokens: 2000 })
+  assert.match(openedPublishedLink.content, /Can you inspect the todo sync output/)
+  const docs = collectIndexDocuments(reloadedTree)
   const rootDoc = docs.find(doc => doc.handle === 'session/mini-session')
   assert.equal(rootDoc.indexId, indexIdForIR(ir))
   assert.match(rootDoc.link, /indexId=/)
@@ -1110,8 +1163,9 @@ test('search documents preserve searchable navigation metadata', () => {
   assert.match(rootDoc.zoom, /^1\/\d+$/)
   assert.ok(rootDoc.navigation.mips >= rootDoc.navigation.mip)
 
-  const searchableDoc = docs.find(doc => /clientRevision/i.test(doc.searchText) && /atlas/i.test(doc.searchText))
+  const searchableDoc = docs.find(doc => /clientRevision/i.test(doc.searchText))
   assert.ok(searchableDoc)
+  assert.equal(docs.some(doc => /atlas/i.test(doc.searchText)), false)
   assert.ok(searchableDoc.link.startsWith('tool:conversation_history://open?'))
   assert.match(searchableDoc.index, /^\d+\/\d+$/)
   assert.match(searchableDoc.zoom, /^\d+\/\d+$/)
@@ -1218,22 +1272,25 @@ test('index docs bound inner-node descendant text without losing leaf search', (
   const tree = buildMipTree(ir)
   const docs = collectIndexDocuments(tree)
   const rootDoc = docs.find(doc => doc.handle === 'session/large-session')
-  assert.ok(rootDoc.searchText.length <= 20000)
-  assert.doesNotMatch(rootDoc.searchText, /late_unique_marker/)
+  assert.equal(rootDoc.searchText, '')
 
-  assert.ok(docs.some(doc =>
+  const lateLeaf = docs.find(doc =>
     doc.isVerbatim &&
     doc.handle.includes('/content') &&
     /late_unique_marker/.test(doc.searchText)
-  ))
+  )
+  assert.ok(lateLeaf)
+  assert.ok(lateLeaf.searchText.length <= 4000)
 })
 
-test('MIP documents expose generated breadcrumbs for navigation', () => {
+test('MIP documents expose completed generated summaries for search', () => {
   const ir = importCodexJsonl(fixture)
   const tree = buildMipTree(ir)
-  const node = [...tree.byHandle.values()].find(item => item.children.length)
+  const prepared = prepareCompactedSummaryLayer(tree, { summaryInputTokenBudget: 1000 })
+  const node = prepared.nodes[0]
   node.breadcrumb = 'handoff'
   node.head = 'summary about emergency handoff'
+  node.summaryMeta = { status: 'completed' }
 
   const docs = collectIndexDocuments(tree)
   const doc = docs.find(item => item.handle === node.handle)
@@ -1241,7 +1298,7 @@ test('MIP documents expose generated breadcrumbs for navigation', () => {
   assert.match(doc.index, /^\d+\/\d+$/)
   assert.match(doc.zoom, /^\d+\/\d+$/)
 
-  assert.ok(doc.searchText.includes('handoff'))
+  assert.ok(doc.searchText.includes('emergency handoff'))
 })
 
 test('summary planner skips sessions with no compaction boundary', () => {
@@ -1292,6 +1349,83 @@ test('summary planner batches only the compacted-away prefix before a compaction
   assert.match(prompt, /beta_before_compact/)
   assert.doesNotMatch(prompt, /provider compact marker/)
   assert.doesNotMatch(prompt, /gamma_after_compact_live_tail/)
+})
+
+test('summary system prompt is the exact recovered prompt', () => {
+  assert.equal(
+    SUMMARY_SYSTEM_PROMPT,
+    'Copy the information, not the wording. Keep all concrete state. Remove filler, repetition, politeness padding, meta-commentary, and verbose restatements. Do not abstract. Do not decide salience unless something is clearly redundant or obsolete. For tool calls summarize the operation, input, and outcome'
+  )
+})
+
+test('summarizer sends recovered compaction prompt and generated child-record prompt', async () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-summary-prompt-codex-home-'))
+  fs.writeFileSync(path.join(codexHome, 'models_cache.json'), JSON.stringify({
+    fetched_at: '2026-06-05T00:00:00.000Z',
+    client_version: 'test',
+    models: [{ id: 'gpt-5.4-mini' }]
+  }))
+  const ir = createSessionIR({
+    source: { kind: 'test', path: 'summary-prompt.jsonl' },
+    session: { id: 'summary-prompt', agent: 'codex', title: 'Summary prompt' },
+    events: [
+      { type: 'message', role: 'user', content: [textBlock('USER_PROMPT_SENTINEL compacted user request')] },
+      { type: 'message', role: 'assistant', content: [textBlock('ASSISTANT_SENTINEL compacted assistant reply')] },
+      { type: 'compaction', title: 'compact boundary', content: [textBlock('COMPACTION_MARKER_SENTINEL should not be summarized')] },
+      { type: 'message', role: 'user', content: [textBlock('LIVE_TAIL_SENTINEL should not be summarized yet')] }
+    ]
+  })
+  const expectedTree = buildMipTree(ir)
+  const expectedPrepared = prepareCompactedSummaryLayer(expectedTree, { summaryInputTokenBudget: 1000 })
+  const expectedPrompt = makePrompt({
+    node: expectedPrepared.nodes[0],
+    maxChildChars: 1200,
+    inputTokenBudget: 1000
+  })
+
+  const originalChat = OpenAICodexResponsesProvider.prototype.chat
+  const calls = []
+  OpenAICodexResponsesProvider.prototype.chat = async (messages, options) => {
+    calls.push({ messages, options })
+    return {
+      output_text: 'The compacted prefix contains a user request and assistant reply.',
+      usage: {
+        input_tokens: 10,
+        output_tokens: 4,
+        total_tokens: 14
+      }
+    }
+  }
+
+  try {
+    const result = await summarizeTree(buildMipTree(ir), {
+      summaryProvider: 'openai-codex-responses',
+      summaryModel: 'gpt-5.4-mini',
+      codexHome,
+      summaryInputTokenBudget: 1000,
+      summaryMaxBudgetUsd: 'off',
+      maxSummaryNodes: 1,
+      maxSummaryChildChars: 1200,
+      summaryConcurrency: 1
+    })
+
+    assert.equal(result.summary.completedJobCount, 1)
+    assert.equal(calls.length, 1)
+    assert.deepEqual(calls[0].messages.map(message => message.role), ['system', 'user'])
+    assert.equal(calls[0].messages[0].content, SUMMARY_SYSTEM_PROMPT)
+    assert.equal(calls[0].messages[1].content, expectedPrompt)
+    assert.match(calls[0].messages[1].content, /^Node title: summary level 1 span 1\nNode kind: summary_span\n\nChild records \(JSONL\):\n/)
+    assert.match(calls[0].messages[1].content, /USER_PROMPT_SENTINEL compacted user request/)
+    assert.match(calls[0].messages[1].content, /ASSISTANT_SENTINEL compacted assistant reply/)
+    assert.doesNotMatch(calls[0].messages[1].content, /COMPACTION_MARKER_SENTINEL/)
+    assert.doesNotMatch(calls[0].messages[1].content, /LIVE_TAIL_SENTINEL/)
+    assert.equal(calls[0].options.textVerbosity, 'low')
+    assert.equal(Object.hasOwn(calls[0].options, 'text'), false)
+    assert.equal(result.jobs[0].summary, 'The compacted prefix contains a user request and assistant reply.')
+    assert.equal(result.jobs[0].breadcrumb, 'span-1')
+  } finally {
+    OpenAICodexResponsesProvider.prototype.chat = originalChat
+  }
 })
 
 test('retrieval visibility keeps live tail indexed but hidden from search and browse', () => {
@@ -1437,37 +1571,97 @@ test('generated summary handles survive tree serialization and openLink resoluti
   assert.equal(opened.childCount, prepared.nodes[0].children.length)
 })
 
+test('generated summary handles survive source-pointer reload and openLink resolution', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-summary-reload-'))
+  const source = path.join(root, 'codex-mini-live.jsonl')
+  fs.copyFileSync(fixture, source)
+  const ir = importCodexJsonl(source)
+  const tree = buildMipTree(ir)
+  const prepared = prepareCompactedSummaryLayer(tree, { summaryInputTokenBudget: 1000 })
+  assert.ok(prepared.nodes.length)
+  const summaryNode = prepared.nodes[0]
+  const link = sessionLink({ indexId: indexIdForIR(ir), handle: summaryNode.handle })
+
+  writeSessionIndex({ root, ir })
+  commitSummaryJobs({
+    root,
+    sessionId: ir.session.id,
+    ownerId: 'test-owner',
+    jobs: [{
+      targetId: 'summary-test-source-pointer-reload',
+      targetMaterialHash: 'summary-test-source-pointer-reload-material',
+      handle: summaryNode.handle,
+      status: 'completed',
+      breadcrumb: 'todo-sync',
+      summary: 'The compacted prefix covers the todo sync dry run.',
+      topics: ['todo sync dry run'],
+      model: 'test-summary-model',
+      inputTokenBudget: 1000,
+      inputTokenCount: summaryNode.summaryMeta.inputTokenCount,
+      completedAt: '2026-06-05T00:00:10.000Z'
+    }]
+  })
+
+  const reloaded = readSessionTree({ root, sessionId: ir.session.id })
+  assert.ok(reloaded.byHandle.has(summaryNode.handle))
+  const opened = openLink(reloaded, link, { budgetTokens: 200, summaryOnly: true })
+
+  assert.equal(opened.handle, summaryNode.handle)
+  assert.equal(opened.breadcrumb, 'todo-sync')
+  assert.match(opened.content, /todo sync dry run/)
+  assert.equal(opened.isVerbatim, false)
+  assert.equal(opened.childCount, summaryNode.children.length)
+})
+
 test('retrieval evaluation recovers a pre-compaction fact through MCP-shaped tools', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-retrieval-eval-'))
   const sessionId = 'retrieval-eval-session'
   const expected = 'ORCHID-7429'
   const collection = `session_indexer_retrieval_eval_${process.pid}_${Date.now()}`
-  const ir = createSessionIR({
-    source: { kind: 'test', path: path.join(root, 'retrieval-eval.jsonl') },
-    session: { id: sessionId, agent: 'codex', title: 'Retrieval Eval Session' },
-    events: [
-      {
-        type: 'message',
-        role: 'user',
-        content: [textBlock(`Record this exact deployment codename before compaction: ${expected}.`)]
-      },
-      {
-        type: 'message',
-        role: 'assistant',
-        content: [textBlock('Noted; the deployment codename has been recorded.')]
-      },
-      {
-        type: 'compaction',
-        title: 'compact boundary',
-        content: [textBlock('provider compact marker')]
-      },
-      {
-        type: 'message',
-        role: 'user',
-        content: [textBlock('The visible tail no longer repeats the deployment codename.')]
+  const sourceFile = path.join(root, 'retrieval-eval.jsonl')
+  writeJsonl(sourceFile, [
+    {
+      timestamp: '2026-06-05T00:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: sessionId, cwd: root, model_provider: 'openai', cli_version: 'test' }
+    },
+    {
+      timestamp: '2026-06-05T00:00:01.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'user_message',
+        client_id: 'codename-user',
+        message: `Record this exact deployment codename before compaction: ${expected}.`
       }
-    ]
-  })
+    },
+    {
+      timestamp: '2026-06-05T00:00:02.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'agent_message',
+        phase: 'final_answer',
+        message: 'Noted; the deployment codename has been recorded.'
+      }
+    },
+    {
+      timestamp: '2026-06-05T00:00:03.000Z',
+      type: 'compacted',
+      payload: {
+        message: 'provider compact marker',
+        replacement_history: []
+      }
+    },
+    {
+      timestamp: '2026-06-05T00:00:04.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'user_message',
+        client_id: 'tail-user',
+        message: 'The visible tail no longer repeats the deployment codename.'
+      }
+    }
+  ])
+  const ir = importCodexJsonl(sourceFile)
   await writeSessionIndexWithBackend({
     root,
     ir,
@@ -1485,7 +1679,6 @@ test('retrieval evaluation recovers a pre-compaction fact through MCP-shaped too
             call_id: 'call_search',
             name: 'conversation_search',
             arguments: JSON.stringify({
-              session_id: sessionId,
               query: expected,
               limit: 5
             })
@@ -1496,21 +1689,20 @@ test('retrieval evaluation recovers a pre-compaction fact through MCP-shaped too
         const searchResult = JSON.parse(toolMessages[0].content)
         assert.equal(searchResult.agent, 'codex')
         const hit = searchResult.hits.find(item => item.isVerbatim) || searchResult.hits[0]
-        assert.equal(hit.agent, 'codex')
+        assert.ok(hit.handle)
         return {
           output: [{
             type: 'function_call',
             call_id: 'call_open',
             name: 'conversation_openLink',
             arguments: JSON.stringify({
-              link: hit.link,
+              handle: hit.handle,
               budget_tokens: 2000
             })
           }]
         }
       }
       const opened = JSON.parse(toolMessages[1].content)
-      assert.equal(opened.agent, 'codex')
       assert.equal(opened.isVerbatim, true)
       assert.equal(opened.omittedTokenCount || 0, 0)
       assert.match(opened.content, new RegExp(expected))
@@ -1584,7 +1776,7 @@ test('retrieval evaluation reports tool errors in the trace instead of throwing'
   assert.match(result.trace.find(item => item.type === 'tool').result.error, /unsupported retrieval evaluation tool/)
 })
 
-test('summary budget guard asks before a target that cannot fit', async () => {
+test('summary budget guard suspends before a target that cannot fit', async () => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-summary-budget-codex-home-'))
   fs.writeFileSync(path.join(codexHome, 'models_cache.json'), JSON.stringify({
     fetched_at: '2026-06-05T00:00:00.000Z',
@@ -1648,7 +1840,7 @@ test('summary budget guard asks before a target that cannot fit', async () => {
   }
 })
 
-test('summary budget guard spends approved budget before asking for more', async () => {
+test('summary budget guard spends approved budget before suspending for more', async () => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-summary-budget-progress-codex-home-'))
   fs.writeFileSync(path.join(codexHome, 'models_cache.json'), JSON.stringify({
     fetched_at: '2026-06-05T00:00:00.000Z',
@@ -1685,7 +1877,7 @@ test('summary budget guard spends approved budget before asking for more', async
     return {
       output_text: JSON.stringify({
         breadcrumb: 'budget',
-        summary: 'One affordable target was summarized before asking for more budget.',
+        summary: 'One affordable target was summarized before budget suspension.',
         topics: ['Affordable summary target progress before budget approval.']
       }),
       usage: {
@@ -1921,6 +2113,105 @@ test('summary model empty responses retry before failing a target', async () => 
     assert.equal(retry.attempt, 1)
     assert.equal(retry.nextAttempt, 2)
     assert.match(retry.error, /empty response/)
+  } finally {
+    OpenAICodexResponsesProvider.prototype.chat = originalChat
+  }
+})
+
+test('summary model malformed JSON is an error instead of navigation text', async () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-summary-bad-json-codex-home-'))
+  fs.writeFileSync(path.join(codexHome, 'models_cache.json'), JSON.stringify({
+    fetched_at: '2026-06-05T00:00:00.000Z',
+    client_version: 'test',
+    models: [{ id: 'gpt-5.4-mini' }]
+  }))
+  const ir = createSessionIR({
+    source: { kind: 'test', path: 'summary-provider-bad-json.jsonl' },
+    session: { id: 'summary-provider-bad-json', agent: 'codex', title: 'Summary provider bad JSON' },
+    events: [
+      { type: 'message', role: 'user', content: [textBlock('compact this child after a bad JSON model response')] },
+      { type: 'compaction', title: 'compact boundary', content: [textBlock('provider compact marker')] }
+    ]
+  })
+  const originalChat = OpenAICodexResponsesProvider.prototype.chat
+  OpenAICodexResponsesProvider.prototype.chat = async () => ({
+    output_text: '{"breadcrumb":"bad","summary":"unterminated"',
+    usage: {
+      input_tokens: 4,
+      output_tokens: 4,
+      total_tokens: 8
+    }
+  })
+
+  try {
+    const result = await summarizeTree(buildMipTree(ir), {
+      summaryProvider: 'openai-codex-responses',
+      summaryModel: 'gpt-5.4-mini',
+      codexHome,
+      summaryMaxBudgetUsd: 'off',
+      summaryEmptyResponseMaxRetries: 0,
+      maxSummaryNodes: 1,
+      maxSummaryChildChars: 200,
+      summaryConcurrency: 1
+    })
+
+    assert.equal(result.summary.failedJobCount, 1)
+    assert.equal(result.summary.completedJobCount, 0)
+    assert.match(result.jobs[0].error, /malformed serialized output/)
+    assert.equal(result.jobs[0].summary, undefined)
+  } finally {
+    OpenAICodexResponsesProvider.prototype.chat = originalChat
+  }
+})
+
+test('summary model serialized JSON summary field is an error', async () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-summary-json-field-codex-home-'))
+  fs.writeFileSync(path.join(codexHome, 'models_cache.json'), JSON.stringify({
+    fetched_at: '2026-06-05T00:00:00.000Z',
+    client_version: 'test',
+    models: [{ id: 'gpt-5.4-mini' }]
+  }))
+  const ir = createSessionIR({
+    source: { kind: 'test', path: 'summary-provider-json-field.jsonl' },
+    session: { id: 'summary-provider-json-field', agent: 'codex', title: 'Summary provider JSON field' },
+    events: [
+      { type: 'message', role: 'user', content: [textBlock('compact this child after a serialized JSON summary field')] },
+      { type: 'compaction', title: 'compact boundary', content: [textBlock('provider compact marker')] }
+    ]
+  })
+  const originalChat = OpenAICodexResponsesProvider.prototype.chat
+  OpenAICodexResponsesProvider.prototype.chat = async () => ({
+    output_text: JSON.stringify({
+      breadcrumb: '',
+      summary: JSON.stringify({
+        breadcrumb: 'nested',
+        summary: 'This nested JSON must not become navigation text.',
+        topics: ['nested JSON summary field']
+      }),
+      topics: []
+    }),
+    usage: {
+      input_tokens: 4,
+      output_tokens: 4,
+      total_tokens: 8
+    }
+  })
+
+  try {
+    const result = await summarizeTree(buildMipTree(ir), {
+      summaryProvider: 'openai-codex-responses',
+      summaryModel: 'gpt-5.4-mini',
+      codexHome,
+      summaryMaxBudgetUsd: 'off',
+      summaryEmptyResponseMaxRetries: 0,
+      maxSummaryNodes: 1,
+      maxSummaryChildChars: 200,
+      summaryConcurrency: 1
+    })
+
+    assert.equal(result.summary.failedJobCount, 1)
+    assert.equal(result.summary.completedJobCount, 0)
+    assert.match(result.jobs[0].error, /serialized JSON/)
   } finally {
     OpenAICodexResponsesProvider.prototype.chat = originalChat
   }
@@ -2545,7 +2836,7 @@ test('index worker suspends and exits when the next summary target exceeds appro
   try {
     assert.equal(started.job.status, 'suspended')
     assert.equal(started.job.suspendedReason, 'summary_budget')
-    assert.match(started.job.message, /summary budget approval required/)
+    assert.match(started.job.message, /summary budget suspended/)
     assert.equal(started.job.progress.suspended, true)
     assert.equal(started.job.progress.reason, 'summary_budget')
     assert.equal(started.job.summaryBudget.status, 'over_budget')
@@ -2555,7 +2846,7 @@ test('index worker suspends and exits when the next summary target exceeds appro
     assert.equal(Object.hasOwn(started.job.summaryBudget, 'pricing'), false)
     assert.equal(Object.hasOwn(started.job.suspension.summaryBudget, 'pricing'), false)
     assert.ok(started.job.summaryBudget.breakdown.output.tokens > 0)
-    assert.match(started.job.suspension.requiredAction, /Ask the user to approve/)
+    assert.match(started.job.suspension.requiredAction, /Resume with summary_max_budget_usd=/)
     assert.equal(started.job.suspension.approval.status, 'required')
     assert.ok(Math.abs(started.job.suspension.approval.estimatedCostUsd - started.job.summaryBudget.neededBudgetUsd) < 1e-12)
     assert.ok(started.job.suspension.approval.amountUsd >= started.job.summaryBudget.neededBudgetUsd)
@@ -2672,6 +2963,46 @@ test('index status reports operational indexing state without indexing on demand
   assert.equal(ignoresOldError.sessions[0].state, 'not-started')
   assert.equal(Object.hasOwn(ignoresOldError.sessions[0], 'errorMessage'), false)
 
+  const staleMergeJobId = 'index-test-stale-merge'
+  writeJobState({
+    root,
+    state: {
+      jobId: staleMergeJobId,
+      scope: 'this_session_only',
+      source: 'codex',
+      sessions: [sessionFile],
+      status: 'error',
+      error: 'managed Typesense did not become healthy within 30000ms',
+      message: 'old suspension message',
+      suspendedReason: 'summary_budget',
+      suspension: { reason: 'summary_budget' },
+      summaryBudget: { status: 'over_budget' },
+      progress: { phase: 'error' }
+    }
+  })
+  writeJobState({
+    root,
+    state: {
+      jobId: staleMergeJobId,
+      pid: process.pid,
+      status: 'ready',
+      ready: true,
+      progress: { phase: 'watching' },
+      result: {
+        sessions: [{
+          sessionId: 'mini-session'
+        }]
+      }
+    }
+  })
+  const staleMergeJob = JSON.parse(fs.readFileSync(path.join(root, 'jobs', `${staleMergeJobId}.json`), 'utf8'))
+  assert.equal(Object.hasOwn(staleMergeJob, 'error'), false)
+  assert.equal(Object.hasOwn(staleMergeJob, 'message'), false)
+  assert.equal(Object.hasOwn(staleMergeJob, 'suspendedReason'), false)
+  assert.equal(Object.hasOwn(staleMergeJob, 'suspension'), false)
+  assert.equal(Object.hasOwn(staleMergeJob, 'summaryBudget'), false)
+  assert.equal(indexStatus({ root, sessionId: 'mini-session' }).sessions[0].state, 'ready')
+
   writeJobState({
     root,
     state: {
@@ -2711,7 +3042,7 @@ test('index status reports operational indexing state without indexing on demand
       sessions: [sessionFile],
       status: 'suspended',
       suspendedReason: 'summary_budget',
-      message: 'summary budget approval required: approve estimated spend $2.5000 for 3 target(s)',
+      message: 'summary budget suspended; estimated spend is $2.5000 for 3 target(s)',
       summaryBudget: {
         status: 'over_budget',
         maxBudgetUsd: 1,
@@ -2756,7 +3087,7 @@ test('index status reports operational indexing state without indexing on demand
       suspension: {
         reason: 'summary_budget',
         phase: 'summary:budget_suspended',
-        message: 'summary budget approval required: approve estimated spend $2.5000 for 3 target(s)',
+        message: 'summary budget suspended; estimated spend is $2.5000 for 3 target(s)',
         summaryBudget: {
           status: 'over_budget',
           maxBudgetUsd: 1,
@@ -2783,13 +3114,13 @@ test('index status reports operational indexing state without indexing on demand
           additionalUsd: 1.5,
           targetCount: 3,
           estimatedCostUsd: 2.5,
-          prompt: 'Approve conversation_history remaining summarization spend up to $2.50 for 3 target(s)?',
+          prompt: 'Resume conversation_history summarization with budget cap $2.50 for 3 target(s).',
           resumeArgs: {
             summary_max_budget_usd: '2.50'
           },
           cliFlag: '--summary-max-budget-usd 2.50'
         },
-        requiredAction: 'Ask the user to approve conversation_history remaining summarization spend up to $2.50 for 3 target(s). After approval, resume with summary_max_budget_usd=2.50.'
+        requiredAction: 'Resume with summary_max_budget_usd=2.50 to cover 3 remaining target(s).'
       },
       progress: {
         phase: 'summary:budget_suspended',
@@ -2814,10 +3145,10 @@ test('index status reports operational indexing state without indexing on demand
   })
   const budgetSuspended = indexStatus({ root, sessionId: 'mini-session' })
   assert.equal(budgetSuspended.sessions[0].state, 'suspended-budget')
-  assert.match(budgetSuspended.sessions[0].statusMessage, /summary budget approval required/)
+  assert.match(budgetSuspended.sessions[0].statusMessage, /summary budget suspended/)
   assert.equal(budgetSuspended.sessions[0].suspension.summaryBudget.neededBudgetUsd, 2.5)
   assert.equal(budgetSuspended.sessions[0].suspension.approval.amountUsd, 2.5)
-  assert.match(budgetSuspended.sessions[0].suspension.requiredAction, /Ask the user to approve/)
+  assert.match(budgetSuspended.sessions[0].suspension.requiredAction, /Resume with summary_max_budget_usd=/)
   assert.equal(Object.hasOwn(budgetSuspended.sessions[0].suspension.summaryBudget, 'pricing'), false)
   assert.equal(budgetSuspended.sessions[0].indexingJob.status, 'suspended')
   assert.equal(budgetSuspended.sessions[0].indexingJob.summaryBudget.additionalBudgetUsd, 1.5)
@@ -2998,7 +3329,7 @@ test('index worker coalesces live transcript changes and publishes when a compac
       pollMs: 250,
       label: 'compaction-triggered live worker reindex'
     })
-    assert.ok(search.hits.some(hit => hit.agent === 'codex' && /live-growth-session/.test(hit.link || '')))
+    assert.ok(search.hits.some(hit => /GROWTH-CODE-418/.test(hit.text || '') && hit.handle))
 
     const status = await waitUntil(async () => {
       const current = indexStatus({ root, sessionId })
@@ -3061,7 +3392,8 @@ test('Typesense upserts are batched and status reports managed disk usage', asyn
   assert.equal(chunks.length, start.chunkCount)
   assert.ok(chunks.every(event => event.chunkSize <= 5))
   assert.equal(chunks[chunks.length - 1].imported, indexed.docCount)
-  assert.ok(progress.some(event => event.phase === 'index:documents:upsert:preserve-existing'))
+  assert.ok(progress.some(event => event.phase === 'index:documents:delete:start'))
+  assert.ok(progress.some(event => event.phase === 'index:documents:delete:done'))
 
   const status = indexStatus({ root, sessionId })
   assert.equal(status.sessions[0].state, 'not-started')
@@ -3083,6 +3415,10 @@ test('shared Typesense collection isolates sessions by agent and session id', as
       type: 'message',
       role: 'user',
       content: [textBlock(`shared collection sentinel ${needle}`)]
+    }, {
+      type: 'compaction',
+      title: 'compacted prefix',
+      content: [textBlock('compacted boundary')]
     }]
   })
   const sessions = [
@@ -3107,7 +3443,6 @@ test('shared Typesense collection isolates sessions by agent and session id', as
     limit: 10
   })
   assert.ok(codexOnly.hits.length > 0)
-  assert.ok(codexOnly.hits.every(hit => hit.agent === 'codex'))
 
   const claudeOnly = await searchIndexWithBackend({
     root,
@@ -3117,7 +3452,6 @@ test('shared Typesense collection isolates sessions by agent and session id', as
     limit: 10
   })
   assert.ok(claudeOnly.hits.length > 0)
-  assert.ok(claudeOnly.hits.every(hit => hit.agent === 'claude'))
 
   const wrongAgent = await searchIndexWithBackend({
     root,
@@ -3138,7 +3472,6 @@ test('shared Typesense collection isolates sessions by agent and session id', as
     limit: 10
   })
   assert.ok(scoped.hits.length > 0)
-  assert.ok(scoped.hits.every(hit => hit.agent === 'codex'))
 })
 
 test('search and browse missing indexed content do not create session artifacts', async () => {
@@ -3426,6 +3759,9 @@ test('deploys repo as a Codex plugin package with marketplace entry', () => {
   assert.ok(fs.existsSync(path.join(pluginDest, '.codex-plugin', 'plugin.json')))
   assert.ok(fs.existsSync(path.join(pluginDest, 'skills', 'conversation_history', 'SKILL.md')))
   assert.ok(fs.existsSync(path.join(pluginDest, 'SKILL.md')))
+  assert.ok(fs.existsSync(path.join(pluginDest, 'vendor', 'CodexSessionTools', 'package.json')))
+  const packageJson = JSON.parse(fs.readFileSync(path.join(pluginDest, 'package.json'), 'utf8'))
+  assert.equal(packageJson.dependencies['codex-session-tools'], 'file:vendor/CodexSessionTools')
   assert.equal(result.codexSkill, undefined)
   const mcpConfig = JSON.parse(fs.readFileSync(path.join(pluginDest, '.mcp.json'), 'utf8'))
   assert.equal(mcpConfig.mcpServers.conversation_history.cwd, '.')
@@ -3435,6 +3771,31 @@ test('deploys repo as a Codex plugin package with marketplace entry', () => {
   const marketplace = JSON.parse(fs.readFileSync(marketplacePath, 'utf8'))
   assert.equal(marketplace.plugins[0].name, 'conversation-history')
   assert.equal(marketplace.plugins[0].source.path, './plugins/conversation-history')
+})
+
+test('copy deploy installs vendored local dependencies without dangling symlinks', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-deploy-deps-'))
+  const pluginDest = path.join(root, 'plugins', 'conversation-history')
+  const result = deploySkill({
+    target: 'codex-plugin',
+    dest: pluginDest,
+    marketplacePath: path.join(root, 'marketplace.json'),
+    force: true,
+    installDependencies: true
+  })
+
+  assert.equal(result.dependenciesInstalled, true)
+  const resolved = childProcess.execFileSync(process.execPath, [
+    '-e',
+    'process.stdout.write(require.resolve("codex-session-tools"))'
+  ], {
+    cwd: pluginDest,
+    encoding: 'utf8'
+  })
+  assert.match(resolved, /vendor\/CodexSessionTools\/src\/index\.js$/)
+  const linkTarget = fs.readlinkSync(path.join(pluginDest, 'node_modules', 'codex-session-tools'))
+  assert.match(linkTarget, /vendor\/CodexSessionTools$/)
+  assert.ok(fs.existsSync(path.resolve(pluginDest, 'node_modules', linkTarget, 'package.json')))
 })
 
 test('deploys repo as a Pi skill package', () => {
@@ -3511,7 +3872,7 @@ test('redeploy target follows the install context, not the caller', async () => 
   }
 })
 
-test('MCP start indexing always generates the conversation marker server-side', () => {
+test('MCP marker generation replaces supplied markers server-side', () => {
   const { __testing: mcpTesting } = require('../src/mcpServer.js')
   const supplied = 'conversation_history-session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
   const args = { session_marker: supplied }
@@ -3551,37 +3912,88 @@ test('MCP marker discovery uses only the last marker as definitive', async () =>
   }), latestMarker)
 })
 
-test('MCP current-thread scope resolves through Codex app-server metadata', async () => {
+test('MCP current-session scope resolves through the emitted session marker', async () => {
   const { __testing: mcpTesting } = require('../src/mcpServer.js')
   const calls = []
-  const resolved = await mcpTesting.resolveCurrentThreadSession({
+  const marker = 'conversation_history-session-dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+  const file = '/tmp/rollout-2026-06-28T20-13-56-019f115e-8bf8-71b0-9416-ba8fe2441f63.jsonl'
+  const resolved = await mcpTesting.resolveCurrentMarkerSession({
     source: 'codex',
-    current_thread_id: 'thread-current-123',
+    session_marker: marker,
     codex_session_service: {
-      appServerThreadRead: async args => {
+      resolveMarker: async args => {
         calls.push(args)
         return {
-          ok: true,
-          status: 'resolved',
-          result: {
-            thread: {
-              id: 'thread-current-123',
-              sessionId: 'session-current-123',
-              path: '/tmp/current-session.jsonl'
-            }
-          }
+          codex_session_id: '019f115e-8bf8-71b0-9416-ba8fe2441f63',
+          file,
+          reason: 'session_marker_match'
         }
       }
     }
   })
   assert.equal(resolved.ok, true)
-  assert.equal(resolved.threadId, 'thread-current-123')
-  assert.equal(resolved.sessionId, 'session-current-123')
-  assert.deepEqual(calls, [{ threadId: 'thread-current-123', includeTurns: false }])
+  assert.equal(resolved.sessionMarker, marker)
+  assert.equal(resolved.sessionId, '019f115e-8bf8-71b0-9416-ba8fe2441f63')
+  assert.equal(resolved.path, file)
+  assert.deepEqual(calls, [{
+    marker,
+    maxBytes: 8 * 1024 * 1024,
+    limit: 100
+  }])
+})
+
+test('MCP browse fails as a binding error when the current-session marker is missing', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-mcp-missing-marker-'))
+  const fakeHome = path.join(root, 'home')
+  fs.mkdirSync(path.join(fakeHome, '.codex', 'sessions'), { recursive: true })
+
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(__dirname, '..', 'bin', 'session-indexer-mcp.js')],
+    cwd: path.join(__dirname, '..'),
+    env: {
+      AGENTTOOLS_MCP_LOG_DIR: path.join(root, 'mcp-logs'),
+      HOME: fakeHome,
+      SESSION_INDEXER_STATE_DIR: root,
+      SESSION_INDEXER_SUMMARY_MODE: 'off'
+    },
+    stderr: 'pipe'
+  })
+  const client = new Client({
+    name: 'session-indexer-test',
+    version: '0.1.0'
+  })
+
+  await client.connect(transport)
+  try {
+    const result = await client.callTool({
+      name: 'conversation_browse',
+      arguments: { limit: 1 }
+    })
+    assert.equal(result.isError, true)
+    assert.match(result.content[0].text, /conversation_history current-session binding failed.*missing_current_session_marker/)
+  } finally {
+    await client.close()
+  }
 })
 
 test('MCP server exposes native conversation search and openLink tools', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-mcp-'))
+  const fakeHome = path.join(root, 'home')
+  const fakeSessionRoot = path.join(fakeHome, '.codex', 'sessions', '2026', '06', '05')
+  fs.mkdirSync(fakeSessionRoot, { recursive: true })
+  const marker = 'conversation_history-session-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+  const currentSessionFile = path.join(fakeSessionRoot, 'rollout-2026-06-05T00-00-00-mini-session.jsonl')
+  fs.copyFileSync(fixture, currentSessionFile)
+  appendJsonl(currentSessionFile, [{
+    timestamp: '2026-06-05T00:00:08.000Z',
+    type: 'response_item',
+    payload: {
+      type: 'function_call_output',
+      call_id: 'conversation_history_marker',
+      output: JSON.stringify({ sessionMarker: marker })
+    }
+  }])
   const ir = importCodexJsonl(fixture)
   await writeSessionIndexWithBackend({
     root,
@@ -3596,6 +4008,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     cwd: path.join(__dirname, '..'),
     env: {
       AGENTTOOLS_MCP_LOG_DIR: path.join(root, 'mcp-logs'),
+      HOME: fakeHome,
       SESSION_INDEXER_STATE_DIR: root,
       SESSION_INDEXER_SUMMARY_MODE: 'off'
     },
@@ -3625,6 +4038,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     const publicPropertyNames = listed.tools.flatMap(tool => Object.keys(tool.inputSchema.properties || {}))
     for (const leaked of [
       'session_marker',
+      'session_id',
       'index_dir',
       'summary_provider',
       'summary_model',
@@ -3645,24 +4059,30 @@ test('MCP server exposes native conversation search and openLink tools', async (
     const searchTool = listed.tools.find(tool => tool.name === 'conversation_search')
     assert.ok(searchTool.inputSchema.properties.agent)
     assert.ok(searchTool.inputSchema.properties.filter.properties.agent)
-    assert.ok(searchTool.inputSchema.properties.all_sessions)
+    assert.equal(Object.hasOwn(searchTool.inputSchema.properties, 'all_sessions'), false)
+    assert.equal(Object.hasOwn(searchTool.inputSchema.properties, 'session_id'), false)
+    assert.equal(Object.hasOwn(searchTool.inputSchema.properties, 'index_id'), false)
+    assert.equal(Object.hasOwn(searchTool.inputSchema.properties, 'topic'), false)
     const browseTool = listed.tools.find(tool => tool.name === 'conversation_browse')
-    assert.ok(browseTool.inputSchema.properties.query)
     assert.ok(browseTool.inputSchema.properties.agent)
-    assert.ok(browseTool.inputSchema.properties.index_id)
-    assert.ok(browseTool.inputSchema.properties.all_sessions)
-    assert.ok(browseTool.inputSchema.properties.topic_id)
+    assert.ok(browseTool.inputSchema.properties.handle)
     assert.ok(browseTool.inputSchema.properties.zoom)
     assert.ok(browseTool.inputSchema.properties.start)
-    assert.equal(Object.hasOwn(browseTool.inputSchema.properties, 'handle'), false)
+    assert.equal(Object.hasOwn(browseTool.inputSchema.properties, 'query'), false)
+    assert.equal(Object.hasOwn(browseTool.inputSchema.properties, 'index_id'), false)
+    assert.equal(Object.hasOwn(browseTool.inputSchema.properties, 'session_id'), false)
+    assert.equal(Object.hasOwn(browseTool.inputSchema.properties, 'all_sessions'), false)
+    assert.equal(Object.hasOwn(browseTool.inputSchema.properties, 'topic_id'), false)
     assert.equal(Object.hasOwn(browseTool.inputSchema.properties, 'topic'), false)
     const openTool = listed.tools.find(tool => tool.name === 'conversation_openLink')
     assert.ok(openTool.inputSchema.properties.agent)
+    assert.ok(openTool.inputSchema.properties.handle)
 
     const indexingTool = listed.tools.find(tool => tool.name === 'start_indexing_session')
-    assert.deepEqual(Object.keys(indexingTool.inputSchema.properties || {}), ['all'])
+    assert.deepEqual(Object.keys(indexingTool.inputSchema.properties || {}), [])
     const statusTool = listed.tools.find(tool => tool.name === 'conversation_index_status')
-    assert.ok(statusTool.inputSchema.properties.all_sessions)
+    assert.equal(Object.hasOwn(statusTool.inputSchema.properties, 'all_sessions'), false)
+    assert.equal(Object.hasOwn(statusTool.inputSchema.properties, 'session_id'), false)
     // Redeploy target is decided by the install context, never a model argument.
     const redeployTool = listed.tools.find(tool => tool.name === 'redeploy_session_index_mcp')
     assert.equal(Object.hasOwn(redeployTool.inputSchema.properties || {}, 'target'), false)
@@ -3680,152 +4100,104 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.doesNotMatch(prompt.messages[0].content.text, /start_indexing_session first/)
     assert.doesNotMatch(prompt.messages[0].content.text, /typesense|backend|serverIndex|search_backend|search-backend/i)
 
-    const scopedBrowse = (await client.callTool({
+    const browseRoot = (await client.callTool({
       name: 'conversation_browse',
       arguments: {
         limit: 1
       }
     })).structuredContent.result
-    assert.equal(scopedBrowse.schema, 'session-indexer.browse.v1')
-    assert.equal(scopedBrowse.status, 'blocked')
-    assert.equal(scopedBrowse.reason, 'missing_current_thread_id')
-    assert.deepEqual(scopedBrowse.sessions, [])
-    assert.doesNotMatch(JSON.stringify(scopedBrowse), /mini-session|clientRevision|atlas/)
+    assert.equal(browseRoot.schema, 'session-indexer.browse.v1')
+    assert.equal(browseRoot.zoom, 'children')
+    assert.equal(browseRoot.handle, 'root')
+    assert.equal(Object.hasOwn(browseRoot, 'session_id'), false)
+    assert.equal(Object.hasOwn(browseRoot, 'index_id'), false)
+    assert.equal(Object.hasOwn(browseRoot, 'topics'), false)
+    assert.equal(Object.hasOwn(browseRoot, 'link'), false)
+    assert.equal(browseRoot.page.start, 0)
+    assert.equal(browseRoot.page.limit, 1)
+    assert.equal(browseRoot.page.returned, 1)
+    assert.equal(browseRoot.children[0].handle.startsWith('event/'), true)
+    assert.equal(Object.hasOwn(browseRoot.children[0], 'session_id'), false)
+    assert.equal(Object.hasOwn(browseRoot.children[0], 'index_id'), false)
+    assert.equal(Object.hasOwn(browseRoot.children[0], 'resourceLinks'), false)
+    assert.equal(Object.hasOwn(browseRoot.children[0], 'summaryMeta'), false)
+    assert.equal(Object.hasOwn(browseRoot.children[0], 'usage'), false)
+    assert.equal(Object.hasOwn(browseRoot.children[0], 'topic_id'), false)
 
-    const scopedStatus = (await client.callTool({
+    const statusResult = (await client.callTool({
       name: 'conversation_index_status',
       arguments: {
         start_at: 0,
         limit: 1
       }
     })).structuredContent.result
-    assert.equal(scopedStatus.schema, 'session-indexer.index_status.v1')
-    assert.equal(scopedStatus.status, 'blocked')
-    assert.equal(scopedStatus.reason, 'missing_current_thread_id')
-    assert.deepEqual(scopedStatus.sessions, [])
-    assert.doesNotMatch(JSON.stringify(scopedStatus), /mini-session|clientRevision|atlas/)
+    assert.equal(statusResult.schema, 'session-indexer.index_status.v1')
+    assert.equal(Object.hasOwn(statusResult, 'indexedSessionCount'), false)
+    assert.equal(Object.hasOwn(statusResult, 'requestedSessionCount'), false)
+    assert.equal(Object.hasOwn(statusResult, 'upToDate'), false)
+    assert.equal(Object.hasOwn(statusResult.sessions[0], 'sessionId'), false)
+    assert.equal(Object.hasOwn(statusResult.sessions[0], 'indexId'), false)
+    assert.equal(Object.hasOwn(statusResult.sessions[0], 'upToDate'), false)
+    assert.equal(Object.hasOwn(statusResult.sessions[0], 'staleByMs'), false)
+    assert.equal(Object.hasOwn(statusResult.sessions[0], 'sourceUpdatedAt'), false)
+    assert.equal(Object.hasOwn(statusResult.sessions[0], 'sourceUpdatedAgo'), false)
+    assert.equal(Object.hasOwn(statusResult.sessions[0].indexingStats, 'summaryUsageBasis'), false)
+    assert.equal(Object.hasOwn(statusResult.sessions[0], 'compactions'), false)
+    assert.equal(statusResult.sessions[0].summaryTargetStore.targetCount, 0)
+    assert.equal(Object.hasOwn(statusResult.sessions[0], 'nextStatusPoll'), false)
 
-    const scopedSearch = (await client.callTool({
-      name: 'conversation_search',
-      arguments: {
-        query: 'clientRevision atlas',
-        limit: 1
-      }
-    })).structuredContent.result
-    assert.equal(scopedSearch.schema, 'session-indexer.search.v1')
-    assert.equal(scopedSearch.status, 'blocked')
-    assert.equal(scopedSearch.reason, 'missing_current_thread_id')
-    assert.deepEqual(scopedSearch.hits, [])
-    assert.doesNotMatch(JSON.stringify(scopedSearch), /mini-session/)
-
-    const catalogBrowse = (await client.callTool({
-      name: 'conversation_browse',
-      arguments: {
-        all_sessions: true,
-        limit: 1
-      }
-    })).structuredContent.result
-    assert.equal(catalogBrowse.schema, 'session-indexer.browse.v1')
-    assert.equal(catalogBrowse.level, 'sessions')
-    assert.equal(catalogBrowse.page.returned, 1)
-    assert.equal(catalogBrowse.sessions[0].session_id, 'mini-session')
-    assert.equal(catalogBrowse.sessions[0].browse.index_id, indexId)
-    assert.equal(catalogBrowse.sessions[0].browse.topic_id, 'root')
-    assert.equal(Object.hasOwn(catalogBrowse, 'resourceUsage'), false)
-    assert.equal(Object.hasOwn(catalogBrowse.sessions[0], 'summaryIndex'), false)
-
-    const browsed = await client.callTool({
-      name: 'conversation_browse',
-      arguments: {
-        index_id: indexId,
-        session_id: 'mini-session',
-        limit: 1
-      }
-    })
-    const browseResult = browsed.structuredContent.result
-    assert.equal(browseResult.schema, 'session-indexer.browse.v1')
-    assert.equal(Object.hasOwn(browseResult, 'indexStatus'), false)
-    assert.equal(Object.hasOwn(browseResult, 'ready'), false)
-    assert.equal(Object.hasOwn(browseResult, 'handle'), false)
-    assert.equal(browseResult.zoom, 'children')
-    assert.equal(browseResult.page.start, 0)
-    assert.equal(browseResult.page.limit, 1)
-    assert.equal(browseResult.page.returned, 1)
-    assert.ok(browseResult.topics[0].topic_id)
-    if (browseResult.children.length) {
-      assert.equal(Object.hasOwn(browseResult.children[0], 'handle'), false)
-      assert.equal(Object.hasOwn(browseResult.children[0], 'resourceLinks'), false)
-      assert.equal(Object.hasOwn(browseResult.children[0], 'summaryMeta'), false)
-      assert.equal(Object.hasOwn(browseResult.children[0], 'usage'), false)
-      assert.ok(browseResult.children[0].topic_id)
-    }
-    const rootTopicBrowse = (await client.callTool({
-      name: 'conversation_browse',
-      arguments: {
-        index_id: indexId,
-        session_id: 'mini-session',
-        topic_id: 'root',
-        limit: 1
-      }
-    })).structuredContent.result
-    assert.equal(rootTopicBrowse.zoom, 'children')
-    assert.equal(rootTopicBrowse.selected_topic_id, undefined)
-    assert.equal(rootTopicBrowse.children[0].link, browseResult.children[0].link)
     const browseSecondPage = (await client.callTool({
       name: 'conversation_browse',
       arguments: {
-        index_id: indexId,
-        session_id: 'mini-session',
         start: 1,
         limit: 1
       }
     })).structuredContent.result
     assert.equal(browseSecondPage.page.start, 1)
     assert.equal(browseSecondPage.page.returned, 1)
-    assert.notEqual(browseSecondPage.children[0].topic_id, browseResult.children[0].topic_id)
+    assert.notEqual(browseSecondPage.children[0].handle, browseRoot.children[0].handle)
     assert.equal(browseSecondPage.children[0].index, '2/5')
+
     const zoomedBrowse = (await client.callTool({
       name: 'conversation_browse',
       arguments: {
-        index_id: indexId,
-        session_id: 'mini-session',
-        topic_id: browseResult.children[0].topic_id,
+        handle: browseRoot.children[0].handle,
         zoom: 'in',
         limit: 1
       }
     })).structuredContent.result
     assert.equal(zoomedBrowse.zoom, 'in')
-    assert.equal(zoomedBrowse.selected_topic_id, browseResult.children[0].topic_id)
-    assert.equal(zoomedBrowse.topic_id, browseResult.children[0].topic_id)
-    assert.equal(Object.hasOwn(zoomedBrowse, 'handle'), false)
+    assert.equal(zoomedBrowse.handle, browseRoot.children[0].handle)
+    assert.equal(Object.hasOwn(zoomedBrowse, 'topic_id'), false)
+    assert.equal(Object.hasOwn(zoomedBrowse, 'selected_topic_id'), false)
+
+    const scopedSearch = (await client.callTool({
+      name: 'conversation_search',
+      arguments: {
+        query: 'clientRevision',
+        limit: 1
+      }
+    })).structuredContent.result
+    assert.equal(scopedSearch.schema, 'session-indexer.search.v1')
+    assert.equal(scopedSearch.hits.length, 1)
+    assert.equal(Object.hasOwn(scopedSearch.hits[0], 'session_id'), false)
+    assert.equal(Object.hasOwn(scopedSearch.hits[0], 'index_id'), false)
+    assert.equal(Object.hasOwn(scopedSearch.hits[0], 'link'), false)
+    assert.equal(Object.hasOwn(scopedSearch.hits[0], 'head'), false)
+    assert.equal(Object.hasOwn(scopedSearch.hits[0], 'excerpt'), false)
+    assert.equal(Object.hasOwn(scopedSearch.hits[0], 'navigation'), false)
+    assert.equal(Object.hasOwn(scopedSearch.hits[0], 'usage'), false)
+    assert.equal(Object.hasOwn(scopedSearch.hits[0], 'summaryMeta'), false)
+    assert.match(scopedSearch.hits[0].text, /clientRevision 7/)
+    assert.doesNotMatch(JSON.stringify(scopedSearch), /mini-session|atlas/)
 
     const callMiniStatus = async () => (await client.callTool({
       name: 'conversation_index_status',
       arguments: {
         start_at: 0,
-        limit: 1,
-        session_id: 'mini-session'
+        limit: 1
       }
     })).structuredContent.result
-    const statusResult = await callMiniStatus()
-    assert.equal(statusResult.schema, 'session-indexer.index_status.v1')
-    assert.equal(Object.hasOwn(statusResult, 'indexedSessionCount'), false)
-    assert.equal(Object.hasOwn(statusResult, 'requestedSessionCount'), false)
-    assert.equal(Object.hasOwn(statusResult, 'upToDate'), false)
-    assert.equal(Object.hasOwn(statusResult.sessions[0], 'upToDate'), false)
-    assert.equal(Object.hasOwn(statusResult.sessions[0], 'staleByMs'), false)
-    assert.equal(Object.hasOwn(statusResult.sessions[0], 'sourceUpdatedAt'), false)
-    assert.equal(Object.hasOwn(statusResult.sessions[0], 'sourceUpdatedAgo'), false)
-    assert.equal(statusResult.sessions[0].indexId, indexId)
-    assert.equal(Object.hasOwn(statusResult.sessions[0].indexingStats, 'summaryUsageBasis'), false)
-    assert.equal(Object.hasOwn(statusResult.sessions[0], 'compactions'), false)
-    if (statusResult.sessions[0].indexingJob) {
-      assert.equal(Object.hasOwn(statusResult.sessions[0].indexingJob, 'result'), false)
-      assert.equal(Object.hasOwn(statusResult.sessions[0].indexingJob, 'running'), false)
-      assert.equal(Object.hasOwn(statusResult.sessions[0].indexingJob, 'maxSummaryNodes'), false)
-    }
-    assert.equal(statusResult.sessions[0].summaryTargetStore.targetCount, 0)
-    assert.equal(Object.hasOwn(statusResult.sessions[0], 'nextStatusPoll'), false)
 
     const statusWorker = childProcess.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
       stdio: 'ignore'
@@ -3891,11 +4263,11 @@ test('MCP server exposes native conversation search and openLink tools', async (
           sessions: [ir.source.path],
           status: 'suspended',
           suspendedReason: 'summary_budget',
-          message: 'summary budget approval required',
+          message: 'summary budget suspended',
           suspension: {
             reason: 'summary_budget',
-            message: 'summary budget approval required',
-            requiredAction: 'Ask the user to approve the remaining conversation_history indexing budget.'
+            message: 'summary budget suspended',
+            requiredAction: 'Resume with summary_max_budget_usd=2.50.'
           },
           progress: {
             phase: 'summary:budget_suspended',
@@ -3909,7 +4281,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
       assert.equal(suspended.sessions[0].nextStatusPoll.reason, 'approval_required')
       assert.equal(suspended.sessions[0].nextStatusPoll.retryAfterMs, null)
       assert.equal(suspended.sessions[0].nextStatusPoll.retryAt, null)
-      assert.match(suspended.sessions[0].nextStatusPoll.message, /Do not poll/)
+      assert.match(suspended.sessions[0].nextStatusPoll.message, /Indexing is suspended/)
     } finally {
       if (!statusWorker.killed) statusWorker.kill('SIGTERM')
       await Promise.race([
@@ -3921,8 +4293,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     const searched = await client.callTool({
       name: 'conversation_search',
       arguments: {
-        session_id: 'mini-session',
-        query: 'clientRevision atlas',
+        query: 'clientRevision',
         limit: 1
       }
     })
@@ -3933,32 +4304,51 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.equal(Object.hasOwn(searchResult, 'indexDir'), false)
     assert.equal(Object.hasOwn(searchResult, 'filter'), false)
     assert.equal(searchResult.hits.length, 1)
-    assert.equal(searchResult.hits[0].index_id, indexId)
+    assert.equal(Object.hasOwn(searchResult.hits[0], 'index_id'), false)
+    assert.equal(Object.hasOwn(searchResult.hits[0], 'session_id'), false)
     assert.equal(Object.hasOwn(searchResult.hits[0], 'head'), false)
     assert.equal(Object.hasOwn(searchResult.hits[0], 'excerpt'), false)
     assert.equal(Object.hasOwn(searchResult.hits[0], 'navigation'), false)
     assert.equal(Object.hasOwn(searchResult.hits[0], 'usage'), false)
     assert.equal(Object.hasOwn(searchResult.hits[0], 'summaryMeta'), false)
+    assert.match(searchResult.hits[0].text, /clientRevision 7/)
+    assert.doesNotMatch(JSON.stringify(searchResult), /atlas/)
 
-    const docs = collectIndexDocuments(readSessionTree({ root, sessionId: 'mini-session' }))
-    const openDoc = docs.find(doc => /clientRevision 7|atlas/i.test(doc.searchText))
-    assert.ok(openDoc)
     const opened = await client.callTool({
       name: 'conversation_openLink',
       arguments: {
-        link: openDoc.link,
+        handle: searchResult.hits[0].handle,
         budget_tokens: 2000
       }
     })
     const openResult = opened.structuredContent.result
     assert.equal(openResult.schema, 'session-indexer.openLink.v1')
-    assert.match(openResult.content, /clientRevision 7|atlas/i)
+    assert.match(openResult.content, /clientRevision 7/i)
+    assert.doesNotMatch(JSON.stringify(openResult), /mini-session|index_id|session_id/)
+
+    const startTime = Date.now()
+    const startedIndexing = (await client.callTool({
+      name: 'start_indexing_session',
+      arguments: {}
+    })).structuredContent.result
+    assert.equal(startedIndexing.schema, 'session-indexer.start_indexing_session.v1')
+    assert.equal(startedIndexing.timeoutMs, 0)
+    assert.equal(startedIndexing.sessionMarker, undefined)
+    assert.equal(startedIndexing.reusedSessionMarker, true)
+    assert.equal(startedIndexing.generatedSessionMarker, undefined)
+    assert.equal(startedIndexing.job.waitForSessionMarker, false)
+    assert.ok(Date.now() - startTime < 5000)
+
+    const stoppedIndexing = (await client.callTool({
+      name: 'stop_indexing_session',
+      arguments: {}
+    })).structuredContent.result
+    assert.equal(stoppedIndexing.schema, 'session-indexer.stop_indexing_session.v1')
+    assert.equal(stoppedIndexing.sessionMarker, undefined)
 
     const reset = await client.callTool({
       name: 'reset_session_index',
-      arguments: {
-        session_id: 'mini-session'
-      }
+      arguments: {}
     })
     assert.equal(reset.structuredContent.result.schema, 'session-indexer.reset_session_index.v1')
     assert.equal(Object.hasOwn(reset.structuredContent.result.sessions[0], 'removedFiles'), false)
@@ -3968,13 +4358,11 @@ test('MCP server exposes native conversation search and openLink tools', async (
     const missingBrowse = await client.callTool({
       name: 'conversation_browse',
       arguments: {
-        index_id: indexId,
-        session_id: 'mini-session',
         limit: 1
       }
     })
-    assert.equal(missingBrowse.isError, true)
-    assert.match(missingBrowse.content[0].text, /Unknown session browse target|conversation_history CLI failed/)
+    assert.equal(missingBrowse.structuredContent.result.status, 'not_indexed')
+    assert.equal(missingBrowse.structuredContent.result.reason, 'current_session_not_indexed')
   } finally {
     await client.close()
   }

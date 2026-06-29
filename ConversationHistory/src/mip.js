@@ -7,11 +7,10 @@ const {
   stableStringify
 } = require('./util.js')
 const { addUsage, blockText, eventText, normalizeUsage } = require('./ir.js')
-const { normalizeTopics, parseTopicId, topicIdForHandle, topicText, topicsText } = require('./topics.js')
+const { normalizeTopics, parseTopicId, topicIdForHandle, topicText } = require('./topics.js')
 
 const RAW_CHUNK_CHARS = 6000
-const MAX_INDEX_TEXT_CHARS = 20000
-const MAX_INNER_DESCENDANT_SEARCH_CHARS = 8000
+const MAX_SEARCH_MESSAGE_CHARS = 4000
 const MAX_TOPICS = 8
 const DEFAULT_SUMMARY_MODEL = 'summary-not-generated'
 
@@ -57,34 +56,6 @@ const parseSessionLink = link => {
     sessionId: params.get('sessionId') || undefined,
     handle: params.get('handle') || undefined
   }
-}
-
-const flattenSearchParts = (value, out = [], depth = 0) => {
-  if (value == null || depth > 5) return out
-  if (typeof value === 'string') {
-    out.push(value)
-    if (/^\s*[\[{"]/.test(value)) {
-      try {
-        flattenSearchParts(JSON.parse(value), out, depth + 1)
-      } catch (_err) {}
-    }
-    return out
-  }
-  if (typeof value === 'number' || typeof value === 'boolean') {
-    out.push(String(value))
-    return out
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) flattenSearchParts(item, out, depth + 1)
-    return out
-  }
-  if (typeof value === 'object') {
-    for (const [key, child] of Object.entries(value)) {
-      out.push(key)
-      flattenSearchParts(child, out, depth + 1)
-    }
-  }
-  return out
 }
 
 const mergeTopic = (map, topic, weight = 1) => {
@@ -626,6 +597,21 @@ const nodeConversationFields = node => {
   return out
 }
 
+const nodeSourceFields = node => {
+  const meta = node && node.meta || {}
+  const source = meta.source || {}
+  const lineNumber = Number(source.lineNumber || 0)
+  const out = {}
+  if (source.path) out.sourcePath = source.path
+  if (Number.isInteger(lineNumber) && lineNumber > 0) {
+    out.sourceLineNumber = lineNumber
+    out.sourceLineEnd = lineNumber
+  }
+  if (Number.isInteger(meta.charStart)) out.sourceCharStart = meta.charStart
+  if (Number.isInteger(meta.charEnd)) out.sourceCharEnd = meta.charEnd
+  return out
+}
+
 const nodeRef = (tree, node, opts = {}) => ({
   handle: node.handle,
   index_id: tree.ir.indexId,
@@ -634,6 +620,7 @@ const nodeRef = (tree, node, opts = {}) => ({
   ...nodeNavigation(tree, node),
   ...nodeTimeFields(node),
   ...nodeConversationFields(node),
+  ...nodeSourceFields(node),
   kind: node.kind,
   title: node.title,
   breadcrumb: node.breadcrumb || '',
@@ -731,43 +718,43 @@ const optionalString = value => {
   return text ? text : undefined
 }
 
-const browseTopicsForRefs = refs => {
-  const out = []
-  const seen = new Set()
-  for (const ref of refs || []) {
-    const topics = normalizeTopics(ref.topics || [], { max: 0 })
-    const fallback = ref.head || ref.title || ref.breadcrumb || ''
-    const values = topics.length ? topics : fallback ? [fallback] : []
-    for (let index = 0; index < values.length; index += 1) {
-      const topicId = topicIdForHandle({ handle: ref.handle, topicIndex: topics.length ? index : -1 })
-      if (!topicId || seen.has(topicId)) continue
-      seen.add(topicId)
-      out.push({
-        topic_id: topicId,
-        label: optionalString(ref.breadcrumb) || optionalString(ref.title) || `topic ${out.length + 1}`,
-        description: values[index],
-        index: optionalString(ref.index)
-      })
-    }
+const truncateSearchText = (value, maxChars) => String(value || '').slice(0, maxChars)
+
+const nodeHasCompletedSummary = node => {
+  const meta = node && node.summaryMeta || {}
+  return node && node.kind === 'summary_span' &&
+    meta.status === 'completed' &&
+    compactText(node && node.head)
+}
+
+const sourceMessageNode = node => {
+  const meta = node && node.meta || {}
+  return meta.type === 'message' &&
+    (meta.role === 'user' || meta.role === 'assistant') &&
+    (node.kind === 'message' || /^event_content(?:_chunk)?$/.test(String(node.kind || '')))
+}
+
+const modelTextForNode = node => {
+  if (!node || isModelHiddenNode(node)) return ''
+  if (sourceMessageNode(node)) {
+    return node.kind === 'message'
+      ? concatRaw(node)
+      : String(node.raw || '')
   }
-  return out
+  if (nodeHasCompletedSummary(node)) return String(node.head || '')
+  return ''
 }
 
 const browseRef = (tree, node) => {
   const ref = nodeRef(tree, node, { includeResourceLinks: false })
-  const topics = browseTopicsForRefs([ref])
   return {
-    topic_id: topicIdForHandle({ handle: node.handle }),
-    link: ref.link,
+    handle: ref.handle,
+    index_id: ref.index_id,
     index: optionalString(ref.index),
-    kind: ref.kind,
-    title: ref.title,
-    breadcrumb: optionalString(ref.breadcrumb),
-    summary: ref.head || undefined,
-    topics: topics.length ? topics : undefined,
-    isVerbatim: !node.children.length,
-    child_count: Number(ref.childCount || 0),
-    full_token_count: Number(ref.fullTokenCount || 0) || undefined
+    line: ref.sourceLineNumber || undefined,
+    text: modelTextForNode(node) || undefined,
+    openable: Boolean(sourceMessageNode(node)),
+    child_count: Number(ref.childCount || 0)
   }
 }
 
@@ -801,22 +788,13 @@ const browseNode = (tree, opts = {}) => {
   const filteredChildren = visibleChildren.filter(child => topicMatches(child.topics, opts.topic))
   const pageChildren = filteredChildren
     .slice(start, start + (opts.limit || 20))
-  const childRefs = pageChildren.map(child => nodeRef(tree, child, { includeResourceLinks: false }))
   const limit = Math.max(1, Number(opts.limit || 20))
   const nextStart = start + pageChildren.length
   return {
-    topic_id: topicIdForHandle({ handle: node.handle }),
-    selected_topic_id: topicId || undefined,
+    handle: node.handle,
     zoom,
     index_id: tree.ir.indexId,
-    link: sessionLink({ indexId: tree.ir.indexId, handle: node.handle }),
-    ...nodeTimeFields(node),
-    ...nodeConversationFields(node),
-    kind: node.kind,
-    title: node.title,
-    breadcrumb: node.breadcrumb || '',
-    summary: node.head,
-    topics: browseTopicsForRefs(childRefs),
+    text: modelTextForNode(node) || undefined,
     child_count: visibleChildren.length,
     page: {
       start,
@@ -825,67 +803,25 @@ const browseNode = (tree, opts = {}) => {
       total: filteredChildren.length,
       next_start: nextStart < filteredChildren.length ? nextStart : undefined
     },
-    topic_filter: opts.topic || undefined,
     children: pageChildren.map(child => browseRef(tree, child))
   }
 }
 
-const nodeSearchText = (node, opts = {}) => [
-  node.title,
-  node.breadcrumb,
-  node.head,
-  node.raw,
-  stableStringify(node.usage),
-  topicsText(opts.topics || node.topics || []),
-  stableStringify(node.meta),
-  ...flattenSearchParts(node.meta)
-].join('\n')
+const nodeSearchText = (node, opts = {}) => {
+  if (!node || isModelHiddenNode(node)) return ''
+  if (sourceMessageNode(node)) {
+    return truncateSearchText(modelTextForNode(node), MAX_SEARCH_MESSAGE_CHARS)
+  }
+  if (!opts.isPendingSummary && nodeHasCompletedSummary(node)) {
+    return String(node.head || '')
+  }
+  return ''
+}
 
 const isModelHiddenDoc = doc => Boolean(doc && (
   doc.kind === 'reasoning' ||
   /\/reasoning(?:\/|$)/.test(String(doc.handle || ''))
 ))
-
-const appendBounded = (parts, value, state, maxChars) => {
-  if (state.used >= maxChars || value == null) return
-  const text = String(value)
-  if (!text) return
-  const remaining = maxChars - state.used
-  parts.push(text.length > remaining ? text.slice(0, remaining) : text)
-  state.used += Math.min(text.length, remaining)
-}
-
-const compactNodeSearchText = node => [
-  node.title,
-  node.breadcrumb,
-  node.head,
-  topicsText(node.topics || []),
-  stableStringify(node.meta)
-].filter(Boolean).join('\n')
-
-const boundedDescendantSearchText = (node, maxChars = MAX_INNER_DESCENDANT_SEARCH_CHARS, isSearchVisible = () => true) => {
-  const parts = []
-  const state = { used: 0 }
-  const visit = child => {
-    if (!child || state.used >= maxChars) return
-    if (isModelHiddenNode(child)) return
-    if (!isSearchVisible(child)) return
-    appendBounded(parts, compactNodeSearchText(child), state, maxChars)
-    if (!child.children.length) {
-      appendBounded(parts, child.raw, state, maxChars)
-      return
-    }
-    for (const grandchild of child.children) {
-      if (state.used >= maxChars) break
-      visit(grandchild)
-    }
-  }
-  for (const child of modelVisibleChildren(node.children)) {
-    if (state.used >= maxChars) break
-    visit(child)
-  }
-  return parts.join('\n')
-}
 
 const collectIndexDocuments = (tree, opts = {}) => {
   const docs = []
@@ -900,12 +836,7 @@ const collectIndexDocuments = (tree, opts = {}) => {
       node.summaryMeta &&
       node.summaryMeta.status &&
       node.summaryMeta.status !== 'completed'
-    const docTopics = isPendingSummary ? [] : node.topics || []
-    const searchText = isLeaf
-      ? nodeSearchText(node, { topics: docTopics })
-      : isPendingSummary
-        ? nodeSearchText(node, { topics: docTopics })
-      : [nodeSearchText(node, { topics: docTopics }), boundedDescendantSearchText(node, MAX_INNER_DESCENDANT_SEARCH_CHARS, retrievalVisible)].join('\n')
+    const searchText = nodeSearchText(node, { isPendingSummary })
     const agent = tree.ir.session.agent || ''
     docs.push({
       id: hashString(`${agent}:${indexId}:${node.handle}`),
@@ -919,6 +850,7 @@ const collectIndexDocuments = (tree, opts = {}) => {
       ...nodeNavigation(tree, node, parent, depth),
       ...nodeTimeFields(node),
       ...nodeConversationFields(node),
+      ...nodeSourceFields(node),
       depth,
       kind: node.kind,
       mipLevel: node.children.length ? 'summary' : 'leaf',
@@ -927,10 +859,10 @@ const collectIndexDocuments = (tree, opts = {}) => {
       title: node.title || '',
       breadcrumb: node.breadcrumb || '',
       summary: node.head || '',
-      topics: docTopics,
+      topics: [],
       summaryModel: node.summaryModel || DEFAULT_SUMMARY_MODEL,
       summaryMeta: compactSummaryMeta(node.summaryMeta),
-      searchText: searchText.slice(0, MAX_INDEX_TEXT_CHARS),
+      searchText,
       excerpt: isLeaf ? preview(node.raw, 700) : preview(node.head, 700),
       content: isLeaf ? node.raw : '',
       childCount: node.children.length,
@@ -964,7 +896,9 @@ module.exports = {
   lastCompactionChildIndex,
   modelVisibleChildren,
   nodeConversationFields,
+  nodeSourceFields,
   nodeTimeFields,
+  modelTextForNode,
   openLink,
   parseSessionLink,
   rebuildTreeIndex,

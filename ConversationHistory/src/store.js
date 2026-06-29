@@ -20,18 +20,28 @@ const {
   buildMipTree,
   compactedRetrievalHandles,
   collectIndexDocuments,
-  indexIdForIR
+  indexIdForIR,
+  openLink,
+  modelTextForNode,
+  nodeSourceFields,
+  parseSessionLink
 } = require('./mip.js')
+const { adapterFor } = require('./adapters/index.js')
+const {
+  docStorePath,
+  writeSessionDocs
+} = require('./docStore.js')
 const {
   DEFAULT_SUMMARY_MODE,
   applyStoredSummaryJobs,
+  prepareCompactedSummaryLayer,
   summarizeTree
 } = require('./summarizer.js')
 const {
   browseTypesense,
   deleteSessionDocuments,
+  exactDocument,
   importDocuments,
-  openLinkTypesense,
   resolveTypesenseConfig,
   searchTypesense
 } = require('./typesense.js')
@@ -888,13 +898,12 @@ function * sessionIRRows (ir) {
   yield {
     recordType: 'session_ir_header',
     schema: ir.schema,
+    storage: 'source-pointer',
+    indexId: ir.indexId,
     source: ir.source,
-    session: ir.session
-  }
-  for (const event of ir.events || []) {
-    yield {
-      recordType: 'session_ir_event',
-      event
+    session: {
+      ...ir.session,
+      usage: undefined
     }
   }
 }
@@ -921,10 +930,32 @@ const readSessionIRJsonl = file => {
   if (!header) throw new Error(`missing IR JSONL header: ${file}`)
   return {
     schema: header.schema,
+    indexId: header.indexId || header.index_id,
     source: header.source || {},
     session: header.session || {},
     events
   }
+}
+
+const adapterNameForSourceKind = kind => {
+  const text = String(kind || '').toLowerCase()
+  if (text.startsWith('codex')) return 'codex'
+  if (text.startsWith('claude')) return 'claude'
+  return text
+}
+
+const rehydrateSourceIR = ({ stored }) => {
+  const source = stored && stored.source || {}
+  if (!source.path) return stored
+  if (stored && stored.events && stored.events.length) return stored
+  const adapter = adapterFor(adapterNameForSourceKind(source.kind))
+  const ir = adapter.importFile(source.path)
+  if (stored && stored.session && stored.session.id && ir.session.id !== stored.session.id) {
+    throw new Error(`source session id changed for ${source.path}: expected ${stored.session.id}, got ${ir.session.id}`)
+  }
+  const indexId = stored && (stored.indexId || stored.index_id || stored.session && (stored.session.indexId || stored.session.index_id))
+  if (indexId) ir.indexId = String(indexId)
+  return ir
 }
 
 const unlinkIfExists = file => {
@@ -933,6 +964,10 @@ const unlinkIfExists = file => {
     return true
   } catch (err) {
     if (err && err.code === 'ENOENT') return false
+    if (err && (err.code === 'EISDIR' || err.code === 'EPERM')) {
+      fs.rmSync(file, { recursive: true, force: true })
+      return true
+    }
     throw err
   }
 }
@@ -969,6 +1004,7 @@ const resetSessionIndex = ({
     remove(irPath(root, sessionId))
     remove(legacyIrPath(root, sessionId))
     remove(treePath(root, sessionId))
+    remove(docStorePath(root, sessionId))
     remove(summaryTargetsPath(root, sessionId))
     remove(legacySummaryTargetsPath(root, sessionId))
     remove(summaryTargetsLockPath(root, sessionId))
@@ -1045,6 +1081,7 @@ const writeSessionIndex = ({ root = DEFAULT_INDEX_DIR, ir }) => {
     const manifest = readManifest(root)
     manifest.updatedAt = now
     manifest.sessions[ir.session.id] = sessionRecordForManifest(sessionRecord)
+    writeSessionDocs({ root, sessionId: ir.session.id, docs })
     writeSessionIR({ root, ir })
     unlinkIfExists(treePath(root, ir.session.id))
     writeManifest(root, manifest)
@@ -1234,6 +1271,7 @@ const writeSessionIndexWithBackend = async ({
         docCount: docs.length
       })
     }
+    writeSessionDocs({ root, sessionId: ir.session.id, docs })
     const result = await importDocuments({
       docs,
       sessionId: ir.session.id,
@@ -1288,17 +1326,69 @@ const writeSessionIndexWithBackend = async ({
 
 const readSessionIR = ({ root = DEFAULT_INDEX_DIR, sessionId }) => {
   const jsonl = irPath(root, sessionId)
-  if (fs.existsSync(jsonl)) return readSessionIRJsonl(jsonl)
-  return readJson(legacyIrPath(root, sessionId))
+  if (fs.existsSync(jsonl)) return rehydrateSourceIR({ stored: readSessionIRJsonl(jsonl) })
+  const legacy = readJson(legacyIrPath(root, sessionId))
+  return rehydrateSourceIR({ stored: legacy })
 }
 
 const readSessionTree = ({ root = DEFAULT_INDEX_DIR, sessionId, fallbackIR }) => {
   const ir = fallbackIR || readSessionIR({ root, sessionId })
   const tree = buildMipTree(ir)
-  applyCompactionSearchScope(tree)
   const jobs = completedSummaryJobs({ root, sessionId })
-  if (jobs.length) applyStoredSummaryJobs(tree, jobs)
+  if (jobs.length) {
+    prepareCompactedSummaryLayer(tree, {
+      previousSummaryJobs: jobs,
+      summaryInputTokenBudget: jobs.reduce((budget, job) => {
+        const value = Number(job && job.inputTokenBudget || 0)
+        return value > budget ? value : budget
+      }, 0) || undefined
+    })
+    applyStoredSummaryJobs(tree, jobs)
+  } else {
+    applyCompactionSearchScope(tree)
+  }
   return tree
+}
+
+const hydrateModelRef = ({ root = DEFAULT_INDEX_DIR, ref, treeCache }) => {
+  if (!ref || typeof ref !== 'object') return ref
+  const sessionId = ref._sessionId || ref.sessionId || ref.session_id
+  const handle = ref.handle
+  const out = { ...ref }
+  delete out._sessionId
+  delete out.sessionId
+  delete out.session_id
+  if (!sessionId || !handle) return out
+  try {
+    let tree = treeCache && treeCache.get(sessionId)
+    if (!tree) {
+      tree = readSessionTree({ root, sessionId })
+      if (treeCache) treeCache.set(sessionId, tree)
+    }
+    const node = tree && tree.byHandle && tree.byHandle.get(handle)
+    const text = modelTextForNode(node)
+    if (text) out.text = text
+    const source = nodeSourceFields(node)
+    if (!out.line && source.sourceLineNumber) out.line = source.sourceLineNumber
+  } catch (err) {
+    if (!err || (err.code !== 'ENOENT' && !/unknown source adapter/i.test(err.message || ''))) throw err
+  }
+  return out
+}
+
+const hydrateModelRefs = ({ root = DEFAULT_INDEX_DIR, value, treeCache = new Map() }) => {
+  if (Array.isArray(value)) {
+    return value.map(item => hydrateModelRefs({ root, value: item, treeCache }))
+  }
+  if (!value || typeof value !== 'object') return value
+  const own = hydrateModelRef({ root, ref: value, treeCache })
+  if (Array.isArray(own.children)) {
+    own.children = own.children.map(child => hydrateModelRefs({ root, value: child, treeCache }))
+  }
+  if (Array.isArray(own.hits)) {
+    own.hits = own.hits.map(hit => hydrateModelRefs({ root, value: hit, treeCache }))
+  }
+  return own
 }
 
 const browseIndexWithBackend = async ({
@@ -1331,6 +1421,7 @@ const browseIndexWithBackend = async ({
     indexDir: backendOpts.indexDir,
     ...backendOpts
   })
+  const root = backendOpts.root || backendOpts.indexDir || DEFAULT_INDEX_DIR
   const config = await resolveTypesenseConfig(backendOpts)
   return {
     backend: {
@@ -1342,7 +1433,7 @@ const browseIndexWithBackend = async ({
         apiKey: backendOpts.typesenseApiKey ? 'set' : config.apiKey ? 'default' : 'unset'
       }
     },
-    result
+    result: hydrateModelRefs({ root, value: result })
   }
 }
 
@@ -1356,15 +1447,24 @@ const openLinkWithBackend = async ({
   ...backendOpts
 }) => {
   if (searchBackend !== 'typesense') throw new Error('--search-backend must be typesense')
-  const result = await openLinkTypesense({
-    link,
-    indexId,
-    sessionId,
-    agent,
-    budgetTokens,
-    root: backendOpts.root,
-    indexDir: backendOpts.indexDir,
-    ...backendOpts
+  const parsed = parseSessionLink(link)
+  if (!parsed || !parsed.handle) throw new Error(`Unsupported conversation_history link: ${link}`)
+  let resolvedSessionId = sessionId || parsed.sessionId || ''
+  if (!resolvedSessionId) {
+    const doc = await exactDocument({
+      indexId: indexId || parsed.indexId,
+      agent,
+      handle: parsed.handle,
+      root: backendOpts.root,
+      indexDir: backendOpts.indexDir,
+      ...backendOpts
+    })
+    if (!doc) throw new Error(`Unknown session handle: ${parsed.handle}`)
+    resolvedSessionId = doc.sessionId
+  }
+  const root = backendOpts.root || backendOpts.indexDir || DEFAULT_INDEX_DIR
+  const result = openLink(readSessionTree({ root, sessionId: resolvedSessionId }), link, {
+    budgetTokens
   })
   const config = await resolveTypesenseConfig(backendOpts)
   return {
@@ -1411,7 +1511,10 @@ const searchIndexWithBackend = async ({
   })
   const hits = await search()
   return {
-    hits
+    hits: hydrateModelRefs({
+      root: backendOpts.root || backendOpts.indexDir || DEFAULT_INDEX_DIR,
+      value: hits
+    })
   }
 }
 

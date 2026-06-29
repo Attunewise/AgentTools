@@ -41,22 +41,7 @@ const {
   topicsText
 } = require('./topics.js')
 
-const SUMMARY_SYSTEM_PROMPT = [
-  'You generate loss-minimizing transcript mip summaries for browse and search.',
-  'Summaries route future agents to underlying records; they are navigation state, not evidence.',
-  'Summarize only the supplied child records.',
-  'Be recall-biased because omission is the dangerous failure mode. Remove filler and repetition, not concrete facts.',
-  'Preserve user goals, constraints, decisions, current task state, file paths, ids, commands, errors, dates, model/provider choices, costs, resource usage, test results, and open questions when present.',
-  'Tool call and tool result records with the same tool_call_id are one operation. Keep their facts associated and summarize the operation as a unit.',
-  'For exact quoted phrases, secret markers, numeric codes, credentials, or identifiers, describe that the exact value exists in an underlying child record, but do not copy the exact value into the summary.',
-  'Do not say details are missing, unavailable, not shown, not supplied, or absent unless a child record explicitly says that. If a span ends mid-task, summarize only what is present and omit completeness caveats.',
-  'Do not include child handles, event numbers, or resource links in breadcrumb, summary, or topic text; the index stores those as structured fields.',
-  'Return strict JSON with exactly three fields: {"breadcrumb":"one-or-two-words","summary":"one compact paragraph","topics":["natural-language browse/search topic"]}.',
-  'Breadcrumbs must be lowercase, one or two words, and specific to the child span.',
-  'Topics are the browse/search routing surface. Write natural phrases a user might search for, with concrete anchors and synonyms when useful.',
-  'Do not write compressed tags, camelCase keys, one-word labels, or generic topics such as "implementation", "discussion", "cleanup", "tests", "errors", or "indexing".',
-  'Each topic must name the concrete subject and why it matters in the child span, using enough detail to route navigation without opening the child.'
-].join('\n')
+const SUMMARY_SYSTEM_PROMPT = 'Copy the information, not the wording. Keep all concrete state. Remove filler, repetition, politeness padding, meta-commentary, and verbose restatements. Do not abstract. Do not decide salience unless something is clearly redundant or obsolete. For tool calls summarize the operation, input, and outcome'
 
 const DEFAULT_SUMMARY_MODE = process.env.SESSION_INDEXER_SUMMARY_MODE || 'model'
 const DEFAULT_SUMMARY_PROVIDER = process.env.SESSION_INDEXER_SUMMARY_PROVIDER || 'openai-codex-responses'
@@ -878,32 +863,51 @@ const summaryTargetMaterial = ({ node, childHash, resolved, maxChildChars, input
   maxOutputTokens: resolved.callOptions && (resolved.callOptions.maxTokens || resolved.callOptions.max_tokens || resolved.callOptions.max_output_tokens)
 })
 
-const parseSummary = text => {
+const parseSummary = (text, node) => {
   const raw = String(text || '').trim()
-  const match = raw.match(/\{[\s\S]*\}/)
-  if (match) {
+  if (!raw) return { breadcrumb: '', summary: '', topics: [] }
+  if (/^[\[{]/.test(raw)) {
+    let parsed
     try {
-      const parsed = JSON.parse(match[0])
-      return {
-        breadcrumb: compactText(parsed.breadcrumb || ''),
-        summary: compactText(parsed.summary || ''),
-        topics: normalizeTopics(parsed.topics, { max: 8, maxChars: 220 })
-      }
-    } catch (_err) {}
+      parsed = JSON.parse(raw)
+    } catch (err) {
+      throw new Error(`summary model returned malformed serialized output: ${err.message}`)
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || typeof parsed.summary !== 'string') {
+      throw new Error('summary model returned unsupported serialized output')
+    }
+    const summary = compactText(parsed.summary || '')
+    if (summaryLooksLikeSerializedJson(summary)) {
+      throw new Error('summary model returned invalid summary: summary field contains serialized JSON')
+    }
+    return {
+      breadcrumb: compactText(parsed.breadcrumb || ''),
+      summary,
+      topics: normalizeTopics(parsed.topics, { max: 8, maxChars: 220 })
+    }
   }
-  return { breadcrumb: '', summary: compactText(raw), topics: [] }
+  return {
+    breadcrumb: node ? compactText(nodeBreadcrumb(node)) : '',
+    summary: compactText(raw),
+    topics: []
+  }
 }
 
 const assertSummaryHasBody = (parsed, text) => {
   if (parsed && compactText(parsed.summary)) return parsed
-  const fallback = compactText(text || '')
-  if (fallback) {
-    return {
-      ...(parsed || {}),
-      summary: fallback
-    }
-  }
   throw new Error('summary model returned an empty response')
+}
+
+const summaryLooksLikeSerializedJson = text => {
+  const raw = compactText(text || '')
+  if (!raw) return false
+  if (!/^[\[{]/.test(raw)) return false
+  try {
+    JSON.parse(raw)
+    return true
+  } catch (_err) {
+    return /"breadcrumb"\s*:|"summary"\s*:|"topics"\s*:/.test(raw)
+  }
 }
 
 const emitProgress = (opts, event) => {
@@ -1003,7 +1007,9 @@ const publicJob = job => {
 
 const summaryRecordFromJob = job => ({
   breadcrumb: compactText(job && job.breadcrumb || ''),
-  summary: compactText(job && (job.summary || job.resultSummary || job.head) || ''),
+  summary: summaryLooksLikeSerializedJson(job && (job.summary || job.resultSummary || job.head) || '')
+    ? ''
+    : compactText(job && (job.summary || job.resultSummary || job.head) || ''),
   topics: Array.isArray(job && job.topics) ? job.topics : []
 })
 
@@ -1163,7 +1169,7 @@ const applyBatchResults = ({ results, jobs, mode, resolved }) => {
     const text = messageText(result.message)
     let parsed
     try {
-      parsed = assertSummaryHasBody(parseSummary(text), text)
+      parsed = assertSummaryHasBody(parseSummary(text, job.node), text)
     } catch (err) {
       job.error = err.message
       job.status = 'error'
@@ -1783,7 +1789,7 @@ const summarizeTree = async (tree, opts = {}) => {
             resolved,
             progress: modelProgress
           })
-          parsed = assertSummaryHasBody(parseSummary(observed.text), observed.text)
+          parsed = assertSummaryHasBody(parseSummary(observed.text, node), observed.text)
           break
         } catch (err) {
           if (!isEmptySummaryResponseError(err) || emptyRetryCount >= maxEmptyRetries) {

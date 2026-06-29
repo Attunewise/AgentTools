@@ -1,6 +1,6 @@
 {
   "name": "conversation-history",
-  "version": "0.1.0+codex.20260611071503",
+  "version": "0.1.0+codex.20260629144135",
   "description": "Conversation History recovers prior conversation context from a hierarchical, paged, lossless transcript index.",
   "author": {
     "name": "Conversation History"

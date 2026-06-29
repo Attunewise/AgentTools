@@ -194,18 +194,14 @@ const normalizeReasoning = reasoning => array(reasoning).flatMap(item => {
   if (typeof item === 'string') {
     return [{
       modelFamily: 'unknown',
-      summary: item,
-      encrypted: undefined,
-      signature: undefined,
-      raw: undefined
+      hasSummary: Boolean(item)
     }]
   }
   return [compactObject({
     modelFamily: normalizeModelFamily(item.modelFamily || item.provider || item.model),
-    summary: item.summary,
-    encrypted: item.encrypted || item.encryptedContent || item.encrypted_content,
-    signature: item.signature || item.thoughtSignature || item.openaiSignature,
-    raw: item.raw
+    hasSummary: Boolean(item.hasSummary || item.summary),
+    hasEncrypted: Boolean(item.hasEncrypted || item.encrypted || item.encryptedContent || item.encrypted_content),
+    hasSignature: Boolean(item.hasSignature || item.signature || item.thoughtSignature || item.openaiSignature)
   })]
 })
 

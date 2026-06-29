@@ -387,12 +387,11 @@ const rowToEvent = ({ row, file, sessionId, includeResponseMessages, seenRespons
       type: 'reasoning',
       role: 'assistant',
       at,
-      title: 'reasoning summary',
+      title: 'reasoning record',
       reasoning: [{
         modelFamily: 'openai',
-        summary,
-        encrypted: payload.encrypted_content,
-        raw: payload
+        hasSummary: Boolean(summary),
+        hasEncrypted: Boolean(payload.encrypted_content)
       }],
       source
     }
@@ -440,6 +439,38 @@ const rowToEvent = ({ row, file, sessionId, includeResponseMessages, seenRespons
   return null
 }
 
+const duplicateResponseMessageKey = event => {
+  if (!event || event.type !== 'message') return ''
+  const text = String(event.content || '').replace(/\s+/g, ' ').trim()
+  return text ? `${event.role || ''}\n${text}` : ''
+}
+
+const duplicateResponseMessagePreference = event => {
+  const source = event && event.source || {}
+  if (source.outerType === 'event_msg' && source.payloadType === 'user_message') return 4
+  if (source.outerType === 'response_item' && source.payloadType === 'message' && event.role === 'assistant') return 4
+  if (source.outerType === 'response_item' && source.payloadType === 'message') return 3
+  if (source.outerType === 'event_msg' && source.payloadType === 'agent_message') return 3
+  return 1
+}
+
+const removeDuplicateResponseMessages = events => {
+  const best = new Map()
+  for (const [index, event] of events.entries()) {
+    const key = duplicateResponseMessageKey(event)
+    if (!key) continue
+    const preference = duplicateResponseMessagePreference(event)
+    const previous = best.get(key)
+    if (!previous || preference > previous.preference) {
+      best.set(key, { index, preference })
+    }
+  }
+  return events.filter((event, index) => {
+    const key = duplicateResponseMessageKey(event)
+    return !key || best.get(key).index === index
+  })
+}
+
 const importCodexJsonl = (file, opts = {}) => {
   let sessionId = fallbackSessionIdFromFile(file)
   const compactions = []
@@ -474,7 +505,7 @@ const importCodexJsonl = (file, opts = {}) => {
       row,
       file,
       sessionId,
-      includeResponseMessages: Boolean(opts.includeResponseMessages),
+      includeResponseMessages: opts.includeResponseMessages !== false,
       seenResponseMessages,
       tokenUsageDelta
     })
@@ -506,7 +537,7 @@ const importCodexJsonl = (file, opts = {}) => {
       model: meta && meta.meta && meta.meta.modelProvider,
       modelFamily: normalizeModelFamily(meta && meta.meta && meta.meta.modelProvider)
     },
-    events
+    events: removeDuplicateResponseMessages(events)
   })
 }
 

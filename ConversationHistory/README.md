@@ -35,7 +35,7 @@ node bin/session-indexer.js search_server_status
 node bin/session-indexer.js start_indexing_session --scope this_session_only --this-chat --session-marker conversation_history-session-... --timeout-ms 30000
 node bin/session-indexer.js search --query "emergency handoff"
 node bin/session-indexer.js browse --index-id ...
-node bin/session-indexer.js browse --index-id ... --topic-id topic:v1:... --zoom in
+node bin/session-indexer.js browse --index-id ... --handle 'session/.../event/...' --zoom in
 node bin/session-indexer.js openLink --link 'tool:conversation_history://open?indexId=...&handle=...'
 node bin/session-indexer.js stop_indexing_session --scope this_session_only --this-chat --session-marker conversation_history-session-... --timeout-ms 30000
 node bin/session-indexer.js list_models --filter gpt --limit 10
@@ -65,27 +65,27 @@ Token usage is normalized to the models.dev pricing fields: `input`, `output`, `
 
 Local runtime state defaults to a shared user-level directory: `$SESSION_INDEXER_STATE_DIR`, or otherwise `$XDG_DATA_HOME/session-indexer/.session-indexer` / `~/.local/share/session-indexer/.session-indexer`. That keeps one managed conversation_history Typesense server and collection for all plugin copies and all supported agents on the host. Every indexed record carries a definitive facetable `indexId`, plus facetable `sessionId` and `agent` visibility/filter fields; `--index-dir` is a development/test override. `deploy --target codex` installs the repo as a direct Codex skill. `deploy --target codex-plugin` installs the repo as a local Codex plugin and updates the personal plugin marketplace unless `--no-marketplace` is passed. `deploy --target claude-plugin` installs the repo as a Claude Code plugin under `~/.claude/plugins` and writes a Claude marketplace entry; the deploy output prints the `claude plugin marketplace add` / `claude plugin install` commands to finish installation.
 
-For team distribution through Codex, the public repo at `https://github.com/unktomi/ConversationHistory` includes a Git-backed marketplace at `.agents/plugins/marketplace.json`. Teammates can install from the repo rather than from a local path:
+Durable transcript-derived state is JSONL. `sessions/*.ir.jsonl` is a source-pointer header that preserves the published `indexId`, source path/fingerprint, and session metadata; it does not store transcript leaves or generated summaries. `sessions/*.docs.jsonl` stores compact document metadata, and `sessions/*.summary-targets.jsonl` stores completed summary targets. Typesense stores searchable/navigation fields only, not raw leaf content. `openLink` resolves a link to its session and then renders from source JSONL plus completed summary targets, so exact evidence comes from the transcript source rather than the search index.
+
+For team distribution through Codex, the public AgentTools repo at `https://github.com/Attunewise/AgentTools` includes a Git-backed marketplace at `.agents/plugins/marketplace.json`. Add the marketplace from the repo rather than installing from a local path:
 
 ```sh
-codex plugin marketplace add https://github.com/unktomi/ConversationHistory.git
-codex plugin add conversation-history@conversation_history
+codex plugin marketplace add https://github.com/Attunewise/AgentTools.git
 ```
 
-After install, start a new Codex thread so the bundled skills and MCP tools are loaded. To pick up later plugin changes, refresh the marketplace and reinstall the plugin:
+Then install `conversation-history` from the Codex plugin marketplace UI. After install, start a new Codex thread so the bundled skills and MCP tools are loaded. To pick up later plugin changes, refresh the marketplace and reinstall the plugin:
 
 ```sh
-codex plugin marketplace upgrade conversation_history
-codex plugin add conversation-history@conversation_history
+codex plugin marketplace upgrade agenttools
 ```
 
-The marketplace entry points back to the repo root as the plugin source, so Codex installs a cached copy of the Git version under `~/.codex/plugins/cache/conversation_history/conversation-history/<version>/`.
+The marketplace entry points to `./ConversationHistory` inside the AgentTools repo, so Codex installs a cached copy of the Git version under `~/.codex/plugins/cache/agenttools/conversation-history/<version>/`.
 
 Deploy defaults to `--mode copy`; symlink installs are only an explicit opt-in development mode. The MCP server is a thin process that spawns the CLI fresh for every tool call, so edits copied into the deployed package take effect on the next tool call without restarting the host. Only edits to `src/mcpServer.js` itself — the MCP tool surface (tool names, input schemas, argument mapping) — require reloading the plugin host. The installed Claude plugin injects `SESSION_INDEXER_DEPLOY_TARGET=claude-plugin` into its MCP launch env so `redeploy_session_index_mcp` redeploys the correct plugin for the host it is running in.
 
 Search uses the existing conversation_history index. There is no fallback search mode exposed to agents.
 
-`search` and `browse` never summarize or import source sessions on demand. For normal retrieval questions, search the existing index first. Use `start_indexing_session` only when the user explicitly asks to index, refresh, or watch a session, or after permission when the needed index is absent; it starts a watcher running in the background indexing new turns as they occur, so that upon compaction the user and model do not experience reindexing latency.
+`search` and `browse` never summarize or import source sessions on demand. Current-session indexing is a background continuity service: start it once for the session, keep it watching new turns, and use `conversation_index_status` to report machine-readable progress when retrieval runs before the index is ready.
 
 When resolving the current session, use `--this-chat --session-marker conversation_history-session-{guid}`. The resolver searches source session files for that literal marker and refuses to choose a session from recency alone. If the marker appears in multiple Codex files because a session was forked, CodexSessionTools uses Codex's thread spawn graph to choose the descendant thread when there is exactly one leaf candidate; otherwise duplicate marker matches still fail closed.
 
