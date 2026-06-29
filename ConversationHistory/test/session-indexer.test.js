@@ -3802,6 +3802,25 @@ test('copy deploy installs vendored local dependencies without dangling symlinks
   assert.ok(fs.existsSync(path.resolve(pluginDest, 'node_modules', linkTarget, 'package.json')))
 })
 
+test('plugin package starts when file-dependency link is absent', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-deploy-vendor-fallback-'))
+  const pluginDest = path.join(root, 'plugins', 'conversation-history')
+  deploySkill({
+    target: 'codex-plugin',
+    dest: pluginDest,
+    marketplacePath: path.join(root, 'marketplace.json'),
+    force: true,
+    installDependencies: true
+  })
+
+  fs.rmSync(path.join(pluginDest, 'node_modules', 'codex-session-tools'), { recursive: true, force: true })
+  const help = childProcess.execFileSync(process.execPath, ['bin/session-indexer.js', '--help'], {
+    cwd: pluginDest,
+    encoding: 'utf8'
+  })
+  assert.match(help, /session-indexer index/)
+})
+
 test('deploys repo as a Pi skill package', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-pi-deploy-'))
   const result = deploySkill({

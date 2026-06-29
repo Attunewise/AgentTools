@@ -7,10 +7,14 @@ const os = require('os')
 const path = require('path')
 const { z } = require('zod')
 const {
+  loadCodexSessionTools,
+  loadCodexSessionToolsClient
+} = require('./codexSessionTools.js')
+const {
   readFileWindow,
   walkJsonlFiles: walkCodexJsonlFiles
-} = require('codex-session-tools')
-const { connectOrStartCodexSessionServer } = require('codex-session-tools/src/client.js')
+} = loadCodexSessionTools()
+const { connectOrStartCodexSessionServer } = loadCodexSessionToolsClient()
 const { createMcpLogger, installMcpProcessLogging } = require('./mcpLog.js')
 
 const REPO_ROOT = path.resolve(__dirname, '..')

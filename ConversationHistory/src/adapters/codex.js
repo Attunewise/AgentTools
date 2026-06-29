@@ -7,11 +7,13 @@ const {
   normalizeUsage,
   USAGE_FIELDS
 } = require('../ir.js')
+const { loadCodexSessionTools } = require('../codexSessionTools.js')
+
 const {
   latestCodexSessionFile: latestCodexSessionFileFromTools,
   resolveCodexSessionForMarker,
   walkJsonlFiles: walkCodexJsonlFiles
-} = require('codex-session-tools')
+} = loadCodexSessionTools()
 const {
   hashString,
   preview,
