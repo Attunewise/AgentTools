@@ -1,0 +1,19 @@
+{
+  "name": "codex-session-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "src/index.js",
+  "bin": {
+    "codex-session-server": "bin/codex-session-server.js",
+    "codex-session-mcp": "bin/codex-session-mcp.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check bin/*.js src/*.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.67"
+  }
+}

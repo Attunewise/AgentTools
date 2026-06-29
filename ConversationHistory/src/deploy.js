@@ -11,7 +11,16 @@ const LOCAL_FILE_DEPENDENCIES = [{
   sourceDir: path.resolve(REPO_ROOT, '..', 'CodexSessionTools'),
   oldPackageLockKey: '../CodexSessionTools',
   vendorRelativeDir: path.join('vendor', 'CodexSessionTools'),
-  deployedSpec: 'file:vendor/CodexSessionTools'
+  deployedSpec: 'file:vendor/CodexSessionTools',
+  exclude: [
+    '.codex-plugin',
+    '.claude-plugin',
+    '.mcp.json',
+    'CodexSessionTools.doc',
+    'CodexSessionTools.md',
+    'skills',
+    'test'
+  ]
 }]
 
 const defaultCodexSkillDir = () => {
@@ -91,7 +100,7 @@ const copyRepo = (dest) => {
   })
 }
 
-const copyPackageDir = (sourceRoot, dest) => {
+const copyPackageDir = (sourceRoot, dest, { exclude = [] } = {}) => {
   fs.rmSync(dest, { recursive: true, force: true })
   fs.cpSync(sourceRoot, dest, {
     recursive: true,
@@ -105,7 +114,8 @@ const copyPackageDir = (sourceRoot, dest) => {
         'node_modules',
         'coverage',
         'tmp'
-      ].some(name => rel === name || rel.startsWith(`${name}${path.sep}`))
+      ].some(name => rel === name || rel.startsWith(`${name}${path.sep}`)) &&
+        !exclude.some(name => rel === name || rel.startsWith(`${name}${path.sep}`))
     }
   })
 }
@@ -153,7 +163,7 @@ const materializeLocalFileDependencies = target => {
       throw new Error(`missing local dependency package: ${source}`)
     }
     const vendorDest = path.join(target, dependency.vendorRelativeDir)
-    copyPackageDir(source, vendorDest)
+    copyPackageDir(source, vendorDest, { exclude: dependency.exclude || [] })
     rewritePackageJsonLocalDependencies(target, dependency)
     rewritePackageLockLocalDependencies(target, dependency)
   }

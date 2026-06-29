@@ -16,7 +16,7 @@
     "@aws-sdk/client-bedrock-runtime": "^3.1062.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "chokidar": "^4.0.3",
-    "codex-session-tools": "file:../CodexSessionTools",
+    "codex-session-tools": "file:vendor/CodexSessionTools",
     "rxjs": "^7.8.2"
   }
 }
