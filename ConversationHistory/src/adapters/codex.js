@@ -26,15 +26,63 @@ const DEFAULT_SESSIONS_ROOT = path.join(os.homedir(), '.codex', 'sessions')
 const DEFAULT_SESSION_INDEX = path.join(os.homedir(), '.codex', 'session_index.jsonl')
 const DEFAULT_SESSION_MARKER_SCAN_BYTES = 8 * 1024 * 1024
 const DEFAULT_SESSION_MARKER_SCAN_LIMIT = 100
+const INLINE_DATA_URL_RE = /\bdata:([A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+)(?:;[^,\s"'<>]*)?,[^\s"'<>]+/g
+
+const inlineDataPlaceholder = mime => {
+  if (mime && mime.startsWith('image/')) return `[inline ${mime} data omitted]`
+  if (mime && mime.startsWith('audio/')) return `[inline ${mime} data omitted]`
+  if (mime && mime.startsWith('video/')) return `[inline ${mime} data omitted]`
+  return '[inline data omitted]'
+}
+
+const sanitizeInlineDataUrls = value => String(value || '').replace(INLINE_DATA_URL_RE, (_match, mime) => inlineDataPlaceholder(mime))
+
+const mediaUrlValue = part => {
+  const value = part && (part.image_url !== undefined ? part.image_url : part.url)
+  if (typeof value === 'string') return value
+  if (value && typeof value === 'object') return value.url || value.image_url || ''
+  return ''
+}
+
+const mediaDetailValue = part => {
+  const imageUrl = part && part.image_url
+  if (imageUrl && typeof imageUrl === 'object' && imageUrl.detail) return imageUrl.detail
+  return part && part.detail
+}
+
+const isMediaPart = part => part && typeof part === 'object' && (
+  part.type === 'input_image' ||
+  part.type === 'image_url' ||
+  part.type === 'image' ||
+  part.image_url !== undefined
+)
+
+const renderMediaPart = part => {
+  const rawUrl = mediaUrlValue(part)
+  const detail = mediaDetailValue(part)
+  const ref = rawUrl ? sanitizeInlineDataUrls(rawUrl) : 'attached image'
+  const suffix = detail ? `; detail=${sanitizeInlineDataUrls(detail)}` : ''
+  return `[image: ${preview(ref, 240)}${suffix}]`
+}
+
+const sanitizeMediaPayload = value => {
+  if (typeof value === 'string') return sanitizeInlineDataUrls(value)
+  if (Array.isArray(value)) return value.map(item => sanitizeMediaPayload(item))
+  if (!value || typeof value !== 'object') return value
+  const out = {}
+  for (const [key, item] of Object.entries(value)) out[key] = sanitizeMediaPayload(item)
+  return out
+}
 
 const contentText = content => {
   if (content == null) return ''
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return stableStringify(content)
+  if (typeof content === 'string') return sanitizeInlineDataUrls(content)
+  if (!Array.isArray(content)) return stableStringify(sanitizeMediaPayload(content))
   return content.map(part => {
     if (!part) return ''
-    if (typeof part === 'string') return part
-    return part.text || part.input_text || part.output_text || stableStringify(part)
+    if (typeof part === 'string') return sanitizeInlineDataUrls(part)
+    if (isMediaPart(part)) return renderMediaPart(part)
+    return sanitizeInlineDataUrls(part.text || part.input_text || part.output_text || stableStringify(sanitizeMediaPayload(part)))
   }).filter(Boolean).join('\n')
 }
 
@@ -144,8 +192,12 @@ const toolCall = payload => ({
 })
 
 const toolResultOutput = payload => {
-  if (payload.output !== undefined) return payload.output
-  return stableStringify(payload)
+  if (payload.output !== undefined) {
+    return typeof payload.output === 'string'
+      ? sanitizeInlineDataUrls(payload.output)
+      : stableStringify(sanitizeMediaPayload(payload.output))
+  }
+  return stableStringify(sanitizeMediaPayload(payload))
 }
 
 const shallowPayload = payload => {
@@ -271,8 +323,8 @@ const rowToEvent = ({ row, file, sessionId, includeResponseMessages, seenRespons
       at,
       title: 'user message',
       content: [
-        payload.message || '',
-        attachments.length ? `attachments/text elements:\n${stableStringify(attachments)}` : ''
+        sanitizeInlineDataUrls(payload.message || ''),
+        attachments.length ? `attachments/text elements:\n${stableStringify(sanitizeMediaPayload(attachments))}` : ''
       ].filter(Boolean).join('\n'),
       source,
       meta: {
@@ -287,7 +339,7 @@ const rowToEvent = ({ row, file, sessionId, includeResponseMessages, seenRespons
       role: 'assistant',
       at,
       title: payload.phase ? `assistant message (${payload.phase})` : 'assistant message',
-      content: payload.message || '',
+      content: sanitizeInlineDataUrls(payload.message || ''),
       source,
       meta: {
         phase: payload.phase,

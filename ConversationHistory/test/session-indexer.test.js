@@ -221,6 +221,57 @@ test('Codex adapter emits tool-independent coding session IR', () => {
   assert.deepEqual(ir.source.fingerprint, codexSessionFingerprint(fixture))
 })
 
+test('Codex adapter omits inline media blobs from model-facing text', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-indexer-codex-media-'))
+  const file = path.join(root, 'rollout-media-11111111-1111-4111-8111-111111111111.jsonl')
+  const dataUrl = `data:image/png;base64,${'A'.repeat(4096)}`
+  writeJsonl(file, [
+    {
+      timestamp: '2026-06-05T00:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: 'media-session', cwd: '/tmp/project', model_provider: 'openai' }
+    },
+    {
+      timestamp: '2026-06-05T00:00:01.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'user_message',
+        client_id: 'user_msg_media_1',
+        message: `Please inspect this.\n<image>{"type":"input_image","image_url":"${dataUrl}","detail":"high"}</image>`,
+        images: [{ type: 'input_image', image_url: dataUrl, detail: 'high' }]
+      }
+    },
+    {
+      timestamp: '2026-06-05T00:00:02.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Please inspect this too.' },
+          { type: 'input_image', image_url: dataUrl, detail: 'high' }
+        ]
+      }
+    },
+    {
+      timestamp: '2026-06-05T00:00:03.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call_output',
+        call_id: 'call_media',
+        output: JSON.stringify({ screenshot: dataUrl })
+      }
+    }
+  ])
+
+  const ir = importCodexJsonl(file)
+  const rendered = JSON.stringify(ir.events)
+  assert.equal(rendered.includes(dataUrl), false)
+  assert.equal(rendered.includes('data:image'), false)
+  assert.match(rendered, /\[inline image\/png data omitted\]/)
+  assert.match(rendered, /Please inspect this/)
+})
+
 test('Codex sessions convert to Pi v3 JSONL entries', async () => {
   const ir = importCodexJsonl(fixture)
   const converted = piEntriesFromIr(ir)
