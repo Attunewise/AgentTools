@@ -28,7 +28,7 @@ The IR is coding-tool independent. It preserves model-family-specific reasoning 
 npm install
 npm test
 
-node bin/session-indexer-mcp.js
+./bin/session-indexer-mcp
 
 node bin/session-indexer.js inspect --source codex --latest
 node bin/session-indexer.js search_server_status
@@ -80,6 +80,8 @@ codex plugin marketplace upgrade agenttools
 ```
 
 The marketplace entry points to `./ConversationHistory` inside the AgentTools repo, so Codex installs a cached copy of the Git version under `~/.codex/plugins/cache/agenttools/conversation-history/<version>/`.
+
+The installed Codex MCP command is `./bin/session-indexer-mcp`. That shell launcher downloads a checksum-verified Node runtime into the installed plugin cache under `.runtime/node` on first start, then execs `bin/session-indexer-mcp.js` with that plugin-local Node.
 
 Deploy defaults to `--mode copy`; symlink installs are only an explicit opt-in development mode. The MCP server is a thin process that spawns the CLI fresh for every tool call, so edits copied into the deployed package take effect on the next tool call without restarting the host. Only edits to `src/mcpServer.js` itself — the MCP tool surface (tool names, input schemas, argument mapping) — require reloading the plugin host. The installed Claude plugin injects `SESSION_INDEXER_DEPLOY_TARGET=claude-plugin` into its MCP launch env so `redeploy_session_index_mcp` redeploys the correct plugin for the host it is running in.
 
