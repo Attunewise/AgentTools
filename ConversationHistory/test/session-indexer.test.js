@@ -4458,6 +4458,7 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.ok(names.includes('conversation_search'))
     assert.ok(names.includes('conversation_openLink'))
     assert.ok(names.includes('conversation_index_status'))
+    assert.ok(names.includes('conversation_history_poll'))
     assert.ok(names.includes('start_indexing_session'))
     assert.ok(names.includes('reset_session_index'))
     assert.ok(names.includes('redeploy_session_index_mcp'))
@@ -4532,6 +4533,55 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.doesNotMatch(prompt.messages[0].content.text, /start_indexing_session first/)
     assert.doesNotMatch(prompt.messages[0].content.text, /typesense|backend|serverIndex|search_backend|search-backend/i)
 
+    const pollPendingOperation = async (pending, label) => waitUntil(async () => {
+      const result = (await client.callTool({
+        name: 'conversation_history_poll',
+        arguments: {
+          operation_id: pending.operationId
+        }
+      })).structuredContent.result
+      return result.status === 'pending' ? null : result
+    }, { timeoutMs: 10000, pollMs: 250, label })
+
+    const callResolvedTool = async ({ name, args, label }) => {
+      const result = (await client.callTool({
+        name,
+        arguments: args || {}
+      })).structuredContent.result
+      if (result.schema === 'conversation_history.async_operation.v1' && result.status === 'pending') {
+        return pollPendingOperation(result, label || `${name} completion`)
+      }
+      return result
+    }
+
+    const firstStatus = await client.callTool({
+      name: 'conversation_index_status',
+      arguments: {
+        start_at: 0,
+        limit: 1
+      }
+    })
+    assert.notEqual(firstStatus.isError, true)
+    const pendingStatus = firstStatus.structuredContent.result
+    assert.equal(pendingStatus.schema, 'conversation_history.async_operation.v1')
+    assert.equal(pendingStatus.status, 'pending')
+    assert.equal(pendingStatus.reason, 'current_session_pending')
+    assert.equal(pendingStatus.operation, 'conversation_index_status')
+    assert.match(pendingStatus.operationId, /^conversation_history-op-[0-9a-f-]{36}$/)
+    assert.match(pendingStatus.sessionMarker, /^conversation_history-session-[0-9a-f-]{36}$/)
+    assert.equal(pendingStatus.poll.tool, 'conversation_history_poll')
+    appendJsonl(currentSessionFile, [{
+      timestamp: '2026-06-05T00:00:08.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call_output',
+        call_id: 'conversation_index_status',
+        output: JSON.stringify({ sessionMarker: pendingStatus.sessionMarker })
+      }
+    }])
+    const polledStatus = await pollPendingOperation(pendingStatus, 'conversation_history_poll status completion')
+    assert.equal(polledStatus.schema, 'session-indexer.index_status.v1')
+
     const startTime = Date.now()
     const startedIndexing = (await client.callTool({
       name: 'start_indexing_session',
@@ -4553,12 +4603,25 @@ test('MCP server exposes native conversation search and openLink tools', async (
       }
     }])
 
-    const browseRoot = (await client.callTool({
+    await waitUntil(async () => {
+      const status = (await client.callTool({
+        name: 'conversation_index_status',
+        arguments: {
+          start_at: 0,
+          limit: 1
+        }
+      })).structuredContent.result
+      if (status.status === 'pending') return null
+      return status.sessions && status.sessions[0] && status.sessions[0].state === 'ready' ? status : null
+    }, { timeoutMs: 10000, pollMs: 250, label: 'current session index ready' })
+
+    const browseRoot = await callResolvedTool({
       name: 'conversation_browse',
-      arguments: {
+      args: {
         limit: 1
-      }
-    })).structuredContent.result
+      },
+      label: 'browse root completion'
+    })
     assert.equal(browseRoot.schema, 'session-indexer.browse.v1')
     assert.equal(browseRoot.zoom, 'children')
     assert.equal(browseRoot.handle, 'root')
@@ -4578,13 +4641,14 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.equal(Object.hasOwn(browseRoot.children[0], 'usage'), false)
     assert.equal(Object.hasOwn(browseRoot.children[0], 'topic_id'), false)
 
-    const statusResult = (await client.callTool({
+    const statusResult = await callResolvedTool({
       name: 'conversation_index_status',
-      arguments: {
+      args: {
         start_at: 0,
         limit: 1
-      }
-    })).structuredContent.result
+      },
+      label: 'status completion'
+    })
     assert.equal(statusResult.schema, 'session-indexer.index_status.v1')
     assert.equal(Object.hasOwn(statusResult, 'indexedSessionCount'), false)
     assert.equal(Object.hasOwn(statusResult, 'requestedSessionCount'), false)
@@ -4600,38 +4664,41 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.equal(statusResult.sessions[0].summaryTargetStore.targetCount, 0)
     assert.equal(Object.hasOwn(statusResult.sessions[0], 'nextStatusPoll'), false)
 
-    const browseSecondPage = (await client.callTool({
+    const browseSecondPage = await callResolvedTool({
       name: 'conversation_browse',
-      arguments: {
+      args: {
         start: 1,
         limit: 1
-      }
-    })).structuredContent.result
+      },
+      label: 'browse second page completion'
+    })
     assert.equal(browseSecondPage.page.start, 1)
     assert.equal(browseSecondPage.page.returned, 1)
     assert.notEqual(browseSecondPage.children[0].handle, browseRoot.children[0].handle)
     assert.equal(browseSecondPage.children[0].index, '5/5')
 
-    const zoomedBrowse = (await client.callTool({
+    const zoomedBrowse = await callResolvedTool({
       name: 'conversation_browse',
-      arguments: {
+      args: {
         handle: browseRoot.children[0].handle,
         zoom: 'in',
         limit: 1
-      }
-    })).structuredContent.result
+      },
+      label: 'zoomed browse completion'
+    })
     assert.equal(zoomedBrowse.zoom, 'in')
     assert.equal(zoomedBrowse.handle, browseRoot.children[0].handle)
     assert.equal(Object.hasOwn(zoomedBrowse, 'topic_id'), false)
     assert.equal(Object.hasOwn(zoomedBrowse, 'selected_topic_id'), false)
 
-    const scopedSearch = (await client.callTool({
+    const scopedSearch = await callResolvedTool({
       name: 'conversation_search',
-      arguments: {
+      args: {
         query: 'clientRevision',
         limit: 1
-      }
-    })).structuredContent.result
+      },
+      label: 'scoped search completion'
+    })
     assert.equal(scopedSearch.schema, 'session-indexer.search.v1')
     assert.equal(scopedSearch.hits.length, 1)
     assert.equal(Object.hasOwn(scopedSearch.hits[0], 'session_id'), false)
@@ -4708,6 +4775,18 @@ test('MCP server exposes native conversation search and openLink tools', async (
       assert.equal(activeChanged.sessions[0].nextStatusPoll.retryAfterMs, 15000)
       assert.equal(activeChanged.sessions[0].nextStatusPoll.backoff.currentMs, 15000)
 
+      const activeSearch = (await client.callTool({
+        name: 'conversation_search',
+        arguments: {
+          query: 'clientRevision',
+          limit: 1
+        }
+      })).structuredContent.result
+      assert.equal(activeSearch.schema, 'conversation_history.async_operation.v1')
+      assert.equal(activeSearch.status, 'pending')
+      assert.equal(activeSearch.reason, 'current_session_indexing')
+      assert.equal(activeSearch.operation, 'conversation_search')
+
       writeJobState({
         root,
         state: {
@@ -4737,6 +4816,19 @@ test('MCP server exposes native conversation search and openLink tools', async (
       assert.equal(suspended.sessions[0].nextStatusPoll.retryAt, null)
       assert.match(suspended.sessions[0].nextStatusPoll.message, /Indexing is suspended/)
     } finally {
+      writeJobState({
+        root,
+        state: {
+          jobId: 'mcp-status-backoff',
+          scope: 'this_session_only',
+          source: 'codex',
+          sessions: [ir.source.path],
+          status: 'stopped',
+          progress: {
+            phase: 'stopped'
+          }
+        }
+      })
       if (!statusWorker.killed) statusWorker.kill('SIGTERM')
       await Promise.race([
         new Promise(resolve => statusWorker.once('exit', resolve)),
@@ -4744,14 +4836,14 @@ test('MCP server exposes native conversation search and openLink tools', async (
       ])
     }
 
-    const searched = await client.callTool({
+    const searchResult = await callResolvedTool({
       name: 'conversation_search',
-      arguments: {
+      args: {
         query: 'clientRevision',
         limit: 1
-      }
+      },
+      label: 'search completion'
     })
-    const searchResult = searched.structuredContent.result
     assert.equal(searchResult.schema, 'session-indexer.search.v1')
     assert.equal(Object.hasOwn(searchResult, 'indexStatus'), false)
     assert.equal(Object.hasOwn(searchResult, 'searchBackend'), false)
@@ -4768,14 +4860,14 @@ test('MCP server exposes native conversation search and openLink tools', async (
     assert.match(searchResult.hits[0].text, /clientRevision 7/)
     assert.doesNotMatch(JSON.stringify(searchResult), /atlas/)
 
-    const opened = await client.callTool({
+    const openResult = await callResolvedTool({
       name: 'conversation_openLink',
-      arguments: {
+      args: {
         handle: searchResult.hits[0].handle,
         budget_tokens: 2000
-      }
+      },
+      label: 'openLink completion'
     })
-    const openResult = opened.structuredContent.result
     assert.equal(openResult.schema, 'session-indexer.openLink.v1')
     assert.match(openResult.content, /clientRevision 7/i)
     assert.doesNotMatch(JSON.stringify(openResult), /mini-session|index_id|session_id/)
@@ -4802,8 +4894,13 @@ test('MCP server exposes native conversation search and openLink tools', async (
         limit: 1
       }
     })
-    assert.equal(missingBrowse.structuredContent.result.status, 'not_indexed')
+    assert.equal(missingBrowse.structuredContent.result.schema, 'conversation_history.async_operation.v1')
+    assert.equal(missingBrowse.structuredContent.result.status, 'pending')
     assert.equal(missingBrowse.structuredContent.result.reason, 'current_session_not_indexed')
+    await client.callTool({
+      name: 'stop_indexing_session',
+      arguments: {}
+    })
   } finally {
     await client.close()
   }

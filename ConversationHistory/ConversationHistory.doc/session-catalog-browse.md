@@ -13,9 +13,9 @@ scope:
 
 ConversationHistory supports a top-level browse above individual sessions.
 
-The CLI `browse` command without `--index-id` returns a manifest-backed session catalog. In the MCP surface, `conversation_browse` defaults to the current Codex session when neither `index_id` nor `session_id` is supplied; callers must pass `all_sessions: true` to request the shared session catalog. If the MCP cannot resolve the current thread through its response marker, it returns an empty scoped result rather than substituting the global catalog.
+The CLI `browse` command without `--index-id` returns a manifest-backed session catalog. In the MCP surface, `conversation_browse` is current-session scoped and does not expose the shared catalog as a fallback. If the MCP cannot resolve the current thread through its response marker, or if the current-session index cannot satisfy the browse immediately, it returns `conversation_history.async_operation.v1`; callers poll `conversation_history_poll` until the original browse response is ready or blocked.
 
-The catalog path must not import transcripts, start indexing, query Typesense, read every IR file, or inspect full session trees. It reads only the persisted manifest and returns a compact page.
+The catalog path must not import transcripts, start indexing, query Typesense, read every IR file, or inspect full session trees. It reads only the persisted manifest and returns a compact page. Current-session MCP browse may start or reuse background indexing before returning a pending operation, but it must not perform that indexing inline before answering the tool call.
 
 The catalog rows include the minimum fields needed to decide where to drill down:
 
@@ -28,6 +28,6 @@ The catalog rows include the minimum fields needed to decide where to drill down
 
 The page shape uses `level: "sessions"` and `page.start`, `page.limit`, `page.returned`, `page.total`, and optional `page.next_start`.
 
-When `index_id` is supplied, `conversation_browse` drills into that one transcript hierarchy and uses returned `topic_id` values for navigation. `session_id` remains a visibility filter rather than the canonical browse identity.
+When `index_id` is supplied at the CLI layer, browse drills into that one transcript hierarchy and uses returned `topic_id` values for navigation. The MCP surface hides raw `index_id`, `session_id`, `topic_id`, and resource links from the model and instead exposes compact handles such as `root` and `event/...` for follow-up navigation.
 
 Newly written indexes persist `turnCount` and `shortSummary` in the manifest so catalog pages do not have to read IR files. Older sessions may omit these fields until reindexed.

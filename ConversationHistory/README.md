@@ -57,6 +57,7 @@ MCP tools:
 - `conversation_browse`
 - `conversation_openLink`
 - `conversation_index_status` with required `start_at` and `limit`
+- `conversation_history_poll`
 - `start_indexing_session`
 - `stop_indexing_session`
 - `reset_session_index`
@@ -90,7 +91,7 @@ Deploy defaults to `--mode copy`; symlink installs are only an explicit opt-in d
 
 Search uses the existing conversation_history index. There is no fallback search mode exposed to agents.
 
-`search` and `browse` never summarize or import source sessions on demand. Current-session indexing is a background continuity service: start it once for the session, keep it watching new turns, and use `conversation_index_status` to report machine-readable progress when retrieval runs before the index is ready.
+`search`, `browse`, and `openLink` never summarize or import source sessions inline. If the current session is not bound yet, or if the current session index cannot satisfy a request yet, the MCP tool returns a pending `conversation_history.async_operation.v1` result with an `operationId` and a generated response marker. Call `conversation_history_poll` with that `operation_id`; polling resolves the marker, waits for the background index to become usable, and then returns the original tool's real response.
 
 When resolving the current session, use `--this-chat --session-marker conversation_history-session-{guid}`. The resolver searches source session files for that literal marker and refuses to choose a session from recency alone. If the marker appears in multiple Codex files because a session was forked, CodexSessionTools uses Codex's thread spawn graph to choose the descendant thread when there is exactly one leaf candidate; otherwise duplicate marker matches still fail closed.
 

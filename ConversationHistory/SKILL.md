@@ -9,13 +9,13 @@ metadata:
 
 Active context can compact. conversation_history keeps the conversation outside the context window as a hierarchy.
 
-Search finds candidate regions. Browse moves through the hierarchy by handle and zoom. OpenLink spends a bounded token budget on source text.
+Search finds candidate regions. Browse moves through the hierarchy by handle and zoom. OpenLink spends a bounded token budget on source text. If a tool returns a pending `operationId`, call `conversation_history_poll` with that id until it returns the real response or a blocked/not_found state.
 
 Higher zoom levels are compact navigation. The lowest zoom level is lossless. Trust opened source when `isVerbatim` is true.
 
 Keep recovery incremental: search or browse first, open the smallest relevant link, and increase `budget_tokens` on the same link when `omittedTokenCount` is nonzero. Do not fill gaps from memory when the transcript can be recovered.
 
-If the tools are not visible, call `tool_search` for `conversation_history conversation_search conversation_browse conversation_openLink conversation_index_status`.
+If the tools are not visible, call `tool_search` for `conversation_history conversation_search conversation_browse conversation_openLink conversation_index_status conversation_history_poll`.
 
 ## Functions
 
@@ -23,6 +23,7 @@ If the tools are not visible, call `tool_search` for `conversation_history conve
 - `conversation_browse`: navigate the current-session hierarchy. Inputs include `handle`, `zoom`, `start`, `limit`, and `agent`.
 - `conversation_openLink`: open a search or browse handle with a token budget. Inputs include `handle`, `budget_tokens`, and `agent`. Outputs include `isVerbatim` and `omittedTokenCount`.
 - `conversation_index_status`: inspect current-session index status. Inputs include `start_at` and `limit`.
+- `conversation_history_poll`: poll a pending operation returned by another conversation_history tool. Inputs include `operation_id`.
 - `start_indexing_session`: start or reuse background indexing.
 - `stop_indexing_session`: stop background indexing.
 - `reset_session_index`: clear persisted indexes.

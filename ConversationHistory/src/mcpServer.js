@@ -22,6 +22,10 @@ const SESSION_MARKER_SCAN_BYTES = 8 * 1024 * 1024
 const STATUS_POLL_INITIAL_MS = 15_000
 const STATUS_POLL_MAX_MS = 120_000
 const STATUS_POLL_ESTIMATE_BUFFER_MS = 1_000
+const ASYNC_OPERATION_PREFIX = 'conversation_history-op-'
+const ASYNC_OPERATION_TTL_MS = 30 * 60 * 1000
+const ASYNC_POLL_RETRY_MS = 1_000
+const ASYNC_INDEX_POLL_RETRY_MS = 2_000
 
 const statusPollMemory = new Map()
 const codexSessionClients = new Map()
@@ -350,6 +354,55 @@ const callConversationHistory = async argv => {
   return parseCliResult(await runCli(argv))
 }
 
+const cloneJson = value => JSON.parse(JSON.stringify(value || {}))
+
+const asyncOperationId = () => `${ASYNC_OPERATION_PREFIX}${crypto.randomUUID()}`
+
+const pendingMessageFor = reason => {
+  if (reason === 'current_session_pending') return 'conversation_history is binding this request to the current Codex session.'
+  if (reason === 'current_session_not_indexed') return 'conversation_history is indexing the current Codex session before answering this request.'
+  if (reason === 'current_session_indexing') return 'conversation_history is waiting for the current Codex session index to become ready.'
+  return 'conversation_history is still preparing this request.'
+}
+
+const pendingOperationPayload = ({
+  operation,
+  reason,
+  message,
+  retryAfterMs = ASYNC_POLL_RETRY_MS,
+  current,
+  indexing
+}) => ({
+  schema: 'conversation_history.async_operation.v1',
+  status: 'pending',
+  reason,
+  message: message || pendingMessageFor(reason),
+  operationId: operation.id,
+  operation: operation.name,
+  sessionMarker: operation.sessionMarker,
+  createdAt: operation.createdAt,
+  updatedAt: operation.updatedAt,
+  poll: {
+    tool: 'conversation_history_poll',
+    operation_id: operation.id,
+    retryAfterMs,
+    retryAt: retryAtFrom(Date.now(), retryAfterMs)
+  },
+  ...(current ? { scope: currentScopeForResult(current) } : {}),
+  ...(indexing ? { indexing } : {})
+})
+
+const terminalAsyncPayload = ({ operation, status, reason, message, current }) => ({
+  schema: 'conversation_history.async_operation.v1',
+  status,
+  reason,
+  message,
+  operationId: operation && operation.id,
+  operation: operation && operation.name,
+  ...(operation && operation.sessionMarker ? { sessionMarker: operation.sessionMarker } : {}),
+  ...(current ? { scope: currentScopeForResult(current) } : {})
+})
+
 const parseTimeMs = value => {
   const time = Date.parse(value)
   return Number.isFinite(time) ? time : null
@@ -498,11 +551,23 @@ const runCliSyncQuiet = argv => {
 
 const createPluginLifecycle = () => {
   const indexRoots = new Set()
+  const asyncOperations = new Map()
+  const indexingStarts = new Map()
   let currentSessionMarker = ''
   let cleaned = false
   const rootArgs = root => root ? ['--index-dir', root] : []
+  const pruneAsyncOperations = () => {
+    const now = Date.now()
+    for (const [id, operation] of asyncOperations) {
+      if (now - operation.updatedAtMs > ASYNC_OPERATION_TTL_MS) asyncOperations.delete(id)
+    }
+  }
   return {
     currentSessionMarker() {
+      return currentSessionMarker
+    },
+    ensureCurrentSessionMarker(marker) {
+      currentSessionMarker = stringArg(marker) || currentSessionMarker || makeSessionMarker()
       return currentSessionMarker
     },
     setCurrentSessionMarker(marker) {
@@ -512,12 +577,51 @@ const createPluginLifecycle = () => {
     clearCurrentSessionMarker(marker) {
       if (!marker || marker === currentSessionMarker) currentSessionMarker = ''
     },
+    createAsyncOperation({ name, args, sessionMarker }) {
+      pruneAsyncOperations()
+      const now = new Date()
+      const operation = {
+        id: asyncOperationId(),
+        name,
+        args: cloneJson(args),
+        sessionMarker,
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+        createdAtMs: now.getTime(),
+        updatedAtMs: now.getTime(),
+        pollCount: 0
+      }
+      asyncOperations.set(operation.id, operation)
+      return operation
+    },
+    asyncOperation(id) {
+      pruneAsyncOperations()
+      const operation = asyncOperations.get(String(id || ''))
+      if (!operation) return null
+      const now = new Date()
+      operation.updatedAt = now.toISOString()
+      operation.updatedAtMs = now.getTime()
+      operation.pollCount += 1
+      return operation
+    },
+    deleteAsyncOperation(id) {
+      asyncOperations.delete(String(id || ''))
+    },
+    rememberIndexingStart(marker, result) {
+      if (marker) indexingStarts.set(marker, result)
+      return result
+    },
+    indexingStart(marker) {
+      return marker ? indexingStarts.get(marker) : null
+    },
     rememberIndexRoot(root) {
       indexRoots.add(root || '')
     },
     cleanupSync() {
       if (cleaned) return
       cleaned = true
+      asyncOperations.clear()
+      indexingStarts.clear()
       codexSessionClients.clear()
       for (const root of indexRoots) {
         const args = rootArgs(root)
@@ -581,24 +685,165 @@ const addSourceArgs = (argv, args = {}) => {
   return sessionMarker
 }
 
-const registerTools = (server, lifecycle = createPluginLifecycle()) => {
-  server.registerTool('conversation_search', {
-    title: 'Search Indexed Conversation',
-    description: 'Search the current Codex session conversation_history index. This never indexes on demand.',
-    inputSchema: {
-      query: z.string().optional().describe('Search query over original user/assistant messages and generated summaries.'),
-      agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
-      within: z.string().optional().describe('Optional exact parent handle returned by search; search only one level within that node.'),
-      filter: searchFilterShape.describe('Structured exact filters such as {agent:"codex"}, {messageId}, {inReplyToMessageId}, {toolCallId}, {role:"assistant"}, {mip:0}, or {mipLevel:"leaf"}. Avoid exact filters for broad semantic search.'),
-      ...commonSearchShape
+const currentResolutionIsRetryable = current => {
+  const reason = current && current.reason
+  return [
+    'missing_current_session_marker',
+    'current_session_marker_session_id_missing',
+    'current_session_marker_lookup_failed'
+  ].includes(reason)
+}
+
+const ensureCurrentSessionIndexing = async ({ lifecycle, marker }) => {
+  if (!marker) return null
+  const existing = lifecycle.indexingStart(marker)
+  if (existing) return existing
+  const args = {
+    source: defaultSource(),
+    session_marker: marker,
+    wait_for_session_marker: true
+  }
+  const argv = ['start_indexing_session']
+  pushFlag(argv, '--scope', 'this_session_only')
+  pushBool(argv, '--wait-for-session-marker', true)
+  pushFlag(argv, '--timeout-ms', 0)
+  pushFlag(argv, '--summary-mode', 'off')
+  addSourceArgs(argv, args)
+  const result = await callConversationHistory(argv)
+  result.sessionMarker = marker
+  result.generatedSessionMarker = true
+  return lifecycle.rememberIndexingStart(marker, result)
+}
+
+const statusForCurrentSession = async sessionId => withStatusPollHints(await callConversationHistory([
+  'index_status',
+  '--start-at',
+  '0',
+  '--limit',
+  '1',
+  '--session-id',
+  sessionId
+]))
+
+const operationNeedsReadyIndex = name => [
+  'conversation_search',
+  'conversation_browse',
+  'conversation_openLink'
+].includes(name)
+
+const readinessForOperation = async ({ name, scope }) => {
+  if (!operationNeedsReadyIndex(name)) return { ready: true }
+  const status = await statusForCurrentSession(scope.current.sessionId)
+  const session = status && status.sessions && status.sessions[0]
+  if (!session) {
+    return {
+      ready: false,
+      reason: 'current_session_not_indexed',
+      message: 'The current Codex session does not have a ready conversation_history index yet.',
+      retryAfterMs: ASYNC_INDEX_POLL_RETRY_MS,
+      status
     }
-  }, async args => {
-    lifecycle.rememberIndexRoot()
+  }
+  if ((session.state === 'ready' || session.state === 'not-started') && session.indexed !== false) {
+    return { ready: true, status }
+  }
+  if (session.state === 'error' || session.state === 'suspended' || session.state === 'suspended-budget') {
+    return {
+      ready: false,
+      terminal: true,
+      reason: session.state === 'error' ? 'current_session_index_error' : 'current_session_index_suspended',
+      message: session.errorMessage || session.statusMessage || 'The current Codex session index is blocked.',
+      status
+    }
+  }
+  const nextStatusPoll = session.nextStatusPoll || {}
+  return {
+    ready: false,
+    reason: 'current_session_indexing',
+    message: 'The current Codex session index is not ready yet.',
+    retryAfterMs: Number(nextStatusPoll.retryAfterMs || ASYNC_INDEX_POLL_RETRY_MS),
+    status
+  }
+}
+
+const operationWithMarker = ({ lifecycle, name, args, operation }) => {
+  const sessionMarker = stringArg(args.session_marker) ||
+    operation && operation.sessionMarker ||
+    lifecycle.ensureCurrentSessionMarker()
+  lifecycle.ensureCurrentSessionMarker(sessionMarker)
+  args.session_marker = sessionMarker
+  if (operation) {
+    operation.sessionMarker = sessionMarker
+    operation.args = cloneJson(args)
+    return operation
+  }
+  return lifecycle.createAsyncOperation({
+    name,
+    args,
+    sessionMarker
+  })
+}
+
+const pendingForOperation = async ({
+  lifecycle,
+  name,
+  args,
+  operation,
+  current,
+  reason,
+  message,
+  retryAfterMs,
+  status
+}) => {
+  const pending = operationWithMarker({ lifecycle, name, args, operation })
+  let indexing = lifecycle.indexingStart(pending.sessionMarker)
+  if (!indexing) {
+    try {
+      indexing = await ensureCurrentSessionIndexing({
+        lifecycle,
+        marker: pending.sessionMarker
+      })
+    } catch (err) {
+      indexing = {
+        status: 'error',
+        error: compactErrorMessage(err)
+      }
+    }
+  }
+  return toolResult(pendingOperationPayload({
+    operation: pending,
+    reason,
+    message,
+    retryAfterMs,
+    current,
+    indexing: status
+      ? {
+          status,
+          start: indexing
+        }
+      : indexing
+  }), current)
+}
+
+const blockedForOperation = ({ lifecycle, operation, name, args, current, reason, message }) => {
+  const blocked = operation || lifecycle.createAsyncOperation({
+    name,
+    args,
+    sessionMarker: stringArg(args.session_marker) || current && current.sessionMarker || lifecycle.currentSessionMarker()
+  })
+  lifecycle.deleteAsyncOperation(blocked.id)
+  return toolResult(terminalAsyncPayload({
+    operation: blocked,
+    status: 'blocked',
+    reason,
+    message,
+    current
+  }), current)
+}
+
+const runConversationOperationNow = async ({ name, args, scope }) => {
+  if (name === 'conversation_search') {
     if (!stringArg(args.query) && !stringArg(args.agent) && !args.filter) throw new Error('conversation_search requires query, agent, or filter')
-    const scope = await defaultToCurrentSessionScope(args, lifecycle)
-    if (scope.scoped && !scope.current.ok) {
-      throw currentSessionScopeError(scope.current)
-    }
     const argv = ['search']
     pushFlag(argv, '--query', args.query)
     pushFlag(argv, '--agent', args.agent)
@@ -607,24 +852,9 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     if (args.filter) pushFlag(argv, '--filter', JSON.stringify(args.filter))
     addCommonSearchArgs(argv, args)
     return toolResult(withCurrentScope(await callConversationHistory(argv), scope), scope.current)
-  })
+  }
 
-  server.registerTool('conversation_browse', {
-    title: 'Browse Indexed Conversation',
-    description: 'Browse the current Codex session conversation_history hierarchy without indexing on demand. Use handles returned by previous browse/search calls to navigate.',
-    inputSchema: {
-      agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
-      handle: z.string().optional().describe('Short handle returned by conversation_search or conversation_browse. Omit for the root.'),
-      zoom: z.enum(['children', 'in', 'out', 'siblings']).optional().describe('Navigation mode. Defaults to children.'),
-      start: z.number().int().min(0).optional().describe('Zero-based child offset for paging.'),
-      limit: z.number().int().positive().max(100).optional().describe('Maximum child count.')
-    }
-  }, async args => {
-    lifecycle.rememberIndexRoot()
-    const scope = await defaultToCurrentSessionScope(args, lifecycle)
-    if (scope.scoped && !scope.current.ok) {
-      throw currentSessionScopeError(scope.current)
-    }
+  if (name === 'conversation_browse') {
     const argv = ['browse']
     pushFlag(argv, '--session-id', args.session_id)
     pushFlag(argv, '--agent', args.agent)
@@ -640,6 +870,138 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
       }
       throw err
     }
+  }
+
+  if (name === 'conversation_openLink') {
+    const link = args.handle ? internalHandleForScope(args.handle, scope) : args.link
+    if (!link) throw new Error('conversation_openLink requires handle')
+    const argv = ['openLink']
+    pushFlag(argv, '--link', link)
+    pushFlag(argv, '--session-id', args.session_id)
+    pushFlag(argv, '--agent', args.agent)
+    pushFlag(argv, '--budget-tokens', args.budget_tokens)
+    return toolResult(await callConversationHistory(argv), scope.current)
+  }
+
+  if (name === 'conversation_index_status') {
+    const argv = ['index_status']
+    pushFlag(argv, '--start-at', args.start_at)
+    pushFlag(argv, '--limit', args.limit)
+    pushFlag(argv, '--session-id', args.session_id)
+    const status = withCurrentStatusScope(withStatusPollHints(await callConversationHistory(argv)), scope)
+    return toolResult(status, scope.current)
+  }
+
+  if (name === 'stop_indexing_session') {
+    args.source = defaultSource()
+    const current = scope.current
+    if (current.path) args.session = current.path
+    const argv = ['stop_indexing_session']
+    pushFlag(argv, '--scope', 'this_session_only')
+    addSourceArgs(argv, args)
+    const result = await callConversationHistory(argv)
+    return toolResult(result)
+  }
+
+  if (name === 'reset_session_index') {
+    args.source = defaultSource()
+    const argv = ['reset_session_index']
+    pushFlag(argv, '--scope', 'this_session_only')
+    pushFlag(argv, '--session-id', args.session_id)
+    pushFlag(argv, '--agent', args.agent)
+    const result = await callConversationHistory(argv)
+    return toolResult(result, scope.current)
+  }
+
+  throw new Error(`unknown conversation_history operation: ${name}`)
+}
+
+const runConversationOperation = async ({ name, args, lifecycle, operation = null }) => {
+  lifecycle.rememberIndexRoot()
+  const workingArgs = cloneJson(args)
+  if (operation && operation.sessionMarker) workingArgs.session_marker = operation.sessionMarker
+  const scope = await defaultToCurrentSessionScope(workingArgs, lifecycle)
+  if (scope.scoped && !scope.current.ok) {
+    if (currentResolutionIsRetryable(scope.current)) {
+      return pendingForOperation({
+        lifecycle,
+        name,
+        args: workingArgs,
+        operation,
+        current: scope.current,
+        reason: 'current_session_pending',
+        retryAfterMs: ASYNC_POLL_RETRY_MS
+      })
+    }
+    return blockedForOperation({
+      lifecycle,
+      operation,
+      name,
+      args: workingArgs,
+      current: scope.current,
+      reason: scope.current.reason,
+      message: scope.current.message || scope.current.error || 'Current-session binding is blocked.'
+    })
+  }
+
+  const readiness = await readinessForOperation({ name, scope })
+  if (!readiness.ready) {
+    if (readiness.terminal) {
+      return blockedForOperation({
+        lifecycle,
+        operation,
+        name,
+        args: workingArgs,
+        current: scope.current,
+        reason: readiness.reason,
+        message: readiness.message
+      })
+    }
+    return pendingForOperation({
+      lifecycle,
+      name,
+      args: workingArgs,
+      operation,
+      current: scope.current,
+      reason: readiness.reason,
+      message: readiness.message,
+      retryAfterMs: readiness.retryAfterMs,
+      status: readiness.status
+    })
+  }
+
+  const result = await runConversationOperationNow({ name, args: workingArgs, scope })
+  if (operation) lifecycle.deleteAsyncOperation(operation.id)
+  return result
+}
+
+const registerTools = (server, lifecycle = createPluginLifecycle()) => {
+  server.registerTool('conversation_search', {
+    title: 'Search Indexed Conversation',
+    description: 'Search the current Codex session conversation_history index. If the session cannot be bound or indexed immediately, returns a pending operation for conversation_history_poll.',
+    inputSchema: {
+      query: z.string().optional().describe('Search query over original user/assistant messages and generated summaries.'),
+      agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
+      within: z.string().optional().describe('Optional exact parent handle returned by search; search only one level within that node.'),
+      filter: searchFilterShape.describe('Structured exact filters such as {agent:"codex"}, {messageId}, {inReplyToMessageId}, {toolCallId}, {role:"assistant"}, {mip:0}, or {mipLevel:"leaf"}. Avoid exact filters for broad semantic search.'),
+      ...commonSearchShape
+    }
+  }, async args => {
+    return runConversationOperation({ name: 'conversation_search', args, lifecycle })
+  })
+
+  server.registerTool('conversation_browse', {
+    title: 'Browse Indexed Conversation',
+    description: 'Browse the current Codex session conversation_history hierarchy. If the session cannot be bound or indexed immediately, returns a pending operation for conversation_history_poll. Use handles returned by previous browse/search calls to navigate.',
+    inputSchema: {
+      agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
+      handle: z.string().optional().describe('Short handle returned by conversation_search or conversation_browse. Omit for the root.'),
+      zoom: z.enum(['children', 'in', 'out', 'siblings']).optional().describe('Navigation mode. Defaults to children.'),
+      start: z.number().int().min(0).optional().describe('Zero-based child offset for paging.'),
+      limit: z.number().int().positive().max(100).optional().describe('Maximum child count.')
+    }
+  }, async args => {
+    return runConversationOperation({ name: 'conversation_browse', args, lifecycle })
   })
 
   server.registerTool('conversation_openLink', {
@@ -652,19 +1014,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
       budget_tokens: z.number().int().positive().max(200000).optional().describe('Render budget in tokens. Defaults to 1200.')
     }
   }, async args => {
-    lifecycle.rememberIndexRoot()
-    const scope = await defaultToCurrentSessionScope(args, lifecycle)
-    if (scope.scoped && !scope.current.ok) {
-      throw currentSessionScopeError(scope.current)
-    }
-    const link = args.handle ? internalHandleForScope(args.handle, scope) : args.link
-    if (!link) throw new Error('conversation_openLink requires handle')
-    const argv = ['openLink']
-    pushFlag(argv, '--link', link)
-    pushFlag(argv, '--session-id', args.session_id)
-    pushFlag(argv, '--agent', args.agent)
-    pushFlag(argv, '--budget-tokens', args.budget_tokens)
-    return toolResult(await callConversationHistory(argv), scope.current)
+    return runConversationOperation({ name: 'conversation_openLink', args, lifecycle })
   })
 
   server.registerTool('conversation_index_status', {
@@ -675,17 +1025,32 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
       limit: z.number().int().positive().max(100).describe('Maximum session-status records to return. Required.')
     }
   }, async args => {
-    lifecycle.rememberIndexRoot()
-    const scope = await defaultToCurrentSessionScope(args, lifecycle)
-    if (scope.scoped && !scope.current.ok) {
-      throw currentSessionScopeError(scope.current)
+    return runConversationOperation({ name: 'conversation_index_status', args, lifecycle })
+  })
+
+  server.registerTool('conversation_history_poll', {
+    title: 'Poll Conversation History Operation',
+    description: 'Poll a pending conversation_history operation returned by another conversation_history tool.',
+    inputSchema: {
+      operation_id: z.string().describe('Operation id returned by a pending conversation_history tool result.')
     }
-    const argv = ['index_status']
-    pushFlag(argv, '--start-at', args.start_at)
-    pushFlag(argv, '--limit', args.limit)
-    pushFlag(argv, '--session-id', args.session_id)
-    const status = withCurrentStatusScope(withStatusPollHints(await callConversationHistory(argv)), scope)
-    return toolResult(status, scope.current)
+  }, async args => {
+    const operation = lifecycle.asyncOperation(args.operation_id)
+    if (!operation) {
+      return toolResult({
+        schema: 'conversation_history.async_operation.v1',
+        status: 'not_found',
+        reason: 'unknown_operation',
+        operationId: args.operation_id,
+        message: 'No pending conversation_history operation exists for this operation_id.'
+      })
+    }
+    return runConversationOperation({
+      name: operation.name,
+      args: operation.args,
+      lifecycle,
+      operation
+    })
   })
 
   server.registerTool('start_indexing_session', {
@@ -708,6 +1073,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     const result = await callConversationHistory(argv)
     result.sessionMarker = marker
     result.generatedSessionMarker = true
+    lifecycle.rememberIndexingStart(marker, result)
     return toolResult(result)
   })
 
@@ -716,26 +1082,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     description: 'Stop current-session conversation_history background indexing.',
     inputSchema: {}
   }, async args => {
-    lifecycle.rememberIndexRoot()
-    args.source = defaultSource()
-    bindLifecycleSessionMarker(args, lifecycle)
-    const current = await resolveCurrentMarkerSession(args)
-    if (!current.ok && current.reason === 'missing_current_session_marker') {
-      return toolResult({
-        schema: 'session-indexer.stop_indexing_session.v1',
-        status: 'not_found',
-        reason: current.reason,
-        stoppedCount: 0,
-        jobs: []
-      })
-    }
-    if (!current.ok) throw currentSessionScopeError(current)
-    if (current.path) args.session = current.path
-    const argv = ['stop_indexing_session']
-    pushFlag(argv, '--scope', 'this_session_only')
-    addSourceArgs(argv, args)
-    const result = await callConversationHistory(argv)
-    return toolResult(result)
+    return runConversationOperation({ name: 'stop_indexing_session', args, lifecycle })
   })
 
   server.registerTool('reset_session_index', {
@@ -745,16 +1092,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
       agent: z.string().optional().describe('Optional indexed agent filter, e.g. codex or claude.')
     }
   }, async args => {
-    lifecycle.rememberIndexRoot()
-    args.source = defaultSource()
-    const scope = await defaultToCurrentSessionScope(args, lifecycle)
-    if (scope.scoped && !scope.current.ok) throw currentSessionScopeError(scope.current)
-    const argv = ['reset_session_index']
-    pushFlag(argv, '--scope', 'this_session_only')
-    pushFlag(argv, '--session-id', args.session_id)
-    pushFlag(argv, '--agent', args.agent)
-    const result = await callConversationHistory(argv)
-    return toolResult(result, scope.current)
+    return runConversationOperation({ name: 'reset_session_index', args, lifecycle })
   })
 
   server.registerTool('redeploy_session_index_mcp', {
