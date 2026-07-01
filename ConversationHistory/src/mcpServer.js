@@ -26,6 +26,7 @@ const ASYNC_OPERATION_PREFIX = 'conversation_history-op-'
 const ASYNC_OPERATION_TTL_MS = 30 * 60 * 1000
 const ASYNC_POLL_RETRY_MS = 1_000
 const ASYNC_INDEX_POLL_RETRY_MS = 2_000
+const MCP_INDEX_DEBOUNCE_MS = 100
 
 const statusPollMemory = new Map()
 const codexSessionClients = new Map()
@@ -694,10 +695,10 @@ const currentResolutionIsRetryable = current => {
   ].includes(reason)
 }
 
-const ensureCurrentSessionIndexing = async ({ lifecycle, marker }) => {
+const ensureCurrentSessionIndexing = async ({ lifecycle, marker, force = false }) => {
   if (!marker) return null
   const existing = lifecycle.indexingStart(marker)
-  if (existing) return existing
+  if (existing && !force) return existing
   const args = {
     source: defaultSource(),
     session_marker: marker,
@@ -708,6 +709,7 @@ const ensureCurrentSessionIndexing = async ({ lifecycle, marker }) => {
   pushBool(argv, '--wait-for-session-marker', true)
   pushFlag(argv, '--timeout-ms', 0)
   pushFlag(argv, '--summary-mode', 'off')
+  pushFlag(argv, '--debounce-ms', MCP_INDEX_DEBOUNCE_MS)
   addSourceArgs(argv, args)
   const result = await callConversationHistory(argv)
   result.sessionMarker = marker
@@ -744,8 +746,12 @@ const readinessForOperation = async ({ name, scope }) => {
       status
     }
   }
-  if ((session.state === 'ready' || session.state === 'not-started') && session.indexed !== false) {
-    return { ready: true, status }
+  if (session.indexed !== false) {
+    return {
+      ready: true,
+      status,
+      ensureIndexing: session.state === 'not-started'
+    }
   }
   if (session.state === 'error' || session.state === 'suspended' || session.state === 'suspended-budget') {
     return {
@@ -969,6 +975,13 @@ const runConversationOperation = async ({ name, args, lifecycle, operation = nul
       status: readiness.status
     })
   }
+  if (readiness.ensureIndexing) {
+    await ensureCurrentSessionIndexing({
+      lifecycle,
+      marker: workingArgs.session_marker || lifecycle.currentSessionMarker(),
+      force: true
+    })
+  }
 
   const result = await runConversationOperationNow({ name, args: workingArgs, scope })
   if (operation) lifecycle.deleteAsyncOperation(operation.id)
@@ -978,7 +991,7 @@ const runConversationOperation = async ({ name, args, lifecycle, operation = nul
 const registerTools = (server, lifecycle = createPluginLifecycle()) => {
   server.registerTool('conversation_search', {
     title: 'Search Indexed Conversation',
-    description: 'Search the current Codex session conversation_history index. If the session cannot be bound or indexed immediately, returns a pending operation for conversation_history_poll.',
+    description: 'Search the current Codex session conversation_history index. If the session cannot be bound or no usable published index exists yet, returns a pending operation for conversation_history_poll.',
     inputSchema: {
       query: z.string().optional().describe('Search query over original user/assistant messages and generated summaries.'),
       agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
@@ -992,7 +1005,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
 
   server.registerTool('conversation_browse', {
     title: 'Browse Indexed Conversation',
-    description: 'Browse the current Codex session conversation_history hierarchy. If the session cannot be bound or indexed immediately, returns a pending operation for conversation_history_poll. Use handles returned by previous browse/search calls to navigate.',
+    description: 'Browse the current Codex session conversation_history hierarchy. If the session cannot be bound or no usable published index exists yet, returns a pending operation for conversation_history_poll. Use handles returned by previous browse/search calls to navigate.',
     inputSchema: {
       agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
       handle: z.string().optional().describe('Short handle returned by conversation_search or conversation_browse. Omit for the root.'),
@@ -1069,6 +1082,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
     pushBool(argv, '--wait-for-session-marker', true)
     pushFlag(argv, '--timeout-ms', 0)
     pushFlag(argv, '--summary-mode', 'off')
+    pushFlag(argv, '--debounce-ms', MCP_INDEX_DEBOUNCE_MS)
     addSourceArgs(argv, args)
     const result = await callConversationHistory(argv)
     result.sessionMarker = marker

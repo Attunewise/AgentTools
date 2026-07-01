@@ -4782,10 +4782,9 @@ test('MCP server exposes native conversation search and openLink tools', async (
           limit: 1
         }
       })).structuredContent.result
-      assert.equal(activeSearch.schema, 'conversation_history.async_operation.v1')
-      assert.equal(activeSearch.status, 'pending')
-      assert.equal(activeSearch.reason, 'current_session_indexing')
-      assert.equal(activeSearch.operation, 'conversation_search')
+      assert.equal(activeSearch.schema, 'session-indexer.search.v1')
+      assert.equal(activeSearch.hits.length, 1)
+      assert.match(activeSearch.hits[0].text, /clientRevision 7/)
 
       writeJobState({
         root,
