@@ -29,4 +29,6 @@ MCP search, browse, openLink, and status calls default to the current Codex sess
 
 Search, browse, and openLink require a usable current-session index. If no published current-session index exists yet, the MCP returns a pending async operation and starts or reuses background current-session indexing. Polling rechecks marker binding and index readiness, then returns the original operation's real response. Once a published index exists, MCP retrieval serves that index even when a worker is importing or summarizing newer tail records; the current request must not block all prior history on a tail catch-up batch. Retrieval must not perform inline summarization or unbounded transcript import in the tool call itself.
 
+`conversation_index_status` uses `state: "ready"` to mean a published index is usable. Background catch-up after new JSONL lines, compaction boundaries, worker errors, or suspended summarization is reported through `statusMessage`, `indexingJob`, and poll hints rather than changing the session state away from ready.
+
 OpenLink is the only normal path for source text. Exact source recovery is indicated by `isVerbatim`; absent or summary-level text must not be treated as lossless evidence.

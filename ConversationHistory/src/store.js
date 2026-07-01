@@ -463,6 +463,15 @@ const jobHasActiveIndexingWork = job => Boolean(
   !['ready', 'stopped', 'error', 'stale', 'suspended'].includes(job.status)
 )
 
+const backgroundStatusMessage = job => {
+  if (!job) return undefined
+  if (job.status === 'suspended') return job.message || 'background indexing is suspended'
+  if (job.status === 'error') return job.error || 'background indexing job failed'
+  if (job.status === 'stale') return 'background indexing job is no longer running'
+  if (jobHasActiveIndexingWork(job) || jobHasActiveSummaryWork(job)) return 'background indexing is catching up'
+  return undefined
+}
+
 const readPidFile = file => {
   try {
     const pid = Number(fs.readFileSync(file, 'utf8').trim())
@@ -546,6 +555,19 @@ const operationalState = ({
   const runningJob = jobs.find(job => job.running) || null
   const latestPublicJob = latestJob && latestJob.publicJob
   const runningPublicJob = runningJob && runningJob.publicJob
+  if (indexed) {
+    const latestNeedsAttention = latestPublicJob && ['suspended', 'error', 'stale'].includes(latestPublicJob.status)
+    const indexingJob = latestNeedsAttention ? latestPublicJob : runningPublicJob || latestPublicJob
+    const failed = failedSummaryWork({ stats, summaryTargetStore }) || jobHasFailedSummaryWork(indexingJob)
+    const statusMessage = failed
+      ? 'background summary indexing has failed or stale work claims'
+      : backgroundStatusMessage(indexingJob)
+    return {
+      state: 'ready',
+      ...(statusMessage ? { statusMessage } : {}),
+      ...(indexingJob ? { indexingJob } : {})
+    }
+  }
   if (latestPublicJob && latestPublicJob.status === 'suspended') {
     const suspension = latestPublicJob.suspension || {
       reason: latestPublicJob.suspendedReason || 'unknown',

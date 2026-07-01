@@ -466,10 +466,15 @@ const nextStatusPollForSession = (session, now = new Date()) => {
       reason: 'approval_required',
       message: suspension && suspension.requiredAction
         ? `Indexing is suspended until the required action is handled. ${suspension.requiredAction}`
-        : 'Indexing is suspended until the blocking condition is resolved.'
+      : 'Indexing is suspended until the blocking condition is resolved.'
     }
   }
-  if (session.state !== 'indexing-in-progress' || !session.indexingJob) {
+  const activeBackgroundIndexing = session &&
+    session.indexed !== false &&
+    session.indexingJob &&
+    session.indexingJob.status &&
+    !['ready', 'stopped', 'error', 'stale', 'suspended'].includes(session.indexingJob.status)
+  if ((session.state !== 'indexing-in-progress' && !activeBackgroundIndexing) || !session.indexingJob) {
     deleteStatusPollMemoryForSession(session)
     return null
   }
@@ -499,7 +504,9 @@ const nextStatusPollForSession = (session, now = new Date()) => {
   return {
     retryAfterMs,
     retryAt: retryAtFrom(nowMs, retryAfterMs),
-    reason: retryAtMs !== null
+    reason: activeBackgroundIndexing
+      ? 'background_indexing'
+      : retryAtMs !== null
       ? 'worker_retry'
       : estimatedCompletionMs !== null
         ? 'estimated_completion'
@@ -513,7 +520,9 @@ const nextStatusPollForSession = (session, now = new Date()) => {
       ? 'Poll after the worker retry window.'
       : estimatedCompletionMs !== null
         ? 'Poll after the current indexing batch is expected to complete.'
-        : 'Indexing is active; MCP is applying exponential backoff for repeated unchanged status.',
+        : activeBackgroundIndexing
+          ? 'Published index is usable; background indexing is catching up on newer transcript changes.'
+          : 'Indexing is active; MCP is applying exponential backoff for repeated unchanged status.',
     backoff: {
       strategy: 'exponential',
       currentMs: backoffMs,
@@ -747,10 +756,12 @@ const readinessForOperation = async ({ name, scope }) => {
     }
   }
   if (session.indexed !== false) {
+    const job = session.indexingJob || {}
+    const needsIndexingWorker = !session.indexingJob || ['stale', 'stopped', 'error', 'suspended'].includes(job.status)
     return {
       ready: true,
       status,
-      ensureIndexing: session.state === 'not-started'
+      ensureIndexing: needsIndexingWorker
     }
   }
   if (session.state === 'error' || session.state === 'suspended' || session.state === 'suspended-budget') {

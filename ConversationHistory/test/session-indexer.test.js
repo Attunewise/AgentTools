@@ -3307,7 +3307,7 @@ test('index status reports operational indexing state without indexing on demand
   }
 
   const notStarted = indexStatus({ root, sessionId: 'mini-session' })
-  assert.equal(notStarted.sessions[0].state, 'not-started')
+  assert.equal(notStarted.sessions[0].state, 'ready')
   assert.equal(Object.hasOwn(notStarted.sessions[0], 'upToDate'), false)
   assert.equal(Object.hasOwn(notStarted.sessions[0], 'staleByMs'), false)
   assert.equal(Object.hasOwn(notStarted.sessions[0], 'sourceUpdatedAt'), false)
@@ -3330,7 +3330,7 @@ test('index status reports operational indexing state without indexing on demand
     updatedAt: new Date(indexedAt - 1000).toISOString()
   }, null, 2)}\n`)
   const ignoresOldError = indexStatus({ root, sessionId: 'mini-session' })
-  assert.equal(ignoresOldError.sessions[0].state, 'not-started')
+  assert.equal(ignoresOldError.sessions[0].state, 'ready')
   assert.equal(Object.hasOwn(ignoresOldError.sessions[0], 'errorMessage'), false)
 
   const staleMergeJobId = 'index-test-stale-merge'
@@ -3514,12 +3514,13 @@ test('index status reports operational indexing state without indexing on demand
     }
   })
   const budgetSuspended = indexStatus({ root, sessionId: 'mini-session' })
-  assert.equal(budgetSuspended.sessions[0].state, 'suspended-budget')
+  assert.equal(budgetSuspended.sessions[0].state, 'ready')
   assert.match(budgetSuspended.sessions[0].statusMessage, /summary budget suspended/)
-  assert.equal(budgetSuspended.sessions[0].suspension.summaryBudget.neededBudgetUsd, 2.5)
-  assert.equal(budgetSuspended.sessions[0].suspension.approval.amountUsd, 2.5)
-  assert.match(budgetSuspended.sessions[0].suspension.requiredAction, /Resume with summary_max_budget_usd=/)
-  assert.equal(Object.hasOwn(budgetSuspended.sessions[0].suspension.summaryBudget, 'pricing'), false)
+  assert.equal(Object.hasOwn(budgetSuspended.sessions[0], 'suspension'), false)
+  assert.equal(budgetSuspended.sessions[0].indexingJob.suspension.summaryBudget.neededBudgetUsd, 2.5)
+  assert.equal(budgetSuspended.sessions[0].indexingJob.suspension.approval.amountUsd, 2.5)
+  assert.match(budgetSuspended.sessions[0].indexingJob.suspension.requiredAction, /Resume with summary_max_budget_usd=/)
+  assert.equal(Object.hasOwn(budgetSuspended.sessions[0].indexingJob.suspension.summaryBudget, 'pricing'), false)
   assert.equal(budgetSuspended.sessions[0].indexingJob.status, 'suspended')
   assert.equal(budgetSuspended.sessions[0].indexingJob.summaryBudget.additionalBudgetUsd, 1.5)
   assert.equal(Object.hasOwn(budgetSuspended.sessions[0].indexingJob.summaryBudget, 'pricing'), false)
@@ -3541,7 +3542,8 @@ test('index status reports operational indexing state without indexing on demand
     }
   })
   const readyDuringReindex = indexStatus({ root, sessionId: 'mini-session' })
-  assert.equal(readyDuringReindex.sessions[0].state, 'indexing-in-progress')
+  assert.equal(readyDuringReindex.sessions[0].state, 'ready')
+  assert.match(readyDuringReindex.sessions[0].statusMessage, /background indexing/)
   assert.equal(readyDuringReindex.sessions[0].indexingJob.status, 'indexing')
 
   writeJobState({
@@ -3558,7 +3560,8 @@ test('index status reports operational indexing state without indexing on demand
     }
   })
   const notActuallyReady = indexStatus({ root, sessionId: 'mini-session' })
-  assert.equal(notActuallyReady.sessions[0].state, 'indexing-in-progress')
+  assert.equal(notActuallyReady.sessions[0].state, 'ready')
+  assert.match(notActuallyReady.sessions[0].statusMessage, /background indexing/)
   assert.equal(notActuallyReady.sessions[0].indexingJob.status, 'indexing')
   assert.equal(Object.hasOwn(notActuallyReady.sessions[0].indexingJob, 'maxSummaryNodes'), false)
 
@@ -3596,8 +3599,10 @@ test('index status reports operational indexing state without indexing on demand
     }
   })
   const failed = indexStatus({ root, sessionId: 'mini-session' })
-  assert.equal(failed.sessions[0].state, 'error')
-  assert.equal(failed.sessions[0].errorMessage, 'synthetic indexing failure')
+  assert.equal(failed.sessions[0].state, 'ready')
+  assert.equal(failed.sessions[0].statusMessage, 'synthetic indexing failure')
+  assert.equal(failed.sessions[0].indexingJob.status, 'error')
+  assert.equal(failed.sessions[0].indexingJob.error, 'synthetic indexing failure')
 
   const compact = indexStatus({ root, sessionId: 'mini-session' })
   assert.equal(Object.hasOwn(compact.sessions[0], 'compactions'), false)
@@ -3766,7 +3771,7 @@ test('Typesense upserts are batched and status reports managed disk usage', asyn
   assert.ok(progress.some(event => event.phase === 'index:documents:delete:done'))
 
   const status = indexStatus({ root, sessionId })
-  assert.equal(status.sessions[0].state, 'not-started')
+  assert.equal(status.sessions[0].state, 'ready')
   assert.ok(status.resourceUsage.disk.typesenseData.bytes > 0)
   assert.ok(status.resourceUsage.typesense.pid > 0)
   if (status.resourceUsage.typesense.resourceUsage) {
@@ -4741,8 +4746,9 @@ test('MCP server exposes native conversation search and openLink tools', async (
         }
       })
       const activeFirst = await callMiniStatus()
-      assert.equal(activeFirst.sessions[0].state, 'indexing-in-progress')
-      assert.equal(activeFirst.sessions[0].nextStatusPoll.reason, 'active_indexing')
+      assert.equal(activeFirst.sessions[0].state, 'ready')
+      assert.match(activeFirst.sessions[0].statusMessage, /background indexing/)
+      assert.equal(activeFirst.sessions[0].nextStatusPoll.reason, 'background_indexing')
       assert.equal(activeFirst.sessions[0].nextStatusPoll.source, 'mcp_backoff')
       assert.equal(activeFirst.sessions[0].nextStatusPoll.retryAfterMs, 15000)
       assert.match(activeFirst.sessions[0].nextStatusPoll.retryAt, /^\d{4}-\d{2}-\d{2}T/)
@@ -4750,7 +4756,8 @@ test('MCP server exposes native conversation search and openLink tools', async (
       assert.equal(activeFirst.sessions[0].nextStatusPoll.backoff.currentMs, 15000)
 
       const activeSecond = await callMiniStatus()
-      assert.equal(activeSecond.sessions[0].state, 'indexing-in-progress')
+      assert.equal(activeSecond.sessions[0].state, 'ready')
+      assert.equal(activeSecond.sessions[0].nextStatusPoll.reason, 'background_indexing')
       assert.equal(activeSecond.sessions[0].nextStatusPoll.retryAfterMs, 30000)
       assert.equal(activeSecond.sessions[0].nextStatusPoll.backoff.currentMs, 30000)
 
@@ -4771,7 +4778,8 @@ test('MCP server exposes native conversation search and openLink tools', async (
         }
       })
       const activeChanged = await callMiniStatus()
-      assert.equal(activeChanged.sessions[0].state, 'indexing-in-progress')
+      assert.equal(activeChanged.sessions[0].state, 'ready')
+      assert.equal(activeChanged.sessions[0].nextStatusPoll.reason, 'background_indexing')
       assert.equal(activeChanged.sessions[0].nextStatusPoll.retryAfterMs, 15000)
       assert.equal(activeChanged.sessions[0].nextStatusPoll.backoff.currentMs, 15000)
 
@@ -4809,11 +4817,11 @@ test('MCP server exposes native conversation search and openLink tools', async (
         }
       })
       const suspended = await callMiniStatus()
-      assert.equal(suspended.sessions[0].state, 'suspended-budget')
-      assert.equal(suspended.sessions[0].nextStatusPoll.reason, 'approval_required')
-      assert.equal(suspended.sessions[0].nextStatusPoll.retryAfterMs, null)
-      assert.equal(suspended.sessions[0].nextStatusPoll.retryAt, null)
-      assert.match(suspended.sessions[0].nextStatusPoll.message, /Indexing is suspended/)
+      assert.equal(suspended.sessions[0].state, 'ready')
+      assert.match(suspended.sessions[0].statusMessage, /summary budget suspended/)
+      assert.equal(Object.hasOwn(suspended.sessions[0], 'nextStatusPoll'), false)
+      assert.equal(suspended.sessions[0].indexingJob.status, 'suspended')
+      assert.equal(suspended.sessions[0].indexingJob.suspendedReason, 'summary_budget')
     } finally {
       writeJobState({
         root,
