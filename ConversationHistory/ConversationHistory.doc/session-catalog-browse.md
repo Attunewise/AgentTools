@@ -13,9 +13,9 @@ scope:
 
 ConversationHistory supports a top-level browse above individual sessions.
 
-The CLI `browse` command without `--index-id` returns a manifest-backed session catalog. In the MCP surface, `conversation_browse` is current-session scoped and does not expose the shared catalog as a fallback. If the MCP cannot resolve the current thread through its response marker, or if no published current-session index exists yet, it returns `conversation_history.async_operation.v1`; callers poll `conversation_history_poll` until the original browse response is ready or blocked. If a published index exists, browse serves it while background indexing catches up on newer tail records.
+The CLI `browse` command without `--index-id` returns a manifest-backed session catalog. In the MCP surface, `conversation_browse` is current-session scoped and does not expose the shared catalog as a fallback. If the MCP cannot resolve the current thread through its response marker, it returns `conversation_history.async_operation.v1`; callers poll `conversation_history_poll` until binding resolves or is blocked. If no published current-session index exists, browse returns `current_session_not_indexed` and the caller must invoke `start_indexing_session` explicitly. If a published index exists, browse serves it while an explicitly started background worker catches up on newer tail records.
 
-The catalog path must not import transcripts, start indexing, query Typesense, read every IR file, or inspect full session trees. It reads only the persisted manifest and returns a compact page. Current-session MCP browse may start or reuse background indexing before returning a pending operation, but it must not perform that indexing inline before answering the tool call.
+The catalog path must not import transcripts, start indexing, query Typesense, read every IR file, or inspect full session trees. It reads only the persisted manifest and returns a compact page. Current-session MCP browse may return a pending marker-binding operation, but it must never start or reuse indexing as a retrieval side effect.
 
 The catalog rows include the minimum fields needed to decide where to drill down:
 

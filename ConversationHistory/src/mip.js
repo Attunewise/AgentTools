@@ -488,10 +488,13 @@ const applyCompactionSearchScope = tree => {
 }
 
 const createSummaryNode = ({ tree, level = 1, index = 0, children, breadcrumb, head, topics, meta }) => {
-  const childHash = hashString((children || []).map(child => child.handle).join('\n')).slice(0, 12)
   const padded = String(index).padStart(4, '0')
   return section({
-    handle: `${tree.root.handle}/summary/level-${level}/span-${padded}-${childHash}`,
+    // A summary span is a logical slot in the MIP tree. Its source revision is
+    // tracked by sourceGroupHash/targetId; putting a child hash in the handle
+    // would replace the node every time the open right edge grows and makes it
+    // impossible to maintain that spine in place.
+    handle: `${tree.root.handle}/summary/level-${level}/span-${padded}`,
     kind: 'summary_span',
     title: `summary level ${level} span ${index + 1}`,
     breadcrumb: breadcrumb || `span-${index + 1}`,
@@ -631,7 +634,7 @@ const nodeRef = (tree, node, opts = {}) => ({
   title: node.title,
   breadcrumb: node.breadcrumb || '',
   head: node.head,
-  childCount: modelVisibleChildren(node.children).length,
+  childCount: navigationChildren(node).length,
   renderedTokenCount: node.renderedTokenCount,
   nextLevelTokenCount: node.nextLevelTokenCount,
   fullTokenCount: node.fullTokenCount,
@@ -645,6 +648,19 @@ const nodeRef = (tree, node, opts = {}) => ({
 const renderNode = (tree, node, budgetTokens = 1200, opts = {}) => {
   if (isModelHiddenNode(node)) throw new Error(`Reasoning records are not available through conversation_history: ${node.handle}`)
   const budget = Math.max(1, Number(budgetTokens || 1200))
+  if (sourceMessageContainer(node)) {
+    const source = modelTextForNode(node)
+    const maxChars = Math.max(160, budget * 4)
+    const content = source.slice(0, maxChars)
+    return {
+      ...nodeRef(tree, node),
+      mipLevel: content === source ? 'raw' : 'leaf_excerpt',
+      content,
+      isVerbatim: content === source,
+      renderedTokenCount: estimateTokens(content),
+      omittedTokenCount: Math.max(0, estimateTokens(source) - estimateTokens(content))
+    }
+  }
   if (budget >= node.fullTokenCount && !(opts.summaryOnly && node.children.length)) {
     const content = concatRaw(node)
     return {
@@ -678,7 +694,7 @@ const renderNode = (tree, node, budgetTokens = 1200, opts = {}) => {
   ].filter(line => line !== '')
   const children = []
   let spent = estimateTokens(lines.join('\n'))
-  const visibleChildren = modelVisibleChildren(node.children)
+  const visibleChildren = navigationChildren(node)
   for (const child of visibleChildren) {
     const label = child.breadcrumb || child.title
     const line = `- ${label}: ${child.head} (${child.fullTokenCount} full tokens) [${child.handle}]`
@@ -741,6 +757,19 @@ const sourceMessageNode = node => {
     (node.kind === 'message' || /^event_content(?:_chunk)?$/.test(String(node.kind || '')))
 }
 
+const sourceMessageContainer = node => Boolean(node &&
+  node.kind === 'message' &&
+  node.meta && node.meta.type === 'message' &&
+  (node.meta.role === 'user' || node.meta.role === 'assistant'))
+
+const sourceMessageContentNode = (node, parent) => Boolean(node && parent &&
+  sourceMessageContainer(parent) &&
+  /^event_content(?:_chunk)?$/.test(String(node.kind || '')))
+
+const navigationChildren = node => sourceMessageContainer(node)
+  ? []
+  : modelVisibleChildren(node && node.children)
+
 const modelTextForNode = node => {
   if (!node || isModelHiddenNode(node)) return ''
   if (sourceMessageNode(node)) {
@@ -752,6 +781,11 @@ const modelTextForNode = node => {
   return ''
 }
 
+const navigationTextForNode = node => {
+  const text = modelTextForNode(node)
+  return sourceMessageNode(node) ? truncateSearchText(text, MAX_SEARCH_MESSAGE_CHARS) : text
+}
+
 const browseRef = (tree, node) => {
   const ref = nodeRef(tree, node, { includeResourceLinks: false })
   return {
@@ -759,9 +793,9 @@ const browseRef = (tree, node) => {
     index_id: ref.index_id,
     index: optionalString(ref.index),
     line: ref.sourceLineNumber || undefined,
-    text: modelTextForNode(node) || undefined,
+    text: navigationTextForNode(node) || undefined,
     openable: Boolean(sourceMessageNode(node)),
-    child_count: Number(ref.childCount || 0)
+    child_count: navigationChildren(node).length
   }
 }
 
@@ -790,14 +824,14 @@ const browseNode = (tree, opts = {}) => {
     if (parentHandle) node = tree.byHandle.get(parentHandle) || node
   }
   if (isModelHiddenNode(node)) throw new Error(`Reasoning records are not available through conversation_history: ${handle}`)
-  const directChildren = modelVisibleChildren(node.children)
-  const discoveredRoot = !modelTextForNode(node) &&
+  const directChildren = navigationChildren(node)
+  const discoveredRoot = !navigationTextForNode(node) &&
     node.kind === 'session' &&
     directChildren.length === 1 &&
     directChildren[0].kind === 'summary_span'
       ? directChildren[0]
       : node
-  const visibleChildren = modelVisibleChildren(discoveredRoot.children)
+  const visibleChildren = navigationChildren(discoveredRoot)
   const start = Math.max(0, Number(opts.start !== undefined ? opts.start : opts.startAt || opts.start_at || 0) || 0)
   const filteredChildren = visibleChildren.filter(child => topicMatches(child.topics, opts.topic))
   const pageChildren = filteredChildren
@@ -808,7 +842,8 @@ const browseNode = (tree, opts = {}) => {
     handle: node.handle,
     zoom,
     index_id: tree.ir.indexId,
-    text: modelTextForNode(discoveredRoot) || undefined,
+    text: navigationTextForNode(discoveredRoot) || undefined,
+    openable: Boolean(sourceMessageContainer(discoveredRoot)),
     child_count: visibleChildren.length,
     page: {
       start,
@@ -832,8 +867,9 @@ const nodeSearchText = (node, opts = {}) => {
   return ''
 }
 
-const defaultRetrievalVisible = node => Boolean(node &&
+const defaultRetrievalVisible = (node, parent) => Boolean(node &&
   !isModelHiddenNode(node) &&
+  !sourceMessageContentNode(node, parent) &&
   (node.kind === 'session' || modelTextForNode(node))
 )
 
@@ -845,12 +881,17 @@ const isModelHiddenDoc = doc => Boolean(doc && (
 const collectIndexDocuments = (tree, opts = {}) => {
   const docs = []
   const indexId = tree.ir.indexId || indexIdForIR(tree.ir)
-  const retrievalVisible = typeof opts.retrievalVisible === 'function'
+  const customRetrievalVisible = typeof opts.retrievalVisible === 'function'
     ? opts.retrievalVisible
-    : node => opts.retrievalVisible !== false && defaultRetrievalVisible(node)
+    : null
+  const retrievalVisible = (node, parent) => opts.retrievalVisible !== false &&
+    defaultRetrievalVisible(node, parent) &&
+    (!customRetrievalVisible || customRetrievalVisible(node, parent))
   const visit = (node, parent, depth) => {
     if (isModelHiddenNode(node)) return
     const isLeaf = !node.children.length
+    const retrievalChildren = modelVisibleChildren(node.children)
+      .filter(child => retrievalVisible(child, node))
     const isPendingSummary = node.kind === 'summary_span' &&
       node.summaryMeta &&
       node.summaryMeta.status &&
@@ -872,9 +913,9 @@ const collectIndexDocuments = (tree, opts = {}) => {
       ...nodeSourceFields(node),
       depth,
       kind: node.kind,
-      mipLevel: node.children.length ? 'summary' : 'leaf',
-      retrievalVisible: Boolean(retrievalVisible(node)),
-      isVerbatim: isLeaf,
+      mipLevel: retrievalChildren.length ? 'summary' : 'leaf',
+      retrievalVisible: Boolean(retrievalVisible(node, parent)),
+      isVerbatim: isLeaf || sourceMessageContainer(node),
       title: node.title || '',
       breadcrumb: node.breadcrumb || '',
       summary: node.head || '',
@@ -884,7 +925,7 @@ const collectIndexDocuments = (tree, opts = {}) => {
       searchText,
       excerpt: isLeaf ? preview(node.raw, 700) : preview(node.head, 700),
       content: isLeaf ? node.raw : '',
-      childCount: node.children.length,
+      childCount: retrievalChildren.length,
       renderedTokenCount: node.renderedTokenCount,
       nextLevelTokenCount: node.nextLevelTokenCount,
       fullTokenCount: node.fullTokenCount,
@@ -918,6 +959,7 @@ module.exports = {
   nodeSourceFields,
   nodeTimeFields,
   modelTextForNode,
+  navigationTextForNode,
   openLink,
   parseSessionLink,
   rebuildTreeIndex,

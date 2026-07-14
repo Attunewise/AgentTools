@@ -3,6 +3,7 @@ const { hydrateDoc, hydrateDocs } = require('./docStore.js')
 const { normalizeTopics, parseTopicId, topicIdForHandle, topicsText } = require('./topics.js')
 const {
   DEFAULT_MANAGED_TYPESENSE_API_KEY,
+  managedRuntimeInfoIfPresent,
   managedRuntimeInfo,
   startManagedTypesense
 } = require('./typesenseManaged.js')
@@ -164,11 +165,6 @@ const request = async (config, method, pathname, opts = {}) => {
   }
 }
 
-const isCollectionNotFoundError = err => {
-  if (!err || err.status !== 404) return false
-  return /collection not found/i.test(String(err.message || ''))
-}
-
 const collectionSchema = collection => ({
   name: collection,
   fields: [
@@ -239,17 +235,21 @@ const collectionNeedsRecreate = (existing, schema) => {
   return false
 }
 
-const parseJsonlText = text => String(text || '').split('\n')
-  .map(line => line.trim())
-  .filter(Boolean)
-  .map(line => {
-    try {
-      return JSON.parse(line)
-    } catch (_err) {
-      return null
-    }
-  })
-  .filter(Boolean)
+const parseJsonlText = value => {
+  if (Array.isArray(value)) return value.filter(item => item && typeof item === 'object')
+  if (value && typeof value === 'object') return [value]
+  return String(value || '').split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => {
+      try {
+        return JSON.parse(line)
+      } catch (_err) {
+        return null
+      }
+    })
+    .filter(Boolean)
+}
 
 const patchExistingIndexIds = async config => {
   const params = new URLSearchParams()
@@ -285,10 +285,7 @@ const ensureCollection = async (config, opts = {}) => {
   try {
     const existing = await request(config, 'GET', `/collections/${encodeURIComponent(config.collection)}`)
     if (collectionNeedsRecreate(existing, schema)) {
-      await request(config, 'DELETE', `/collections/${encodeURIComponent(config.collection)}`)
-      return request(config, 'POST', '/collections', {
-        body: JSON.stringify(schema)
-      })
+      throw new Error(`Typesense collection ${config.collection} has an incompatible schema; refusing destructive recreation while published history may be live`)
     }
     const existingNames = new Set((existing.fields || []).map(field => field.name))
     const missingFields = schema.fields.filter(field => !existingNames.has(field.name))
@@ -306,6 +303,30 @@ const ensureCollection = async (config, opts = {}) => {
   return request(config, 'POST', '/collections', {
     body: JSON.stringify(schema)
   })
+}
+
+const ensureExistingCollection = async (config, opts = {}) => {
+  const root = opts.indexDir || opts.root
+  const runtime = managedRuntimeInfoIfPresent({ root, version: opts.typesenseVersion })
+  if (!runtime) throw new Error(`managed Typesense runtime is not allocated for ${root || '<default index root>'}`)
+  const started = await startManagedTypesense({
+    root,
+    version: opts.typesenseVersion,
+    apiKey: config.apiKey,
+    install: false,
+    timeoutMs: Number(opts.typesenseStartTimeoutMs || opts.startTimeoutMs || 30000)
+  })
+  config.url = started.url
+  config.managed = started
+  const existing = await request(config, 'GET', `/collections/${encodeURIComponent(config.collection)}`)
+  const schema = collectionSchema(config.collection)
+  const existingNames = new Set((existing.fields || []).map(field => field.name))
+  const missingFields = schema.fields.filter(field => !existingNames.has(field.name))
+  if (collectionNeedsRecreate(existing, schema) || missingFields.length) {
+    const detail = missingFields.length ? `; missing fields: ${missingFields.map(field => field.name).join(', ')}` : ''
+    throw new Error(`Typesense collection ${config.collection} has an incompatible schema${detail}`)
+  }
+  return existing
 }
 
 const docForTypesense = doc => {
@@ -708,7 +729,7 @@ const pageWindow = ({ startAt = 0, limit = 20 }) => {
 
 const exactDocument = async ({ indexId, sessionId, agent, handle, includeContent = false, ...opts }) => {
   const config = typesenseConfig(opts)
-  await ensureCollection(config, opts)
+  await ensureExistingCollection(config, opts)
   const filters = [
     exactFilter('indexId', indexId || opts.index_id),
     exactFilter('sessionId', sessionId),
@@ -729,7 +750,7 @@ const exactDocument = async ({ indexId, sessionId, agent, handle, includeContent
 
 const childDocuments = async ({ indexId, sessionId, agent, parentHandle, startAt = 0, limit = 20, topic, ...opts }) => {
   const config = typesenseConfig(opts)
-  await ensureCollection(config, opts)
+  await ensureExistingCollection(config, opts)
   const window = pageWindow({ startAt, limit })
   const filters = [exactFilter('parentHandle', parentHandle)]
   filters.push('retrievalVisible:=true')
@@ -872,10 +893,17 @@ const sourceMessageRef = ref => Boolean(ref &&
   (ref.kind === 'message' || /^event_content(?:_chunk)?$/.test(String(ref.kind || '')))
 )
 
-const refText = ref => ref && ref.summaryMeta && ref.summaryMeta.status === 'completed'
+const navigationMessageText = value => String(value || '').slice(0, 4000)
+
+const refHasGeneratedSummary = ref => Boolean(ref &&
+  (ref.kind === 'summary_span' || ref.kind === 'session') &&
+  ref.summaryMeta && ref.summaryMeta.status === 'completed' &&
+  ref.summaryMeta.strategy !== 'summary-disabled')
+
+const refText = ref => refHasGeneratedSummary(ref)
   ? optionalString(ref.summary || ref.head)
   : sourceMessageRef(ref)
-    ? optionalString(ref.content || ref.excerpt || ref.summary || ref.head)
+    ? optionalString(navigationMessageText(ref.content || ref.excerpt || ref.summary || ref.head))
     : undefined
 
 const refIsOpenable = ref => Boolean(sourceMessageRef(ref) && (ref.isVerbatim || ref.content))
@@ -883,6 +911,41 @@ const refIsOpenable = ref => Boolean(sourceMessageRef(ref) && (ref.isVerbatim ||
 const refIsBrowsable = ref => Boolean(refText(ref) || refIsOpenable(ref))
 
 const refIsGeneratedSummary = ref => Boolean(ref && ref.kind === 'summary_span')
+
+const sourceMessageSearchIdentity = ref => {
+  if (!sourceMessageRef(ref)) return `handle:${ref && ref.handle || ''}`
+  const scope = [
+    ref.agent || '',
+    ref.index_id || ref.indexId || '',
+    ref.session_id || ref.sessionId || ''
+  ].join(':')
+  const role = ref.role || ''
+  const line = Number(ref.sourceLineNumber || ref.line || 0)
+  if (Number.isInteger(line) && line > 0) return `source:${scope}:line:${line}:role:${role}`
+  const messageId = String(ref.messageId || '')
+  if (messageId) return `source:${scope}:message:${messageId}:role:${role}`
+  return `handle:${ref.handle || ''}`
+}
+
+const sourceMessageSearchRefIsPreferred = (candidate, current) => {
+  const candidateOpenable = refIsOpenable(candidate)
+  const currentOpenable = refIsOpenable(current)
+  if (candidateOpenable !== currentOpenable) return candidateOpenable
+  const candidateMessage = candidate && candidate.kind === 'message'
+  const currentMessage = current && current.kind === 'message'
+  if (candidateMessage !== currentMessage) return candidateMessage
+  return String(candidate && candidate.handle || '').localeCompare(String(current && current.handle || '')) < 0
+}
+
+const canonicalizeSourceMessageSearchRefs = refs => {
+  const canonical = new Map()
+  for (const ref of refs || []) {
+    const key = sourceMessageSearchIdentity(ref)
+    const previous = canonical.get(key)
+    if (!previous || sourceMessageSearchRefIsPreferred(ref, previous)) canonical.set(key, ref)
+  }
+  return [...canonical.values()]
+}
 
 const browseRef = ref => {
   return {
@@ -893,7 +956,7 @@ const browseRef = ref => {
     line: ref.sourceLineNumber || undefined,
     text: refText(ref),
     openable: refIsOpenable(ref),
-    child_count: Number(ref.childCount || 0)
+    child_count: sourceMessageRef(ref) ? 0 : Number(ref.childCount || 0)
   }
 }
 
@@ -907,7 +970,7 @@ const searchRef = ref => {
     line: ref.sourceLineNumber || undefined,
     text: refText(ref),
     openable: refIsOpenable(ref),
-    child_count: Number(ref.childCount || 0)
+    child_count: sourceMessageRef(ref) ? 0 : Number(ref.childCount || 0)
   }
 }
 
@@ -931,6 +994,7 @@ const browseDocForTopicId = async ({ topicId, sessionId, agent, ...opts }) => {
     sessionId,
     agent,
     handle: parsed.handle,
+    includeContent: true,
     ...opts
   })
   if (!doc) throw new Error(`Unknown browse topic_id: ${topicId}`)
@@ -944,6 +1008,7 @@ const parentDocument = async ({ doc, sessionId, agent, ...opts }) => {
     sessionId: sessionId || doc.sessionId,
     agent: agent || doc.agent,
     handle: doc.parentHandle,
+    includeContent: true,
     ...opts
   })
 }
@@ -972,6 +1037,7 @@ const browseTypesense = async ({ indexId, sessionId, agent, handle, topicId, zoo
       sessionId,
       agent,
       handle: targetHandle,
+      includeContent: true,
       ...opts
     })
   }
@@ -1024,16 +1090,18 @@ const browseTypesense = async ({ indexId, sessionId, agent, handle, topicId, zoo
       childParentHandle = topSummary.handle
     }
   }
-  const childResult = await childDocuments({
-    indexId: doc.indexId,
-    sessionId,
-    agent: agent || doc.agent,
-    parentHandle: childParentHandle,
-    startAt: resolvedStart,
-    limit,
-    topic,
-    ...opts
-  })
+  const childResult = sourceMessageRef(ref)
+    ? { found: 0, docs: [] }
+    : await childDocuments({
+        indexId: doc.indexId,
+        sessionId,
+        agent: agent || doc.agent,
+        parentHandle: childParentHandle,
+        startAt: resolvedStart,
+        limit,
+        topic,
+        ...opts
+      })
   const childRefs = childResult.docs
     .map(child => docRef({ doc: child }))
     .filter(refIsBrowsable)
@@ -1061,7 +1129,7 @@ const browseTypesense = async ({ indexId, sessionId, agent, handle, topicId, zoo
 
 const searchTypesense = async (opts = {}) => {
   const config = typesenseConfig(opts)
-  await ensureCollection(config, opts)
+  await ensureExistingCollection(config, opts)
   const query = compactText([
     opts.query,
     opts.topic
@@ -1085,7 +1153,7 @@ const searchTypesense = async (opts = {}) => {
       : ''
     throw new Error(`Typesense returned found=${result.found} with no hits for query ${JSON.stringify(query || '*')};${logs} raw=${preview(JSON.stringify(result), 1000)}`)
   }
-  return hydrateDocs({
+  const refs = hydrateDocs({
     root: opts.indexDir || opts.root,
     includeContent: true,
     docs: (result.hits || [])
@@ -1094,7 +1162,8 @@ const searchTypesense = async (opts = {}) => {
         ...(hit.document || {}),
         _textMatch: hit.text_match || 1
       }))
-  }).map(doc => searchRef(docRef({ doc, score: doc._textMatch || 1 })))
+  }).map(doc => docRef({ doc, score: doc._textMatch || 1 }))
+  return (opts.canonicalize === false ? refs : canonicalizeSourceMessageSearchRefs(refs)).map(searchRef)
 }
 
 const health = async opts => {
@@ -1106,14 +1175,15 @@ module.exports = {
   DEFAULT_TYPESENSE_API_KEY,
   DEFAULT_TYPESENSE_COLLECTION,
   browseTypesense,
+  canonicalizeSourceMessageSearchRefs,
   collectionSchema,
   docForTypesense,
   deleteSessionDocuments,
   ensureCollection,
+  ensureExistingCollection,
   exactDocument,
   health,
   importDocuments,
-  isCollectionNotFoundError,
   openLinkTypesense,
   patchExistingIndexIds,
   resolveTypesenseConfig,

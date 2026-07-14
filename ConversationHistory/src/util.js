@@ -132,7 +132,14 @@ const withFileLock = (lockPath, fn, opts = {}) => {
   while (true) {
     try {
       fs.mkdirSync(lockPath)
-      writeJson(path.join(lockPath, 'owner.json'), lockOwner())
+      try {
+        writeJson(path.join(lockPath, 'owner.json'), lockOwner())
+      } catch (err) {
+        try {
+          fs.rmSync(lockPath, { recursive: true, force: true })
+        } catch (_cleanupErr) {}
+        throw err
+      }
       try {
         return fn()
       } finally {
@@ -154,6 +161,95 @@ const withFileLock = (lockPath, fn, opts = {}) => {
       }
       sleepSync(Math.min(pollMs, Math.max(1, deadline - Date.now())))
     }
+  }
+}
+
+const processIsAlive = pid => {
+  const value = Number(pid)
+  if (!Number.isInteger(value) || value <= 0) return false
+  try {
+    process.kill(value, 0)
+    return true
+  } catch (_err) {
+    return false
+  }
+}
+
+const readLockOwner = lockPath => {
+  try {
+    return readJson(path.join(lockPath, 'owner.json'))
+  } catch (_err) {
+    return null
+  }
+}
+
+const asyncDelay = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+const withAsyncFileLock = async (lockPath, fn, opts = {}) => {
+  const timeoutMs = opts.timeoutMs === undefined ? 30000 : Number(opts.timeoutMs)
+  const pollMs = opts.pollMs === undefined ? 50 : Number(opts.pollMs)
+  const staleMs = opts.staleMs === undefined ? 10 * 60 * 1000 : Number(opts.staleMs)
+  const deadline = Date.now() + Math.max(0, timeoutMs)
+  const token = crypto.randomBytes(16).toString('hex')
+  const owner = {
+    ...lockOwner(),
+    token
+  }
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true })
+  while (true) {
+    try {
+      fs.mkdirSync(lockPath)
+      try {
+        writeJson(path.join(lockPath, 'owner.json'), owner)
+      } catch (err) {
+        try {
+          fs.rmSync(lockPath, { recursive: true, force: true })
+        } catch (_cleanupErr) {}
+        throw err
+      }
+      break
+    } catch (err) {
+      if (err && err.code !== 'EEXIST') throw err
+      try {
+        const stat = fs.statSync(lockPath)
+        const currentOwner = readLockOwner(lockPath)
+        const locallyAlive = currentOwner &&
+          currentOwner.hostname === os.hostname() &&
+          processIsAlive(currentOwner.pid)
+        if (!locallyAlive && Number.isFinite(staleMs) && staleMs >= 0 && Date.now() - stat.mtimeMs > staleMs) {
+          fs.rmSync(lockPath, { recursive: true, force: true })
+          continue
+        }
+      } catch (_statErr) {}
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out waiting for lock: ${lockPath}`)
+      }
+      await asyncDelay(Math.min(pollMs, Math.max(1, deadline - Date.now())))
+    }
+  }
+  const heartbeatMs = Number.isFinite(staleMs) && staleMs > 0
+    ? Math.max(1000, Math.floor(staleMs / 3))
+    : 60 * 1000
+  const heartbeat = setInterval(() => {
+    try {
+      const currentOwner = readLockOwner(lockPath)
+      if (currentOwner && currentOwner.token === token) {
+        const now = new Date()
+        fs.utimesSync(lockPath, now, now)
+      }
+    } catch (_err) {}
+  }, heartbeatMs)
+  if (typeof heartbeat.unref === 'function') heartbeat.unref()
+  try {
+    return await fn()
+  } finally {
+    clearInterval(heartbeat)
+    try {
+      const currentOwner = readLockOwner(lockPath)
+      if (currentOwner && currentOwner.token === token) {
+        fs.rmSync(lockPath, { recursive: true, force: true })
+      }
+    } catch (_err) {}
   }
 }
 
@@ -283,6 +379,7 @@ module.exports = {
   readLines,
   safeId,
   stableStringify,
+  withAsyncFileLock,
   withFileLock,
   walkFiles,
   writeJson,

@@ -1,3 +1,4 @@
+const crypto = require('crypto')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
@@ -106,11 +107,13 @@ const fallbackSessionIdFromFile = file => {
   return match ? match[1] : hashString(file).slice(0, 24)
 }
 
-const fingerprintFromCompactions = ({ sessionId, compactions }) => {
+const fingerprintFromCompactions = ({ sessionId, compactions, sourceSize = 0, sourceHash = '' }) => {
   const last = compactions[compactions.length - 1] || null
   return {
-    schema: 'session-indexer.codex-source-fingerprint.v1',
+    schema: 'session-indexer.codex-source-fingerprint.v3',
     sessionId,
+    sourceSize: Number(sourceSize || 0),
+    sourceHash,
     compactionCount: compactions.length,
     lastCompactionLineNumber: last ? last.lineNumber : 0,
     lastCompactionTimestamp: last ? last.timestamp : '',
@@ -119,9 +122,13 @@ const fingerprintFromCompactions = ({ sessionId, compactions }) => {
 }
 
 const codexSessionFingerprint = file => {
+  const stat = fs.statSync(file)
+  const sourceHash = crypto.createHash('sha256')
   let sessionId = fallbackSessionIdFromFile(file)
   const compactions = []
   for (const { lineNumber, line } of readLines(file)) {
+    sourceHash.update(line)
+    sourceHash.update('\n')
     if (!line || (!line.includes('"session_meta"') && !line.includes('"compacted"'))) continue
     try {
       const json = JSON.parse(line)
@@ -144,7 +151,12 @@ const codexSessionFingerprint = file => {
       }
     }
   }
-  return fingerprintFromCompactions({ sessionId, compactions })
+  return fingerprintFromCompactions({
+    sessionId,
+    compactions,
+    sourceSize: stat.size,
+    sourceHash: sourceHash.digest('hex')
+  })
 }
 
 const latestCodexSessionFile = (root = DEFAULT_SESSIONS_ROOT) => latestCodexSessionFileFromTools(root)
@@ -527,6 +539,7 @@ const importCodexJsonl = (file, opts = {}) => {
   const compactions = []
   const names = opts.sessionNames || readSessionNames(opts.sessionIndex || DEFAULT_SESSION_INDEX)
   const stat = fs.statSync(file)
+  const sourceHash = crypto.createHash('sha256')
   let firstAt
   let meta
   let previousTokenUsage
@@ -534,6 +547,8 @@ const importCodexJsonl = (file, opts = {}) => {
   const events = []
 
   for (const row of readJsonlRows(file)) {
+    sourceHash.update(String(row.raw || ''))
+    sourceHash.update('\n')
     if (!row.parseError && row.json.type === 'session_meta' && row.json.payload && row.json.payload.id) {
       sessionId = row.json.payload.id
     }
@@ -568,7 +583,12 @@ const importCodexJsonl = (file, opts = {}) => {
     }
   }
 
-  const fingerprint = fingerprintFromCompactions({ sessionId, compactions })
+  const fingerprint = fingerprintFromCompactions({
+    sessionId,
+    compactions,
+    sourceSize: stat.size,
+    sourceHash: sourceHash.digest('hex')
+  })
   const title = names.get(sessionId) || `Codex session ${sessionId}`
   return createSessionIR({
     source: {

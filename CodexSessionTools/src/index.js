@@ -22,6 +22,7 @@ const DEFAULT_SESSION_SCAN_LIMIT = 100
 const DEFAULT_WINDOW_BYTES = 8 * 1024 * 1024
 const DEFAULT_PREVIEW_CHARS = 240
 const MARKER_SCAN_CHUNK_BYTES = 64 * 1024
+const SESSION_MARKER_SINCE_GRACE_MS = 2000
 
 const defaultCodexSessionRoot = () => path.join(os.homedir(), '.codex', 'sessions')
 
@@ -120,6 +121,10 @@ const sameFingerprint = (left, right) => Boolean(left && right) &&
   (left.dev === undefined || right.dev === undefined || left.dev === right.dev) &&
   (left.ino === undefined || right.ino === undefined || left.ino === right.ino)
 
+const sameFileIdentity = (left, right) => Boolean(left && right) &&
+  (left.dev === undefined || right.dev === undefined || left.dev === right.dev) &&
+  (left.ino === undefined || right.ino === undefined || left.ino === right.ino)
+
 const markerCacheKey = (root, marker) => `${path.resolve(root || defaultCodexSessionRoot())}\0${marker}`
 
 const markerCacheEntry = (cache, root, marker) => {
@@ -134,6 +139,17 @@ const markerCacheEntry = (cache, root, marker) => {
     cache.set(key, entry)
   }
   return entry
+}
+
+const primeMarkerLookupCache = ({ markerLookupCache, root, marker, sessionFiles = [] }) => {
+  const entry = markerCacheEntry(markerLookupCache, root, marker)
+  if (!entry) return markerLookupCache
+  for (const item of sessionFiles) {
+    if (!item || !item.file || entry.matches.has(item.file) || entry.misses.has(item.file)) continue
+    const fingerprint = fileFingerprint(item)
+    if (fingerprint) entry.misses.set(item.file, { fingerprint })
+  }
+  return markerLookupCache
 }
 
 const readRangeContainsLiteral = ({ file, literal, start, end }) => {
@@ -538,8 +554,15 @@ const scoreCodexSessionMarkerFile = (item, marker, options = {}) => {
   let startOffset = 0
   const cachedMiss = cacheEntry && cacheEntry.misses.get(item.file)
   if (cachedMiss && sameFingerprint(cachedMiss.fingerprint, fingerprint)) return null
-  if (cachedMiss && cachedMiss.fingerprint && fingerprint && fingerprint.size > cachedMiss.fingerprint.size) {
+  if (cachedMiss && cachedMiss.fingerprint && fingerprint &&
+      sameFileIdentity(cachedMiss.fingerprint, fingerprint) &&
+      fingerprint.size > cachedMiss.fingerprint.size) {
     startOffset = Math.max(0, cachedMiss.fingerprint.size - Buffer.byteLength(String(marker)) + 1)
+  } else if (Number(options.sessionMarkerSinceMs) > 0 && fingerprint) {
+    const scanBytes = Number(options.sessionMarkerScanBytes || options.maxBytes || DEFAULT_WINDOW_BYTES)
+    if (Number.isFinite(scanBytes) && scanBytes > 0) {
+      startOffset = Math.max(0, fingerprint.size - scanBytes - Buffer.byteLength(String(marker)) + 1)
+    }
   }
 
   const match = fileContainsLiteral({
@@ -610,7 +633,11 @@ const resolveForkedMarkerCandidate = (candidates, options = {}) => {
 const resolveCodexSessionForMarker = (root, marker, options = {}) => {
   const sessionRoot = root || defaultCodexSessionRoot()
   const sessionFiles = Array.isArray(options.sessionFiles) ? options.sessionFiles : walkJsonlFiles(sessionRoot)
-  const candidates = recentSessionFileItems(sessionFiles, options)
+  const markerSinceMs = Number(options.sessionMarkerSinceMs)
+  const eligibleSessionFiles = Number.isFinite(markerSinceMs) && markerSinceMs > 0
+    ? sessionFiles.filter(item => Number(item.mtimeMs) >= markerSinceMs - SESSION_MARKER_SINCE_GRACE_MS)
+    : sessionFiles
+  const candidates = recentSessionFileItems(eligibleSessionFiles, options)
     .map(item => scoreCodexSessionMarkerFile(item, marker, {
       ...options,
       root: sessionRoot
@@ -669,6 +696,7 @@ module.exports = {
   buildCodexExecArgs,
   parseToolArguments,
   parseJsonl,
+  primeMarkerLookupCache,
   readCodexThreadSpawnEdges,
   readFileWindow,
   recentSessionFileItems,

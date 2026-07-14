@@ -5,9 +5,9 @@ search/openLink, providers). This file is the Claude-Code-specific layer.
 
 ## Workspace isolation
 
-- This migrated checkout lives at `~/Documents/AgentTools/ConversationHistory`.
-  It intentionally does not include `.git`; initialize or attach version control
-  explicitly before branch, merge, checkout, or commit operations.
+- This checkout lives at `~/Documents/AgentTools/ConversationHistory` inside the
+  parent AgentTools Git repository. Run repository-wide Git operations from the
+  parent checkout and preserve other in-progress work there.
 
 ## Claude Code source adapter
 
@@ -31,9 +31,10 @@ search/openLink, providers). This file is the Claude-Code-specific layer.
 ## Plugin install + the development loop
 
 - Install for Claude Code: `node bin/session-indexer.js deploy --target claude-plugin`
-  (symlink mode by default). It writes `~/.claude/plugins/session-indexer` plus a
-  Claude marketplace, and prints the `claude plugin marketplace add` /
-  `claude plugin install` commands.
+  (copy mode by default; pass `--mode symlink` explicitly for local development).
+  It writes `~/.claude/plugins/conversation-history` plus a Claude marketplace,
+  and prints the `claude plugin marketplace add` / `claude plugin install`
+  commands.
 - The MCP server is a thin wrapper that spawns the CLI fresh for every tool call.
   So with a symlink install, edits to adapters / indexing / store / summarizer /
   CLI take effect on the **next tool call — no Claude Code restart needed**.

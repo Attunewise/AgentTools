@@ -32,17 +32,27 @@ function * docRows ({ sessionId, docs }) {
 }
 
 const writeSessionDocs = ({ root, sessionId, docs }) => {
-  writeJsonlRows(docStorePath(root, sessionId), docRows({ sessionId, docs }))
+  writeJsonlRows(docStorePath(root, sessionId), docRows({
+    sessionId,
+    docs
+  }))
 }
 
 const readSessionDocs = ({ root, sessionId }) => {
   const docs = []
-  for (const row of readJsonlRows(docStorePath(root, sessionId))) {
+  const file = docStorePath(root, sessionId)
+  let header = null
+  for (const row of readJsonlRows(file)) {
     if (row.parseError) {
-      throw new Error(`invalid session docs JSONL at ${docStorePath(root, sessionId)}:${row.lineNumber}: ${row.parseError}`)
+      throw new Error(`invalid session docs JSONL at ${file}:${row.lineNumber}: ${row.parseError}`)
     }
     const record = row.json || {}
-    if (record.recordType === 'session_doc' && record.doc) docs.push(record.doc)
+    if (record.recordType === 'session_docs_header') header = record
+    else if (record.recordType === 'session_doc' && record.doc) docs.push(record.doc)
+  }
+  if (!header) throw new Error(`missing session docs JSONL header: ${file}`)
+  if (String(header.sessionId || '') !== String(sessionId || '')) {
+    throw new Error(`session docs JSONL session mismatch at ${file}: expected ${sessionId}, got ${header.sessionId || '<missing>'}`)
   }
   return docs
 }
@@ -96,12 +106,7 @@ const findSourceNode = ({ tree, doc }) => {
   return candidates.find(node => node.kind === doc.kind) || (candidates.length === 1 ? candidates[0] : null)
 }
 
-const isSourceMessageDoc = doc => Boolean(doc &&
-  (doc.role === 'user' || doc.role === 'assistant') &&
-  (doc.kind === 'message' || /^event_content(?:_chunk)?$/.test(String(doc.kind || '')))
-)
-
-const canHydrateSourceContent = doc => isSourceMessageDoc(doc)
+const canHydrateSourceContent = doc => Boolean(doc && doc.isVerbatim)
 
 const sourceTreeCacheKey = ({ doc, opts }) => JSON.stringify({
   sourceKind: doc.sourceKind || '',

@@ -2,11 +2,13 @@ const fs = require('fs')
 const path = require('path')
 const chokidar = require('chokidar')
 const { adapterFor } = require('./adapters/index.js')
+const { loadCodexSessionTools } = require('./codexSessionTools.js')
 const { deploySkill } = require('./deploy.js')
 const {
   DEFAULT_POLL_MS,
   DEFAULT_TIMEOUT_MS,
   makeIndexingJobId,
+  readJobState,
   startIndexingJob,
   stopIndexingJobs,
   writeJobState
@@ -58,6 +60,13 @@ const {
   expandHome,
   newestFile
 } = require('./util.js')
+
+const {
+  primeMarkerLookupCache,
+  walkJsonlFiles: walkCodexJsonlFiles
+} = loadCodexSessionTools()
+
+const DEFAULT_SESSION_MARKER_WAIT_TIMEOUT_MS = 30 * 60 * 1000
 
 const usage = () => `
 Usage:
@@ -209,6 +218,8 @@ const parseArgs = argv => {
     timeoutMs: DEFAULT_TIMEOUT_MS,
     pollMs: DEFAULT_POLL_MS,
     waitForSessionMarker: false,
+    sessionMarkerSinceMs: 0,
+    sessionMarkerWaitTimeoutMs: DEFAULT_SESSION_MARKER_WAIT_TIMEOUT_MS,
     scope: 'this_session_only',
     jobId: '',
     query: '',
@@ -322,6 +333,8 @@ const parseArgs = argv => {
     else if (arg === '--timeout-ms') opts.timeoutMs = Number(next())
     else if (arg === '--poll-ms') opts.pollMs = Number(next())
     else if (arg === '--wait-for-session-marker') opts.waitForSessionMarker = true
+    else if (arg === '--session-marker-since-ms') opts.sessionMarkerSinceMs = Number(next())
+    else if (arg === '--session-marker-wait-timeout-ms') opts.sessionMarkerWaitTimeoutMs = Number(next())
     else if (arg === '--scope') opts.scope = next()
     else if (arg === '--job-id') opts.jobId = next()
     else if (arg === '--query') opts.query = next()
@@ -370,6 +383,8 @@ const parseArgs = argv => {
   if (!Number.isFinite(opts.debounceMs) || opts.debounceMs < 50) throw new Error('--debounce-ms must be at least 50')
   if (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs < 0) throw new Error('--timeout-ms must be zero or greater')
   if (!Number.isFinite(opts.pollMs) || opts.pollMs < 25) throw new Error('--poll-ms must be at least 25')
+  if (!Number.isFinite(opts.sessionMarkerSinceMs) || opts.sessionMarkerSinceMs < 0) throw new Error('--session-marker-since-ms must be zero or greater')
+  if (!Number.isFinite(opts.sessionMarkerWaitTimeoutMs) || opts.sessionMarkerWaitTimeoutMs <= 0) throw new Error('--session-marker-wait-timeout-ms must be positive')
   if (!Number.isInteger(opts.typesenseImportChunkSize) || opts.typesenseImportChunkSize < 1) throw new Error('--typesense-import-chunk-size must be a positive integer')
   if (!['model', 'off', 'none'].includes(opts.summaryMode)) throw new Error('--summary-mode must be model, off, or none')
   if (!Number.isInteger(opts.maxSummaryNodes) || opts.maxSummaryNodes < 0) throw new Error('--max-summary-nodes must be zero or greater')
@@ -1159,25 +1174,28 @@ const workerArgsFor = ({ opts, jobId, files }) => {
   if (opts.sessionIndex) args.push('--session-index', opts.sessionIndex)
   if (opts.includeResponseMessages) args.push('--include-response-messages')
   if (opts.waitForSessionMarker) {
-    args.push('--this-chat', '--session-marker', opts.sessionMarker, '--wait-for-session-marker')
+    args.push(
+      '--this-chat',
+      '--session-marker', opts.sessionMarker,
+      '--wait-for-session-marker',
+      '--session-marker-since-ms', String(opts.sessionMarkerSinceMs),
+      '--session-marker-wait-timeout-ms', String(opts.sessionMarkerWaitTimeoutMs)
+    )
   } else if (opts.scope === 'all') args.push('--all')
   else for (const file of files) args.push('--session', file)
   return args
 }
 
 const startIndexingSession = async opts => {
-  let files = []
-  let waitForSessionMarker = false
-  try {
-    files = indexingFiles(opts)
-  } catch (err) {
-    const canWaitForMarker = /could not resolve current|no .* session files found/i.test(err.message)
-    if (!opts.waitForSessionMarker || !opts.thisChat || !opts.sessionMarker || !canWaitForMarker) {
-      throw err
-    }
-    waitForSessionMarker = true
-  }
+  const waitForSessionMarker = Boolean(opts.waitForSessionMarker && opts.thisChat && opts.sessionMarker)
+  const files = waitForSessionMarker ? [] : indexingFiles(opts)
+  const sessionMarkerBaseline = waitForSessionMarker && opts.source === 'codex'
+    ? walkCodexJsonlFiles(opts.sourceRoot || adapterFor(opts.source).defaultRoot)
+    : []
   opts.waitForSessionMarker = waitForSessionMarker
+  if (waitForSessionMarker && !(Number(opts.sessionMarkerSinceMs) > 0)) {
+    opts.sessionMarkerSinceMs = Date.now()
+  }
   const jobId = makeIndexingJobId({
     source: opts.source,
     scope: opts.scope,
@@ -1226,6 +1244,7 @@ const startIndexingSession = async opts => {
     sourceRoot: opts.sourceRoot,
     sessionMarker: waitForSessionMarker ? opts.sessionMarker : '',
     waitForSessionMarker,
+    sessionMarkerBaseline,
     sessions: files,
     workerArgs,
     timeoutMs: opts.timeoutMs,
@@ -1285,6 +1304,16 @@ const runIndexWorker = async opts => {
     pricingCacheDir: opts.pricingCacheDir,
     maxSummaryNodes: opts.maxSummaryNodes
   })
+  const markerLookupCache = new Map()
+  if (opts.source === 'codex' && opts.waitForSessionMarker) {
+    const initial = readJobState({ root: opts.indexDir, jobId }) || {}
+    primeMarkerLookupCache({
+      markerLookupCache,
+      root: opts.sourceRoot || adapter.defaultRoot,
+      marker: opts.sessionMarker,
+      sessionFiles: initial.sessionMarkerBaseline || []
+    })
+  }
   const writeState = state => writeJobState({
     root: opts.indexDir,
     state: {
@@ -1466,6 +1495,29 @@ const runIndexWorker = async opts => {
         sessions.push(reusableIndexedSession({ adapter, file, opts }) || await importAndIndex(file))
       }
       const readiness = summarizeReadiness(sessions)
+      const changedDuringIndex = adapter.sourceFingerprint
+        ? files.filter((file, index) => !sameFingerprint(
+            sessions[index] && sessions[index].sourceFingerprint,
+            adapter.sourceFingerprint(file)
+          ))
+        : []
+      if (changedDuringIndex.length) {
+        const progress = {
+          phase: 'source_changed_during_index',
+          pass,
+          changedFiles: changedDuringIndex,
+          changedFileCount: changedDuringIndex.length
+        }
+        logProgress(progress)
+        writeState({
+          status: 'indexing',
+          ready: false,
+          sessions: files,
+          progress
+        })
+        pass += 1
+        continue
+      }
       const budgetSuspendedSession = sessions.find(session => budgetSuspensionForSession(session))
       if (budgetSuspendedSession) {
         await suspendWorkerWithSuspension(budgetSuspensionForSession(budgetSuspendedSession), {
@@ -1508,12 +1560,25 @@ const runIndexWorker = async opts => {
 
   const resolveWorkerFiles = async () => {
     if (!opts.waitForSessionMarker) return selectFiles(adapter, opts)
+    const markerWaitStartedAtMs = Number(opts.sessionMarkerSinceMs) > 0
+      ? Number(opts.sessionMarkerSinceMs)
+      : Date.now()
+    const markerWaitTimeoutMs = Math.max(0, Number(opts.sessionMarkerWaitTimeoutMs || 0))
     while (!stopped) {
-      const resolved = adapter.resolveCurrentSessionFile({
-        root: opts.sourceRoot || adapter.defaultRoot,
-        command: opts.command,
-        sessionMarker: opts.sessionMarker
-      })
+      let markerAmbiguity = null
+      let resolved = null
+      try {
+        resolved = adapter.resolveCurrentSessionFile({
+          root: opts.sourceRoot || adapter.defaultRoot,
+          command: opts.command,
+          sessionMarker: opts.sessionMarker,
+          sessionMarkerSinceMs: opts.sessionMarkerSinceMs,
+          markerLookupCache
+        })
+      } catch (err) {
+        if (!err || err.code !== 'AMBIGUOUS_SESSION_MARKER') throw err
+        markerAmbiguity = err.message
+      }
       if (resolved && resolved.file) {
         opts.currentSessionResolution = {
           file: resolved.file,
@@ -1530,7 +1595,8 @@ const runIndexWorker = async opts => {
       }
       const progress = {
         phase: 'waiting_for_session_marker',
-        sessionMarker: opts.sessionMarker
+        sessionMarker: opts.sessionMarker,
+        ...(markerAmbiguity ? { reason: 'awaiting_fork_disambiguation', message: markerAmbiguity } : {})
       }
       logProgress(progress)
       writeState({
@@ -1541,6 +1607,25 @@ const runIndexWorker = async opts => {
         sessions: [],
         progress
       })
+      if (markerWaitTimeoutMs > 0 && Date.now() - markerWaitStartedAtMs >= markerWaitTimeoutMs) {
+        const message = `session marker did not appear within ${markerWaitTimeoutMs}ms`
+        const timeoutProgress = {
+          phase: 'session_marker_timeout',
+          sessionMarker: opts.sessionMarker,
+          waitedMs: Date.now() - markerWaitStartedAtMs
+        }
+        logProgress({ ...timeoutProgress, message })
+        writeState({
+          status: 'error',
+          ready: false,
+          error: message,
+          sessionMarker: opts.sessionMarker,
+          waitForSessionMarker: true,
+          sessions: [],
+          progress: timeoutProgress
+        })
+        return []
+      }
       await sleep(opts.pollMs)
     }
     return []
@@ -1561,9 +1646,6 @@ const runIndexWorker = async opts => {
       },
       startedAt: new Date().toISOString()
     })
-    await indexFiles(files)
-    if (stopped) return
-
     const watched = opts.scope === 'all'
       ? path.join(opts.sourceRoot || adapter.defaultRoot, '**', '*.jsonl')
       : files
@@ -1634,6 +1716,18 @@ const runIndexWorker = async opts => {
     })
     watcher.on('add', queue)
     watcher.on('change', queue)
+    await new Promise((resolve, reject) => {
+      watcher.once('ready', resolve)
+      watcher.once('error', reject)
+    })
+    watcherIndexRunning = true
+    try {
+      await indexFiles(files)
+    } finally {
+      watcherIndexRunning = false
+    }
+    if (stopped) return
+    if (watcherIndexAgain || changedFiles.size) await indexQueuedChanges()
     await new Promise(() => {})
   } catch (err) {
     if (workerSuspensionForError(err)) {

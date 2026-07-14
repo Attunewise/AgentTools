@@ -10,7 +10,6 @@ const {
   createSummaryNode,
   isModelVisibleNode,
   modelVisibleChildren,
-  nodeTimeFields,
   rebuildTreeIndex
 } = require('./mip.js')
 const { addUsage, normalizeUsage } = require('./ir.js')
@@ -42,6 +41,8 @@ const {
 } = require('./topics.js')
 
 const SUMMARY_SYSTEM_PROMPT = 'Preserve the turns in the conversation. Identify the speaker, user, assistant, or tool call. Copy the information, not the wording. Keep all concrete state. Remove filler, repetition, politeness padding, meta-commentary, and verbose restatements. Do not abstract. Do not decide salience unless something is clearly redundant or obsolete. For tool calls summarize the operation, input, and outcome'
+const PARENT_SUMMARY_SYSTEM_PROMPT = 'Create a concise higher-level conversation summary from the complete ordered child summaries. Preserve concrete state, decisions, open tasks, tool outcomes, file paths, code symbols, model and tool choices, errors, constraints, and user preferences. Merge redundant facts and preserve chronology only where it changes causality or state. Do not list original turns or invent missing details. Return only one JSON object with keys breadcrumb, summary, and topics. breadcrumb is one or two words. summary is the complete parent summary. topics is an array of objects with one_word and one_line keys.'
+const PARENT_UPDATE_SYSTEM_PROMPT = 'Revise an existing higher-level conversation summary using the supplied ordered child-summary suffix. The update metadata says whether the suffix is appended or replaces the previous suffix. When it replaces a suffix, remove or revise claims supported only by the superseded child summaries; new child evidence takes precedence over stale statements in the existing summary. Preserve still-valid concrete state, decisions, open tasks, tool outcomes, file paths, code symbols, model and tool choices, errors, constraints, and user preferences. Merge redundant facts and preserve chronology only where it changes causality or state. Return a complete replacement summary, not a patch. Do not list original turns or invent missing details. Return only one JSON object with keys breadcrumb, summary, and topics. breadcrumb is one or two words. summary is the complete updated parent summary. topics is an array of objects with one_word and one_line keys.'
 
 const DEFAULT_SUMMARY_MODE = process.env.SESSION_INDEXER_SUMMARY_MODE || 'model'
 const DEFAULT_SUMMARY_PROVIDER = process.env.SESSION_INDEXER_SUMMARY_PROVIDER || 'openai-codex-responses'
@@ -62,6 +63,36 @@ const DEFAULT_SUMMARY_EMPTY_RESPONSE_BACKOFF_MS = Number(process.env.SESSION_IND
 const SPAN_SUMMARY_STRATEGY = 'compaction-contiguous-span-v1'
 const ROOT_SUMMARY_STRATEGY = 'compaction-root-summary-v1'
 const SUMMARY_TARGET_SCHEMA = 'session-indexer.summary-target.v1'
+
+const summaryLevelForNode = node => {
+  if (!node) return 1
+  if (node.kind !== 'session') {
+    return Number(node.meta && node.meta.summaryLevel || node.summaryMeta && node.summaryMeta.summaryLevel || 1)
+  }
+  const childLevels = (node.children || []).map(child => Number(
+    child.meta && child.meta.summaryLevel || child.summaryMeta && child.summaryMeta.summaryLevel || 0
+  ))
+  return Math.max(1, ...childLevels) + 1
+}
+
+const summarySystemPromptForNode = (node, promptAction = 'create') => {
+  if (summaryLevelForNode(node) <= 1) return SUMMARY_SYSTEM_PROMPT
+  return promptAction === 'update'
+    ? PARENT_UPDATE_SYSTEM_PROMPT
+    : PARENT_SUMMARY_SYSTEM_PROMPT
+}
+
+const summaryPromptHashesForNode = node => summaryLevelForNode(node) <= 1
+  ? new Set([hashString(SUMMARY_SYSTEM_PROMPT)])
+  : new Set([
+      hashString(PARENT_SUMMARY_SYSTEM_PROMPT),
+      hashString(PARENT_UPDATE_SYSTEM_PROMPT)
+    ])
+const SUMMARY_PROMPT_SET_HASH = hashString([
+  SUMMARY_SYSTEM_PROMPT,
+  PARENT_SUMMARY_SYSTEM_PROMPT,
+  PARENT_UPDATE_SYSTEM_PROMPT
+].join('\n---\n'))
 
 const CODEX_MODEL_PREFERENCES = [
   'gpt-5.4-mini',
@@ -462,42 +493,232 @@ const truncateSource = (text, maxChars) => {
   return `${value.slice(0, Math.max(0, maxChars - 64))}\n[truncated ${value.length - maxChars + 64} chars]`
 }
 
+const SUMMARY_SOURCE_EVENT_TYPES = new Set(['message', 'tool_call', 'tool_result'])
+const SYNTHETIC_HARNESS_MARKER = /<(?:recommended_plugins|environment_context|permissions instructions|collaboration_mode|multi_agent_mode|skills_instructions|apps_instructions|plugins_instructions)(?:\s[^>]*)?>/i
+
+const summarySourceEventType = child => child && child.meta && child.meta.type || child && child.kind
+
+const isSyntheticHarnessMessage = child => {
+  if (summarySourceEventType(child) !== 'message' || child.meta && child.meta.role !== 'user') return false
+  const source = child.meta && child.meta.source || {}
+  return source.outerType === 'response_item' &&
+    source.payloadType === 'message' &&
+    SYNTHETIC_HARNESS_MARKER.test(nodeRawText(child))
+}
+
+const isLevelOneSummarySource = child => {
+  const type = summarySourceEventType(child)
+  if (!SUMMARY_SOURCE_EVENT_TYPES.has(type)) return false
+  if (type === 'message') {
+    const role = child.meta && child.meta.role
+    return (role === 'user' || role === 'assistant') && !isSyntheticHarnessMessage(child)
+  }
+  return true
+}
+
+const levelOneSummarySources = children => modelVisibleChildren(children).filter(isLevelOneSummarySource)
+
+const parseJsonValue = value => {
+  const text = String(value || '').trim()
+  if (!text || (text[0] !== '{' && text[0] !== '[')) return undefined
+  try {
+    return JSON.parse(text)
+  } catch (_err) {
+    return undefined
+  }
+}
+
+const summaryTextRecords = values => {
+  const records = []
+  const seen = new Set()
+  for (const value of values || []) {
+    if (!value || typeof value !== 'object') continue
+    const text = String(value.text || '').trim()
+    if (!text) continue
+    const line = value.line === undefined || value.line === null || value.line === ''
+      ? undefined
+      : value.line
+    const key = `${line === undefined ? '' : String(line)}\n${text}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    records.push({ text })
+  }
+  return records
+}
+
+const compactSessionIndexerSummaryResult = value => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  if (value.schema === 'session-indexer.search.v1') {
+    return summaryTextRecords(value.hits)
+  }
+  if (value.schema === 'session-indexer.browse.v1') {
+    return summaryTextRecords([value, ...(Array.isArray(value.children) ? value.children : [])])
+  }
+  if (value.schema === 'session-indexer.openLink.v1') {
+    return {
+      content: String(value.content || ''),
+      isVerbatim: Boolean(value.isVerbatim),
+      omittedTokenCount: Number(value.omittedTokenCount || 0)
+    }
+  }
+  return null
+}
+
+const canonicalizeMcpCallToolResult = value => {
+  if (typeof value === 'string') {
+    const parsed = parseJsonValue(value)
+    if (parsed === undefined) return { value, changed: false }
+    const nested = canonicalizeMcpCallToolResult(parsed)
+    return nested.changed
+      ? { value: stableStringify(nested.value), changed: true }
+      : { value, changed: false }
+  }
+  if (Array.isArray(value)) {
+    let changed = false
+    const items = value.map(item => {
+      const nested = canonicalizeMcpCallToolResult(item)
+      changed = changed || nested.changed
+      return nested.value
+    })
+    return { value: changed ? items : value, changed }
+  }
+  if (!value || typeof value !== 'object') return { value, changed: false }
+
+  const retrieval = compactSessionIndexerSummaryResult(value)
+  if (retrieval !== null) return { value: retrieval, changed: true }
+
+  if (Array.isArray(value.content) && value.structuredContent !== undefined) {
+    const payload = value.structuredContent &&
+      typeof value.structuredContent === 'object' &&
+      !Array.isArray(value.structuredContent) &&
+      Object.hasOwn(value.structuredContent, 'result')
+      ? value.structuredContent.result
+      : value.structuredContent
+    const structured = canonicalizeMcpCallToolResult(payload)
+    let canonical = structured.value
+    if (value.isError === true) {
+      canonical = canonical && typeof canonical === 'object' && !Array.isArray(canonical)
+        ? { ...canonical, isError: true }
+        : { result: canonical, isError: true }
+    }
+    return { value: canonical, changed: true }
+  }
+
+  let changed = false
+  const canonical = {}
+  for (const [key, item] of Object.entries(value)) {
+    const nested = canonicalizeMcpCallToolResult(item)
+    changed = changed || nested.changed
+    canonical[key] = nested.value
+  }
+  return { value: changed ? canonical : value, changed }
+}
+
+const levelOneSourceText = (child, maxChars) => {
+  const raw = nodeRawText(child)
+  const type = summarySourceEventType(child)
+  if (type === 'tool_call') {
+    const parsed = parseJsonValue(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return truncateSource(raw, maxChars)
+    return truncateSource(stableStringify({
+      name: parsed.name || child.meta && child.meta.toolName,
+      arguments: parsed.arguments
+    }), maxChars)
+  }
+  if (type !== 'tool_result') return truncateSource(raw, maxChars)
+  const parsed = parseJsonValue(raw)
+  if (parsed === undefined) return truncateSource(raw, maxChars)
+  const canonical = canonicalizeMcpCallToolResult(parsed)
+  return truncateSource(canonical.changed ? stableStringify(canonical.value) : raw, maxChars)
+}
+
 const childRecord = (child, maxChildChars, opts = {}) => {
-  const record = {
-    label: child.breadcrumb || child.title || child.kind || 'child',
-    kind: child.kind,
-    title: child.title,
-    ...nodeTimeFields(child),
-    summary: child.head || '',
-    topics: opts.includeRawSource ? [] : child.topics || [],
-    child_count: modelVisibleChildren(child.children).length
-  }
-  if (child.meta && (child.meta.type === 'tool_call' || child.meta.type === 'tool_result')) {
-    record.tool_role = child.meta.type === 'tool_call' ? 'call' : 'result'
-    if (child.meta.toolName) record.tool_name = child.meta.toolName
-    if (child.meta.callId) record.tool_call_id = child.meta.callId
-  }
   if (opts.includeRawSource) {
-    record.source_text = truncateSource(nodeRawText(child), opts.maxSourceChars || maxChildChars)
-  } else if (!child.children.length) {
-    record.source_excerpt = preview(child.raw, maxChildChars)
+    const type = summarySourceEventType(child)
+    const record = {}
+    if (type === 'message') record.role = child.meta && child.meta.role
+    if (type === 'tool_call' || type === 'tool_result') {
+      record.tool_role = type === 'tool_call' ? 'call' : 'result'
+      if (child.meta && child.meta.toolName) record.tool_name = child.meta.toolName
+      if (child.meta && child.meta.callId) record.tool_call_id = child.meta.callId
+    }
+    record.source_text = levelOneSourceText(child, opts.maxSourceChars || maxChildChars)
+    return record
+  }
+  const meta = child.meta || {}
+  const startAt = meta.startAt || meta.at
+  const endAt = meta.endAt || meta.at
+  const startMs = Date.parse(startAt || '')
+  const endMs = Date.parse(endAt || '')
+  const record = {
+    summary: child.head || '',
+    token_count: Number(child.fullTokenCount || 0),
+    start_at: startAt,
+    end_at: endAt,
+    duration_ms: Number.isFinite(startMs) && Number.isFinite(endMs)
+      ? Math.max(0, endMs - startMs)
+      : undefined
+  }
+  for (const key of Object.keys(record)) {
+    if (record[key] === undefined || record[key] === '') delete record[key]
   }
   return record
 }
 
-const makePrompt = ({ node, maxChildChars, inputTokenBudget }) => {
+const previousSummaryRecord = maintenanceBase => {
+  if (!maintenanceBase) return null
+  const record = {
+    summary: summaryRecordFromJob(maintenanceBase).summary,
+    token_count: Number(maintenanceBase.fullTokenCount || 0),
+    start_at: maintenanceBase.startAt,
+    end_at: maintenanceBase.endAt,
+    duration_ms: maintenanceBase.durationMs
+  }
+  for (const key of Object.keys(record)) {
+    if (record[key] === undefined || record[key] === '') delete record[key]
+  }
+  return record.summary ? record : null
+}
+
+const makePrompt = ({ node, maxChildChars, inputTokenBudget, maintenanceBase, deltaChildren, promptPlan }) => {
   const includeRawSource = node.meta && node.meta.summaryLevel === 1
   const maxSourceChars = Math.max(maxChildChars, (inputTokenBudget || DEFAULT_SUMMARY_INPUT_TOKEN_BUDGET) * 4)
-  const childLines = modelVisibleChildren(node.children).map(child => JSON.stringify(childRecord(child, maxChildChars, {
+  const children = includeRawSource
+    ? levelOneSummarySources(node.children)
+    : Array.isArray(deltaChildren)
+      ? deltaChildren
+      : modelVisibleChildren(node.children)
+  const childLines = children.map(child => JSON.stringify(childRecord(child, maxChildChars, {
     includeRawSource,
     maxSourceChars
   })))
+  if (includeRawSource) {
+    return [
+      'Transcript records (JSONL):',
+      ...childLines
+    ].join('\n')
+  }
+  if (!promptPlan || promptPlan.action !== 'update') {
+    return [
+      'Complete ordered child summaries (JSONL):',
+      ...childLines
+    ].join('\n')
+  }
+  const existing = previousSummaryRecord(maintenanceBase)
+  if (!existing) throw new Error(`parent update prompt requires an existing summary: ${node.handle}`)
   return [
-  `Node title: ${node.title}`,
-  `Node kind: ${node.kind}`,
-  '',
-  'Child records (JSONL):',
-  ...childLines
+    'Existing summary to revise:',
+    JSON.stringify(existing),
+    '',
+    `Child-summary update: ${JSON.stringify({
+      kind: promptPlan.updateKind,
+      unchanged_child_count: promptPlan.unchangedChildCount,
+      previous_child_count: promptPlan.previousChildCount,
+      current_child_count: promptPlan.currentChildCount
+    })}`,
+    '',
+    'New or replacement child-summary suffix (JSONL):',
+    ...childLines
   ].join('\n')
 }
 
@@ -679,6 +900,116 @@ const sourceFingerprint = child => {
 
 const sourceHashForChildren = children => hashString((children || []).map(sourceFingerprint).join('\n'))
 
+const summaryLineageHandle = handle => String(handle || '').replace(
+  /(\/summary\/level-\d+\/span-\d{4})(?:-[^/]+)?$/,
+  '$1'
+)
+
+const childRevisionHashesForNode = node => (node.children || []).map(child => hashString(sourceFingerprint(child)))
+
+const sourceGroupHashForNode = node => sourceHashForChildren(node.children || [])
+
+const completedAtMs = job => {
+  const value = Date.parse(job && (job.completedAt || job.generatedAt) || '')
+  return Number.isFinite(value) ? value : 0
+}
+
+const jobPromptMatchesNode = (job, node) => {
+  if (!job || !node) return false
+  if (!job.promptHash && summaryLevelForNode(node) > 1) return false
+  if (job.promptHash && !summaryPromptHashesForNode(node).has(job.promptHash)) return false
+  const currentSourceHash = sourceGroupHashForNode(node)
+  if (job.sourceGroupHash) return job.sourceGroupHash === currentSourceHash
+  const currentRevisions = childRevisionHashesForNode(node)
+  if (Array.isArray(job.childRevisionHashes) && job.childRevisionHashes.length) {
+    return stableStringify(job.childRevisionHashes) === stableStringify(currentRevisions)
+  }
+  // Legacy span handles contained a hash of their child handles. They remain
+  // safe to reuse for an unchanged non-root span, but a session root has always
+  // had a stable handle and therefore needs revision evidence.
+  return node.kind !== 'session' && summaryLineageHandle(job.handle) === node.handle
+}
+
+const maintenanceBaseForNode = ({ node, previousSummaryJobs }) => {
+  if (summaryLevelForNode(node) <= 1) return null
+  const lineage = summaryLineageHandle(node.handle)
+  const currentSourceHash = sourceGroupHashForNode(node)
+  const candidates = (previousSummaryJobs || [])
+    .filter(job => hasReusableSummary(job))
+    .filter(job => summaryLineageHandle(job.handle) === lineage)
+    .filter(job => !job.sourceGroupHash || job.sourceGroupHash !== currentSourceHash)
+    .sort((a, b) => completedAtMs(b) - completedAtMs(a))
+  return candidates[0] || null
+}
+
+const summaryPromptPlanForNode = ({ node, maintenanceBase }) => {
+  const children = modelVisibleChildren(node.children)
+  if (summaryLevelForNode(node) <= 1) {
+    return {
+      action: 'leaf',
+      children,
+      currentChildCount: children.length
+    }
+  }
+  const create = reason => ({
+    action: 'create',
+    reason,
+    children,
+    previousChildCount: Array.isArray(maintenanceBase && maintenanceBase.childRevisionHashes)
+      ? maintenanceBase.childRevisionHashes.length
+      : 0,
+    currentChildCount: children.length
+  })
+  if (!maintenanceBase) return create('new_parent')
+  const previous = Array.isArray(maintenanceBase.childRevisionHashes)
+    ? maintenanceBase.childRevisionHashes
+    : []
+  const current = childRevisionHashesForNode(node)
+  if (!previous.length) return create('missing_revision_lineage')
+  if (current.length < previous.length) return create('child_sequence_shrank')
+  let firstChanged = 0
+  while (
+    firstChanged < previous.length &&
+    firstChanged < current.length &&
+    previous[firstChanged] === current[firstChanged]
+  ) firstChanged += 1
+  if (firstChanged === current.length && previous.length === current.length) {
+    return create('unchanged_target_not_reusable')
+  }
+  return {
+    action: 'update',
+    updateKind: firstChanged === previous.length ? 'append' : 'replace_suffix',
+    children: children.slice(firstChanged),
+    unchangedChildCount: firstChanged,
+    previousChildCount: previous.length,
+    currentChildCount: current.length
+  }
+}
+
+const nodeJobMetadata = node => {
+  const meta = node.meta || {}
+  const startAt = meta.startAt || meta.at
+  const endAt = meta.endAt || meta.at
+  const startMs = Date.parse(startAt || '')
+  const endMs = Date.parse(endAt || '')
+  return {
+    summaryLevel: summaryLevelForNode(node),
+    spanIndex: node.kind === 'session' ? 0 : Number(meta.spanIndex || 0),
+    lineageHandle: summaryLineageHandle(node.handle),
+    sourceGroupHash: sourceGroupHashForNode(node),
+    childStartHandle: node.children[0] && node.children[0].handle,
+    childEndHandle: node.children[node.children.length - 1] && node.children[node.children.length - 1].handle,
+    childHandles: node.children.map(child => child.handle),
+    childRevisionHashes: childRevisionHashesForNode(node),
+    fullTokenCount: Number(node.fullTokenCount || 0),
+    startAt,
+    endAt,
+    durationMs: Number.isFinite(startMs) && Number.isFinite(endMs)
+      ? Math.max(0, endMs - startMs)
+      : undefined
+  }
+}
+
 const summaryNodesUnder = (node, out = []) => {
   if (!node) return out
   if (node.kind === 'summary_span') out.push(node)
@@ -767,6 +1098,36 @@ const prepareRollupSummaryLayers = (tree, opts = {}) => {
   return summaryNodesUnder(tree.root)
 }
 
+const proactiveTailSpan = tree => {
+  const children = tree.root.children || []
+  let boundaryIndex = -1
+  for (let index = children.length - 1; index >= 0; index -= 1) {
+    const child = children[index]
+    if (child.kind === 'compaction' || child.meta && child.meta.type === 'compaction') {
+      boundaryIndex = index
+      break
+    }
+  }
+  const tail = levelOneSummarySources(children.slice(boundaryIndex + 1))
+  if (!tail.length) return null
+  return {
+    index: -1,
+    startIndex: boundaryIndex + 1,
+    endIndex: children.length - 1,
+    boundaryIndex: undefined,
+    boundaryHandle: 'proactive-tail',
+    children: tail,
+    proactive: true
+  }
+}
+
+const readyGroupsForSpan = ({ span, inputTokenBudget }) => {
+  const groups = groupByInputTokenBudget(levelOneSummarySources(span.children), inputTokenBudget)
+  if (!span.proactive || !groups.length) return groups
+  return groups.filter((group, index) =>
+    index < groups.length - 1 || Number(group.inputTokenCount || 0) >= Number(inputTokenBudget || 0))
+}
+
 const prepareCompactedSummaryLayer = (tree, opts = {}) => {
   if ((tree.root.children || []).some(node => node.kind === 'summary_span')) {
     return {
@@ -778,12 +1139,14 @@ const prepareCompactedSummaryLayer = (tree, opts = {}) => {
   }
   const inputTokenBudget = opts.summaryInputTokenBudget || DEFAULT_SUMMARY_INPUT_TOKEN_BUDGET
   const compactedSpans = compactedEventSpans(tree)
+  const tailSpan = proactiveTailSpan(tree)
+  const plannedSpans = tailSpan ? [...compactedSpans, tailSpan] : compactedSpans
   const summaryNodes = []
-  for (const span of compactedSpans) {
-    const spanChildren = modelVisibleChildren(span.children)
+  for (const span of plannedSpans) {
+    const spanChildren = levelOneSummarySources(span.children)
     if (!spanChildren.length) continue
     const sourceSpanHash = sourceHashForChildren(spanChildren)
-    for (const group of groupByInputTokenBudget(spanChildren, inputTokenBudget)) {
+    for (const group of readyGroupsForSpan({ span, inputTokenBudget })) {
       const sourceGroupHash = sourceHashForChildren(group.children)
       const node = createSummaryNode({
         tree,
@@ -791,7 +1154,7 @@ const prepareCompactedSummaryLayer = (tree, opts = {}) => {
         index: summaryNodes.length,
         children: group.children,
         meta: {
-          source: 'compacted-transcript',
+          source: span.proactive ? 'proactive-transcript-tail' : 'compacted-transcript',
           compactionBoundaryHandle: span.boundaryHandle,
           compactedSpanIndex: span.index,
           spanStartIndex: span.startIndex,
@@ -826,8 +1189,9 @@ const prepareCompactedSummaryLayer = (tree, opts = {}) => {
     status: summaryNodes.length ? 'prepared' : 'no_compaction',
     nodes,
     compactedSpanCount: compactedSpans.length,
-    compactedInputTokenCount: compactedSpans.reduce((sum, span) => sum +
-      modelVisibleChildren(span.children).reduce((childSum, child) => childSum + Number(child.fullTokenCount || 0), 0), 0)
+    compactedInputTokenCount: summaryNodes
+      .filter(node => node.meta && node.meta.summaryLevel === 1)
+      .reduce((sum, node) => sum + Number(node.meta && node.meta.inputTokenCount || 0), 0)
   }
 }
 
@@ -848,13 +1212,29 @@ const candidateSummaryNodes = ({ tree, prepared }) => {
   return nodes
 }
 
-const summaryTargetMaterial = ({ node, childHash, resolved, maxChildChars, inputTokenBudget, strategy }) => ({
+const summaryTargetMaterial = ({
+  node,
+  childHash,
+  resolved,
+  maxChildChars,
+  inputTokenBudget,
+  strategy,
+  promptHash,
+  promptAction,
+  updateKind,
+  maintenanceBaseTargetId,
+  deltaChildRevisionHashes
+}) => ({
   schema: SUMMARY_TARGET_SCHEMA,
   strategy,
   nodeHandle: node.handle,
-  sourceGroupHash: node.kind === 'session' ? sourceHashForChildren(node.children) : node.meta && node.meta.sourceGroupHash,
-  promptHash: hashString(SUMMARY_SYSTEM_PROMPT),
+  sourceGroupHash: sourceGroupHashForNode(node),
+  promptHash,
+  promptAction,
+  updateKind: updateKind || '',
   childHash,
+  maintenanceBaseTargetId: maintenanceBaseTargetId || '',
+  deltaChildRevisionHashes: deltaChildRevisionHashes || [],
   provider: resolved.providerName,
   model: resolved.model,
   reasoningEffort: resolved.reasoningEffort || '',
@@ -932,13 +1312,17 @@ const markSummaryError = ({ node, internalJob, error, mode, resolved }) => {
       modelSource: resolved.modelSource,
       modelCache: resolved.modelCache,
       reasoningEffort: resolved.reasoningEffort,
-      promptHash: hashString(SUMMARY_SYSTEM_PROMPT),
+      promptHash: internalJob.promptHash,
+      promptAction: internalJob.promptAction,
+      updateKind: internalJob.updateKind,
       childHash: internalJob.childHash,
       customId: internalJob.customId,
       targetId: internalJob.targetId,
       targetMaterialHash: internalJob.targetMaterialHash,
       strategy: internalJob.strategy || SPAN_SUMMARY_STRATEGY,
-      summaryLevel: node.meta && node.meta.summaryLevel,
+      summaryLevel: internalJob.summaryLevel || summaryLevelForNode(node),
+      sourceGroupHash: internalJob.sourceGroupHash,
+      childRevisionHashes: internalJob.childRevisionHashes,
       inputTokenBudget: internalJob.inputTokenBudget,
       inputTokenCount: internalJob.inputTokenCount,
       status: 'error',
@@ -966,19 +1350,73 @@ const innerNodesBottomUp = root => {
   return out
 }
 
-const nodeJobs = ({ nodes, maxChildChars, inputTokenBudget, resolved }) => nodes.map(node => {
-  const prompt = makePrompt({ node, maxChildChars, inputTokenBudget })
+const nodeJobs = ({ nodes, maxChildChars, inputTokenBudget, resolved, previousSummaryJobs }) => nodes.map(node => {
+  const metadata = nodeJobMetadata(node)
+  const exact = node.summaryMeta && node.summaryMeta.targetId
+    ? (previousSummaryJobs || []).find(job =>
+        job.targetId === node.summaryMeta.targetId && jobPromptMatchesNode(job, node))
+    : null
+  if (exact) {
+    const promptAction = exact.promptAction || (summaryLevelForNode(node) <= 1 ? 'leaf' : 'create')
+    const systemPrompt = summarySystemPromptForNode(node, promptAction)
+    const promptHash = exact.promptHash || hashString(systemPrompt)
+    return {
+      ...metadata,
+      handle: node.handle,
+      customId: exact.customId || safeCustomId(`${node.handle}:${exact.childHash || exact.targetId}`),
+      targetId: exact.targetId,
+      targetMaterialHash: exact.targetMaterialHash,
+      provider: resolved.providerName,
+      model: resolved.model,
+      inputChars: Number(exact.inputChars || 0),
+      inputTokenBudget,
+      inputTokenCount: Number(exact.inputTokenCount || 0),
+      childCount: node.children.length,
+      prompt: '',
+      childHash: exact.childHash || '',
+      promptHash,
+      systemPrompt,
+      promptCacheKey: `session-indexer-summary:${promptHash}`,
+      promptAction,
+      updateKind: exact.updateKind,
+      strategy: summaryStrategyForNode(node),
+      node
+    }
+  }
+  const maintenanceBase = maintenanceBaseForNode({ node, previousSummaryJobs })
+  const promptPlan = summaryPromptPlanForNode({ node, maintenanceBase })
+  const systemPrompt = summarySystemPromptForNode(node, promptPlan.action)
+  const promptHash = hashString(systemPrompt)
+  const promptChildren = promptPlan.action === 'leaf' ? undefined : promptPlan.children
+  const usedMaintenanceBase = promptPlan.action === 'update' ? maintenanceBase : null
+  const prompt = makePrompt({
+    node,
+    maxChildChars,
+    inputTokenBudget,
+    maintenanceBase: usedMaintenanceBase,
+    deltaChildren: promptChildren,
+    promptPlan
+  })
   const childHash = hashString(prompt)
   const strategy = summaryStrategyForNode(node)
+  const deltaChildRevisionHashes = promptPlan.action === 'update'
+    ? promptPlan.children.map(child => hashString(sourceFingerprint(child)))
+    : []
   const targetMaterial = summaryTargetMaterial({
     node,
     childHash,
     resolved,
     maxChildChars,
     inputTokenBudget,
-    strategy
+    strategy,
+    promptHash,
+    promptAction: promptPlan.action,
+    updateKind: promptPlan.updateKind,
+    maintenanceBaseTargetId: usedMaintenanceBase && usedMaintenanceBase.targetId,
+    deltaChildRevisionHashes
   })
   return {
+    ...metadata,
     handle: node.handle,
     customId: safeCustomId(`${node.handle}:${childHash}`),
     targetId: `summary-${hashString(stableStringify(targetMaterial)).slice(0, 32)}`,
@@ -991,6 +1429,17 @@ const nodeJobs = ({ nodes, maxChildChars, inputTokenBudget, resolved }) => nodes
     childCount: node.children.length,
     prompt,
     childHash,
+    promptHash,
+    systemPrompt,
+    promptCacheKey: `session-indexer-summary:${promptHash}`,
+    promptAction: promptPlan.action,
+    promptReason: promptPlan.reason,
+    updateKind: promptPlan.updateKind,
+    unchangedChildCount: promptPlan.unchangedChildCount,
+    previousChildCount: promptPlan.previousChildCount,
+    currentChildCount: promptPlan.currentChildCount,
+    maintenanceBaseTargetId: usedMaintenanceBase && usedMaintenanceBase.targetId,
+    deltaChildRevisionHashes,
     strategy,
     node
   }
@@ -1000,6 +1449,8 @@ const publicJob = job => {
   const {
     prompt,
     node,
+    systemPrompt,
+    promptCacheKey,
     ...out
   } = job
   return out
@@ -1032,13 +1483,17 @@ const applyParsedSummary = ({ node, parsed, mode, resolved, internalJob, batchId
     modelCache: resolved.modelCache,
     reasoningEffort: resolved.reasoningEffort,
     generatedAt: reused ? reusedFrom && (reusedFrom.completedAt || reusedFrom.generatedAt) : new Date().toISOString(),
-    promptHash: hashString(SUMMARY_SYSTEM_PROMPT),
+    promptHash: internalJob.promptHash,
+    promptAction: internalJob.promptAction,
+    updateKind: internalJob.updateKind,
     childHash: internalJob.childHash,
     customId: internalJob.customId,
     targetId: internalJob.targetId,
     targetMaterialHash: internalJob.targetMaterialHash,
     strategy: internalJob.strategy || SPAN_SUMMARY_STRATEGY,
-    summaryLevel: node.meta && node.meta.summaryLevel,
+    summaryLevel: internalJob.summaryLevel || summaryLevelForNode(node),
+    sourceGroupHash: internalJob.sourceGroupHash,
+    childRevisionHashes: internalJob.childRevisionHashes,
     inputTokenBudget: internalJob.inputTokenBudget,
     inputTokenCount: internalJob.inputTokenCount,
     status: 'completed',
@@ -1330,11 +1785,15 @@ const updateSubmittedJobNodes = ({ jobs, batch, mode, resolved }) => {
       model: resolved.model,
       modelSource: resolved.modelSource,
       reasoningEffort: resolved.reasoningEffort,
-      promptHash: hashString(SUMMARY_SYSTEM_PROMPT),
+      promptHash: job.promptHash,
+      promptAction: job.promptAction,
+      updateKind: job.updateKind,
       childHash: job.childHash,
       customId: job.customId,
       strategy: job.strategy || SPAN_SUMMARY_STRATEGY,
-      summaryLevel: job.node.meta && job.node.meta.summaryLevel,
+      summaryLevel: job.summaryLevel || summaryLevelForNode(job.node),
+      sourceGroupHash: job.sourceGroupHash,
+      childRevisionHashes: job.childRevisionHashes,
       inputTokenBudget: job.inputTokenBudget,
       inputTokenCount: job.inputTokenCount,
       status: batch.processing_status === 'ended' ? 'completed' : 'submitted',
@@ -1415,10 +1874,27 @@ const compactionLogForNodes = ({ tree, nodes, jobs }) => {
 
 const applyStoredSummaryJobs = (tree, jobs = []) => {
   let applied = 0
-  for (const job of jobs || []) {
+  const aliases = []
+  const jobLevel = job => {
+    if (job && job.strategy === ROOT_SUMMARY_STRATEGY) return Number.MAX_SAFE_INTEGER
+    const direct = Number(job && job.summaryLevel)
+    if (Number.isFinite(direct) && direct > 0) return direct
+    const match = String(job && job.handle || '').match(/\/summary\/level-(\d+)\//)
+    return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER
+  }
+  const ordered = [...(jobs || [])].sort((a, b) =>
+    jobLevel(a) - jobLevel(b) || completedAtMs(b) - completedAtMs(a))
+  for (const job of ordered) {
     if (!hasReusableSummary(job)) continue
-    const node = tree.byHandle.get(job.handle)
+    const lineageHandle = summaryLineageHandle(job.handle)
+    const node = tree.byHandle.get(job.handle) || tree.byHandle.get(lineageHandle)
     if (!node) continue
+    if (job.handle && job.handle !== node.handle) aliases.push([job.handle, node])
+    if (!jobPromptMatchesNode(job, node)) continue
+    if (node.summaryMeta && node.summaryMeta.status === 'completed') {
+      if (node.summaryMeta.targetId === job.targetId) applied += 1
+      continue
+    }
     const parsed = summaryRecordFromJob(job)
     if (parsed.summary) node.head = parsed.summary
     if (parsed.breadcrumb) node.breadcrumb = parsed.breadcrumb
@@ -1433,7 +1909,13 @@ const applyStoredSummaryJobs = (tree, jobs = []) => {
       targetMaterialHash: job.targetMaterialHash,
       childHash: job.childHash,
       customId: job.customId,
+      promptHash: job.promptHash || hashString(summarySystemPromptForNode(node, job.promptAction)),
+      promptAction: job.promptAction,
+      updateKind: job.updateKind,
       strategy: job.strategy || SPAN_SUMMARY_STRATEGY,
+      summaryLevel: job.summaryLevel || summaryLevelForNode(node),
+      sourceGroupHash: job.sourceGroupHash || sourceGroupHashForNode(node),
+      childRevisionHashes: job.childRevisionHashes || childRevisionHashesForNode(node),
       inputTokenBudget: job.inputTokenBudget,
       inputTokenCount: job.inputTokenCount,
       status: 'completed',
@@ -1443,6 +1925,7 @@ const applyStoredSummaryJobs = (tree, jobs = []) => {
     applied += 1
   }
   rebuildTreeIndex(tree)
+  for (const [alias, node] of aliases) tree.byHandle.set(alias, node)
   return applied
 }
 
@@ -1481,10 +1964,11 @@ const observeSummaryWithRateLimitBackoff = async ({
     }
     try {
       const response = await resolved.provider.chat([
-        { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
+        { role: 'system', content: internalJob.systemPrompt },
         { role: 'user', content: internalJob.prompt }
       ], {
         ...resolved.callOptions,
+        prompt_cache_key: internalJob.promptCacheKey,
         onRetry: emitRetryProgress
       })
       return observeSummary({
@@ -1514,7 +1998,13 @@ const observeSummaryWithRateLimitBackoff = async ({
 }
 
 const summarizeTreeBatch = async ({ tree, opts, mode, resolved, candidateNodes, nodes, maxChildChars, inputTokenBudget, compactedSpanCount }) => {
-  const candidateJobs = nodeJobs({ nodes: candidateNodes, maxChildChars, inputTokenBudget, resolved })
+  const candidateJobs = nodeJobs({
+    nodes: candidateNodes,
+    maxChildChars,
+    inputTokenBudget,
+    resolved,
+    previousSummaryJobs: opts.previousSummaryJobs
+  })
   const selectedHandles = new Set(nodes.map(node => node.handle))
   const { reusedJobs, pendingJobs } = opts.summaryBatchId
     ? { reusedJobs: [], pendingJobs: candidateJobs.filter(job => selectedHandles.has(job.handle)) }
@@ -1602,9 +2092,13 @@ const summarizeTreeBatch = async ({ tree, opts, mode, resolved, candidateNodes, 
         pollMs
       })
     } else {
+      const systemPrompts = [...new Set(modelJobs.map(job => job.systemPrompt))]
+      if (systemPrompts.length !== 1) {
+        throw new Error('summary batch cannot mix leaf, parent-creation, and parent-update prompt families')
+      }
       batch = await resolved.provider.createBatch({
         jobs: modelJobs,
-        systemPrompt: SUMMARY_SYSTEM_PROMPT,
+        systemPrompt: systemPrompts[0],
         maxTokens: resolved.callOptions.maxTokens,
         cacheSystemPrompt: opts.summaryPromptCache !== false
       })
@@ -1677,6 +2171,49 @@ const summarizeTreeBatch = async ({ tree, opts, mode, resolved, candidateNodes, 
   }
 }
 
+const summaryJobRank = job => {
+  if (!job) return 0
+  if (job.resultType === 'succeeded') return 5
+  if (job.status === 'completed' && !job.reused) return 4
+  if (job.resultType === 'reused' || job.reused) return 3
+  if (job.status === 'submitted' || job.status === 'processing') return 2
+  if (job.status === 'pending') return 1
+  return 0
+}
+
+const mergeSummaryJobs = (...groups) => {
+  const merged = new Map()
+  let anonymous = 0
+  for (const job of groups.flat()) {
+    if (!job) continue
+    const key = job.targetId || `${job.handle || 'job'}:${job.childHash || anonymous++}`
+    const current = merged.get(key)
+    if (!current || summaryJobRank(job) > summaryJobRank(current)) merged.set(key, job)
+  }
+  return [...merged.values()]
+}
+
+const combineSummaryPasses = (first, next) => {
+  const jobs = mergeSummaryJobs(first.jobs || [], next.jobs || [])
+  const accounting = jobAccounting(jobs)
+  return {
+    summary: {
+      ...first.summary,
+      ...next.summary,
+      generatedNodeCount: Number(first.summary && first.summary.generatedNodeCount || 0) +
+        Number(next.summary && next.summary.generatedNodeCount || 0),
+      compactedSpanCount: next.summary && next.summary.compactedSpanCount === undefined
+        ? first.summary && first.summary.compactedSpanCount
+        : next.summary && next.summary.compactedSpanCount,
+      compactedInputTokenCount: next.summary && next.summary.compactedInputTokenCount === undefined
+        ? first.summary && first.summary.compactedInputTokenCount
+        : next.summary && next.summary.compactedInputTokenCount,
+      ...accounting
+    },
+    jobs
+  }
+}
+
 const summarizeTree = async (tree, opts = {}) => {
   const mode = opts.summaryMode || DEFAULT_SUMMARY_MODE
   if (mode === 'off' || mode === 'none') {
@@ -1687,7 +2224,7 @@ const summarizeTree = async (tree, opts = {}) => {
 
   const resolved = summaryProvider({
     ...opts,
-    promptCacheKey: `session-indexer-summary:${hashString(SUMMARY_SYSTEM_PROMPT)}`,
+    promptCacheKey: `session-indexer-summary:${SUMMARY_PROMPT_SET_HASH}`,
     summarySessionId: opts.summarySessionId || `session-indexer-summary-${tree.ir.session.id}`
   })
   const maxNodes = opts.maxSummaryNodes
@@ -1731,7 +2268,7 @@ const summarizeTree = async (tree, opts = {}) => {
 
   if (resolved.batch) {
     const selectedNodes = candidateNodes.slice(0, Math.max(0, limit))
-    return summarizeTreeBatch({
+    const batchResult = await summarizeTreeBatch({
       tree,
       opts,
       mode,
@@ -1742,9 +2279,32 @@ const summarizeTree = async (tree, opts = {}) => {
       inputTokenBudget,
       compactedSpanCount: prepared.compactedSpanCount
     })
+    const maintenanceDepth = Number(opts._summaryMaintenanceDepth || 0)
+    if (
+      batchResult.summary.status === 'completed' &&
+      Number(batchResult.summary.generatedNodeCount || 0) > 0 &&
+      !rootSummaryIsUsable(tree.root) &&
+      maintenanceDepth < 64
+    ) {
+      const next = await summarizeTree(tree, {
+        ...opts,
+        previousSummaryJobs: mergeSummaryJobs(opts.previousSummaryJobs || [], batchResult.jobs || []),
+        maxSummaryNodes: Math.max(0, limit - Number(batchResult.summary.generatedNodeCount || 0)),
+        summaryBatchId: undefined,
+        _summaryMaintenanceDepth: maintenanceDepth + 1
+      })
+      return combineSummaryPasses(batchResult, next)
+    }
+    return batchResult
   }
 
-  const candidateJobs = nodeJobs({ nodes: candidateNodes, maxChildChars, inputTokenBudget, resolved })
+  const candidateJobs = nodeJobs({
+    nodes: candidateNodes,
+    maxChildChars,
+    inputTokenBudget,
+    resolved,
+    previousSummaryJobs: opts.previousSummaryJobs
+  })
   emitProgress(opts, {
     phase: 'summary:prepared',
     execution: 'chat-work-queue',
@@ -1915,7 +2475,7 @@ const summarizeTree = async (tree, opts = {}) => {
     jobs
   })
   const budgetSuspended = ['over_budget', 'budget_limited'].includes(summaryBudget && summaryBudget.status)
-  return {
+  const currentResult = {
     summary: {
       mode,
       provider: resolved.providerName,
@@ -1939,6 +2499,24 @@ const summarizeTree = async (tree, opts = {}) => {
     },
     jobs
   }
+  const maintenanceDepth = Number(opts._summaryMaintenanceDepth || 0)
+  const generatedCleanly = generatedJobs.length > 0 && generatedJobs.every(job =>
+    job.status === 'completed' && !job.error)
+  if (
+    generatedCleanly &&
+    !budgetSuspended &&
+    !rootSummaryIsUsable(tree.root) &&
+    maintenanceDepth < 64
+  ) {
+    const next = await summarizeTree(tree, {
+      ...opts,
+      previousSummaryJobs: mergeSummaryJobs(opts.previousSummaryJobs || [], jobs),
+      maxSummaryNodes: Math.max(0, limit - reservation.claimedJobs.length),
+      _summaryMaintenanceDepth: maintenanceDepth + 1
+    })
+    return combineSummaryPasses(currentResult, next)
+  }
+  return currentResult
 }
 
 module.exports = {
@@ -1952,10 +2530,16 @@ module.exports = {
   DEFAULT_SUMMARY_MODE,
   DEFAULT_SUMMARY_PROVIDER,
   DEFAULT_SUMMARY_REASONING_EFFORT,
+  jobAccounting,
   loadCodexModels,
   makePrompt,
+  PARENT_SUMMARY_SYSTEM_PROMPT,
+  PARENT_UPDATE_SYSTEM_PROMPT,
   prepareCompactedSummaryLayer,
   SUMMARY_SYSTEM_PROMPT,
+  childRevisionHashesForNode,
+  summaryPromptPlanForNode,
+  summarySystemPromptForNode,
   summarizeTree,
   summaryProvider
 }

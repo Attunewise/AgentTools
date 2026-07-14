@@ -15,6 +15,8 @@ Higher zoom levels are compact navigation. The lowest zoom level is lossless. Tr
 
 Keep recovery incremental: search or browse first, open the smallest relevant link, and increase `budget_tokens` on the same link when `omittedTokenCount` is nonzero. Do not fill gaps from memory when the transcript can be recovered.
 
+Search, browse, openLink, and index status are read-only. If retrieval returns `current_session_not_indexed`, call `start_indexing_session` explicitly; retrieval must not start an indexer as a side effect.
+
 If the tools are not visible, call `tool_search` for `conversation_history conversation_search conversation_browse conversation_openLink conversation_index_status conversation_history_poll`.
 
 ## Functions

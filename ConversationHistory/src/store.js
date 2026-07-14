@@ -11,6 +11,7 @@ const {
   preview,
   readJson,
   readJsonlRows,
+  withAsyncFileLock,
   withFileLock,
   writeJson,
   writeJsonlRows
@@ -22,11 +23,12 @@ const {
   collectIndexDocuments,
   indexIdForIR,
   openLink,
-  modelTextForNode,
+  navigationTextForNode,
   nodeSourceFields,
   parseSessionLink
 } = require('./mip.js')
 const { adapterFor } = require('./adapters/index.js')
+const { parseTopicId } = require('./topics.js')
 const {
   docStorePath,
   writeSessionDocs
@@ -34,13 +36,13 @@ const {
 const {
   DEFAULT_SUMMARY_MODE,
   applyStoredSummaryJobs,
+  jobAccounting,
   prepareCompactedSummaryLayer,
   summarizeTree
 } = require('./summarizer.js')
 const {
   browseTypesense,
   deleteSessionDocuments,
-  exactDocument,
   importDocuments,
   openLinkTypesense,
   resolveTypesenseConfig,
@@ -58,6 +60,8 @@ const DEFAULT_SEARCH_BACKEND = 'typesense'
 
 const manifestPath = root => path.join(root, 'manifest.json')
 const manifestLockPath = root => path.join(root, 'manifest.lock')
+const sessionIndexLockPath = (root, sessionId) => path.join(root, 'sessions', `${sessionId}.index.lock`)
+const sessionGenerationPath = (root, sessionId) => path.join(root, 'sessions', `${sessionId}.generation.json`)
 const irPath = (root, sessionId) => path.join(root, 'sessions', `${sessionId}.ir.jsonl`)
 const legacyIrPath = (root, sessionId) => path.join(root, 'sessions', `${sessionId}.ir.json`)
 const treePath = (root, sessionId) => path.join(root, 'sessions', `${sessionId}.tree.json`)
@@ -72,6 +76,26 @@ const emptyManifest = () => ({
   updatedAt: null,
   sessions: {}
 })
+
+const readSessionGeneration = ({ root, sessionId }) => {
+  try {
+    return Math.max(0, Number(readJson(sessionGenerationPath(root, sessionId)).generation || 0))
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') throw err
+    return 0
+  }
+}
+
+const bumpSessionGeneration = ({ root, sessionId }) => {
+  const generation = readSessionGeneration({ root, sessionId }) + 1
+  writeJson(sessionGenerationPath(root, sessionId), {
+    schema: 'conversation-history.session-generation.v1',
+    sessionId,
+    generation,
+    updatedAt: new Date().toISOString()
+  })
+  return generation
+}
 
 const readManifest = root => {
   try {
@@ -277,12 +301,27 @@ const commitSummaryJobs = ({ root = DEFAULT_INDEX_DIR, sessionId, ownerId, jobs 
   })
 }
 
-const currentTargetIdsForSession = session => new Set(
-  (session && (session.compactions || session.summaryIndex && session.summaryIndex.compactionLog) || [])
+const targetIdsFromCompactions = compactions => new Set(
+  (compactions || [])
     .flatMap(compaction => compaction.targets || [])
     .map(target => target.targetId)
     .filter(Boolean)
 )
+
+const currentTargetIdsForSession = session => {
+  if (!session) return null
+  // Field presence establishes a published scope; an empty set means every stored target is orphaned.
+  if (Array.isArray(session.summaryTargetIds)) {
+    return new Set(session.summaryTargetIds.filter(Boolean))
+  }
+  if (Array.isArray(session.compactions)) {
+    return targetIdsFromCompactions(session.compactions)
+  }
+  if (session.summaryIndex && Array.isArray(session.summaryIndex.compactionLog)) {
+    return targetIdsFromCompactions(session.summaryIndex.compactionLog)
+  }
+  return null
+}
 
 const countTargets = (targets, nowMs) => {
   const activeClaims = targets.filter(target => isClaimActive(target, nowMs))
@@ -300,7 +339,7 @@ const targetStoreSummary = ({ root = DEFAULT_INDEX_DIR, sessionId, currentTarget
   const targets = Object.values(store.targets || {})
   const nowMs = now.getTime()
   const totals = countTargets(targets, nowMs)
-  const currentSet = currentTargetIds && currentTargetIds.size ? currentTargetIds : null
+  const currentSet = currentTargetIds instanceof Set ? currentTargetIds : null
   const currentTargets = currentSet ? targets.filter(target => currentSet.has(target.targetId)) : targets
   const currentTotals = countTargets(currentTargets, nowMs)
   return {
@@ -308,6 +347,7 @@ const targetStoreSummary = ({ root = DEFAULT_INDEX_DIR, sessionId, currentTarget
     updatedAt: store.updatedAt || null,
     updatedAgo: store.updatedAt ? formatAgo(store.updatedAt, now) : null,
     ...totals,
+    currentTargetScope: Boolean(currentSet),
     currentTargetCount: currentSet ? currentSet.size : currentTotals.targetCount,
     currentStoredTargetCount: currentTotals.targetCount,
     currentStoredCompletedTargetCount: currentTotals.completedTargetCount,
@@ -346,6 +386,44 @@ const indexingStats = session => {
   }
 }
 
+const refreshedCompactionAccounting = ({ compactions, jobs }) => {
+  const byTarget = new Map((jobs || [])
+    .filter(job => job && job.targetId)
+    .map(job => [job.targetId, job]))
+  return (compactions || []).map(compaction => {
+    const targets = (compaction.targets || []).map(target => {
+      const job = byTarget.get(target && target.targetId)
+      if (!job) return target
+      const status = job.error
+        ? 'error'
+        : job.status === 'completed' || job.resultType === 'succeeded' || job.resultType === 'reused'
+          ? 'completed'
+          : job.status || target.status
+      return { ...target, status }
+    })
+    const completedTargetCount = targets.filter(target => target.status === 'completed').length
+    const failedTargetCount = targets.filter(target => target.status === 'error').length
+    const pendingTargetCount = Math.max(0, targets.length - completedTargetCount - failedTargetCount)
+    return {
+      ...compaction,
+      targets,
+      targetCount: targets.length,
+      completedTargetCount,
+      pendingTargetCount,
+      failedTargetCount,
+      status: !targets.length
+        ? 'empty'
+        : failedTargetCount
+          ? 'error'
+          : completedTargetCount === targets.length
+            ? 'indexed'
+            : completedTargetCount
+              ? 'partial'
+              : 'pending'
+    }
+  })
+}
+
 const publicIndexingStats = session => {
   const stats = { ...(session.indexingStats || indexingStats(session)) }
   delete stats.summaryUsageBasis
@@ -382,6 +460,48 @@ const sessionIndexReadiness = ({ root, sessionRecord }) => {
     completedTargetCount: Number(stats.completedTargetCount || 0),
     claimedTargetCount: Number(summaryTargetStore.currentStoredClaimedTargetCount || 0),
     failedTargetCount: Number(stats.failedTargetCount || 0) + Number(summaryTargetStore.currentStoredFailedTargetCount || 0)
+  }
+}
+
+const currentDerivationReadiness = ({ root, sessionRecord }) => {
+  const sourceUpdatedAt = sourceTimestamp(sessionRecord.sourcePath)
+  const hasSource = Boolean(sourceUpdatedAt)
+  const stats = publicIndexingStats(sessionRecord)
+  const currentTargetIds = currentTargetIdsForSession(sessionRecord)
+  const summaryTargetStore = currentTargetIds
+    ? targetStoreSummary({
+        root,
+        sessionId: sessionRecord.sessionId,
+        currentTargetIds
+      })
+    : null
+  const storedPendingTargetCount = summaryTargetStore
+    ? Math.max(0,
+        Number(summaryTargetStore.currentTargetCount || 0) -
+        Number(summaryTargetStore.currentStoredCompletedTargetCount || 0) -
+        Number(summaryTargetStore.currentStoredFailedTargetCount || 0))
+    : 0
+  const pendingTargetCount = summaryTargetStore
+    ? storedPendingTargetCount
+    : Number(stats.pendingTargetCount || 0)
+  const claimedTargetCount = Number(summaryTargetStore && summaryTargetStore.currentStoredClaimedTargetCount || 0)
+  const failedTargetCount = summaryTargetStore
+    ? Number(summaryTargetStore.currentStoredFailedTargetCount || 0) +
+      Number(summaryTargetStore.currentStoredStaleClaimCount || 0)
+    : Number(stats.failedTargetCount || 0)
+  const active = pendingTargetCount > 0 || claimedTargetCount > 0
+  const failed = failedTargetCount > 0
+  return {
+    ready: hasSource && !failed && !active,
+    hasSource,
+    failed,
+    active,
+    pendingTargetCount,
+    completedTargetCount: summaryTargetStore
+      ? Number(summaryTargetStore.currentStoredCompletedTargetCount || 0)
+      : Number(stats.completedTargetCount || 0),
+    claimedTargetCount,
+    failedTargetCount
   }
 }
 
@@ -431,21 +551,29 @@ const activeSummaryWork = ({ stats, summaryTargetStore }) => {
   const currentPendingFromStore = Math.max(0, Number(summaryTargetStore.currentTargetCount || 0) -
     Number(summaryTargetStore.currentStoredCompletedTargetCount || 0) -
     Number(summaryTargetStore.currentStoredFailedTargetCount || 0))
+  const claimedTargetCount = summaryTargetStore.currentTargetScope
+    ? Number(summaryTargetStore.currentStoredClaimedTargetCount || 0)
+    : Number(summaryTargetStore.claimedTargetCount || 0)
   return Boolean(
     Number(stats.pendingTargetCount || 0) > 0 ||
     currentPendingFromStore > 0 ||
-    Number(summaryTargetStore.claimedTargetCount || 0) > 0 ||
-    Number(summaryTargetStore.currentStoredClaimedTargetCount || 0) > 0
+    claimedTargetCount > 0
   )
 }
 
-const failedSummaryWork = ({ stats, summaryTargetStore }) => Boolean(
-  Number(stats.failedTargetCount || 0) > 0 ||
-  Number(summaryTargetStore.failedTargetCount || 0) > 0 ||
-  Number(summaryTargetStore.currentStoredFailedTargetCount || 0) > 0 ||
-  Number(summaryTargetStore.staleClaimCount || 0) > 0 ||
-  Number(summaryTargetStore.currentStoredStaleClaimCount || 0) > 0
-)
+const failedSummaryWork = ({ stats, summaryTargetStore }) => {
+  const failedTargetCount = summaryTargetStore.currentTargetScope
+    ? Number(summaryTargetStore.currentStoredFailedTargetCount || 0)
+    : Number(summaryTargetStore.failedTargetCount || 0)
+  const staleClaimCount = summaryTargetStore.currentTargetScope
+    ? Number(summaryTargetStore.currentStoredStaleClaimCount || 0)
+    : Number(summaryTargetStore.staleClaimCount || 0)
+  return Boolean(
+    Number(stats.failedTargetCount || 0) > 0 ||
+    failedTargetCount > 0 ||
+    staleClaimCount > 0
+  )
+}
 
 const jobHasActiveSummaryWork = job => {
   const progress = job && job.progress || {}
@@ -526,9 +654,15 @@ const inferredSourcePathForSession = ({ sessionId, jobs }) => {
 }
 
 const statsFromTargetStore = summaryTargetStore => {
-  const targetCount = Number(summaryTargetStore.currentTargetCount || summaryTargetStore.targetCount || 0)
-  const completedTargetCount = Number(summaryTargetStore.currentStoredCompletedTargetCount || summaryTargetStore.completedTargetCount || 0)
-  const failedTargetCount = Number(summaryTargetStore.currentStoredFailedTargetCount || summaryTargetStore.failedTargetCount || 0)
+  const targetCount = Number(summaryTargetStore.currentTargetScope
+    ? summaryTargetStore.currentTargetCount
+    : summaryTargetStore.targetCount || 0)
+  const completedTargetCount = Number(summaryTargetStore.currentTargetScope
+    ? summaryTargetStore.currentStoredCompletedTargetCount
+    : summaryTargetStore.completedTargetCount || 0)
+  const failedTargetCount = Number(summaryTargetStore.currentTargetScope
+    ? summaryTargetStore.currentStoredFailedTargetCount
+    : summaryTargetStore.failedTargetCount || 0)
   return {
     compactionCount: 0,
     indexedCompactionCount: 0,
@@ -905,8 +1039,10 @@ const summaryIndexForManifest = summaryIndex => {
 }
 
 const sessionRecordForManifest = sessionRecord => {
+  const currentTargetIds = currentTargetIdsForSession(sessionRecord) || new Set()
   const out = {
     ...sessionRecord,
+    summaryTargetIds: [...currentTargetIds].sort(),
     summaryIndex: summaryIndexForManifest(sessionRecord.summaryIndex)
   }
   delete out.summaryJobs
@@ -1001,12 +1137,18 @@ const resetSessionIndex = ({
   const removedFiles = []
   let removedJobArtifacts = []
   let removedSession = null
+  let sourcePath = null
+  const cleanupErrors = []
   const remove = file => {
-    if (unlinkIfExists(file)) removedFiles.push(file)
+    try {
+      if (unlinkIfExists(file)) removedFiles.push(file)
+    } catch (err) {
+      cleanupErrors.push({ file, error: err.message })
+    }
   }
   withFileLock(manifestLockPath(root), () => {
+    bumpSessionGeneration({ root, sessionId })
     const manifest = readManifest(root)
-    let sourcePath = null
     if (manifest.sessions && manifest.sessions[sessionId]) {
       const record = manifest.sessions[sessionId]
       sourcePath = record.sourcePath || null
@@ -1021,22 +1163,28 @@ const resetSessionIndex = ({
       }
       delete manifest.sessions[sessionId]
     }
-    removedJobArtifacts = removeJobArtifactsForSession({ root, sessionId, sourcePath })
-    remove(irPath(root, sessionId))
-    remove(legacyIrPath(root, sessionId))
-    remove(treePath(root, sessionId))
-    remove(docStorePath(root, sessionId))
-    remove(summaryTargetsPath(root, sessionId))
-    remove(legacySummaryTargetsPath(root, sessionId))
-    remove(summaryTargetsLockPath(root, sessionId))
     manifest.updatedAt = new Date().toISOString()
     writeManifest(root, manifest)
+    withFileLock(summaryTargetsLockPath(root, sessionId), () => {
+      remove(summaryTargetsPath(root, sessionId))
+      remove(legacySummaryTargetsPath(root, sessionId))
+    })
   })
+  try {
+    removedJobArtifacts = removeJobArtifactsForSession({ root, sessionId, sourcePath })
+  } catch (err) {
+    cleanupErrors.push({ artifact: 'job_state', error: err.message })
+  }
+  remove(irPath(root, sessionId))
+  remove(legacyIrPath(root, sessionId))
+  remove(treePath(root, sessionId))
+  remove(docStorePath(root, sessionId))
   return {
     sessionId,
     removedFromManifest: Boolean(removedSession),
     ...(removedSession ? { removedSession } : {}),
     ...(removedJobArtifacts.length ? { removedJobArtifacts } : {}),
+    ...(cleanupErrors.length ? { cleanupErrors } : {}),
     removedFiles
   }
 }
@@ -1049,28 +1197,39 @@ const resetSessionIndexWithBackend = async ({
   ...backendOpts
 }) => {
   if (searchBackend !== 'typesense') throw new Error('--search-backend must be typesense')
-  const typeOpts = { root, indexDir: root, ...backendOpts }
-  const manifest = readManifest(root)
-  const manifestAgent = manifest.sessions && manifest.sessions[sessionId] && manifest.sessions[sessionId].agent
-  const result = await deleteSessionDocuments({
-    sessionId,
-    agent: agent || manifestAgent || undefined,
-    ...typeOpts
-  })
-  const local = resetSessionIndex({ root, sessionId })
-  const config = await resolveTypesenseConfig(typeOpts)
-  return {
-    ...local,
-    serverIndex: {
-      backend: searchBackend,
-      status: 'ready',
-      result,
-      config: {
-        ...config,
-        apiKey: backendOpts.typesenseApiKey ? 'set' : config.apiKey ? 'default' : 'unset'
+  return withAsyncFileLock(sessionIndexLockPath(root, sessionId), async () => {
+    const typeOpts = { root, indexDir: root, ...backendOpts }
+    const manifest = readManifest(root)
+    const manifestAgent = manifest.sessions && manifest.sessions[sessionId] && manifest.sessions[sessionId].agent
+    const local = resetSessionIndex({ root, sessionId })
+    let result
+    try {
+      result = await deleteSessionDocuments({
+        sessionId,
+        agent: agent || manifestAgent || undefined,
+        ...typeOpts
+      })
+    } catch (err) {
+      err.localReset = local
+      throw err
+    }
+    const config = await resolveTypesenseConfig(typeOpts)
+    return {
+      ...local,
+      serverIndex: {
+        backend: searchBackend,
+        status: 'ready',
+        result,
+        config: {
+          ...config,
+          apiKey: backendOpts.typesenseApiKey ? 'set' : config.apiKey ? 'default' : 'unset'
+        }
       }
     }
-  }
+  }, {
+    timeoutMs: Number(backendOpts.sessionIndexLockTimeoutMs || 5 * 60 * 1000),
+    staleMs: Number(backendOpts.sessionIndexLockStaleMs || 30 * 60 * 1000)
+  })
 }
 
 const writeSessionIndex = ({ root = DEFAULT_INDEX_DIR, ir }) => {
@@ -1093,6 +1252,7 @@ const writeSessionIndex = ({ root = DEFAULT_INDEX_DIR, ir }) => {
     turnCount: turnCountForIR(ir),
     docCount: docs.length,
     rootHandle: tree.root.handle,
+    summaryTargetIds: [],
     shortSummary: preview(tree.root.head || ir.session.title || ir.session.id, 180),
     fullTokenCount: tree.root.fullTokenCount,
     usage: tree.root.usage
@@ -1136,6 +1296,30 @@ const collectPublishedDocuments = ({ tree, sourceTree }) => {
   return [...docsById.values()]
 }
 
+const candidateIsOlderThanIndexed = ({ candidate, indexed }) => {
+  if (!candidate || !indexed) return false
+  const candidateSize = Number(candidate.sourceFingerprint && candidate.sourceFingerprint.sourceSize || 0)
+  const publishedSize = Number(indexed.sourceFingerprint && indexed.sourceFingerprint.sourceSize || 0)
+  const candidateTime = Date.parse(candidate.updatedAt)
+  const publishedTime = Date.parse(indexed.updatedAt)
+  if (candidate.sourcePath) {
+    try {
+      const stat = fs.statSync(candidate.sourcePath)
+      const sizeMatches = !candidateSize || stat.size === candidateSize
+      const timeMatches = Number.isFinite(candidateTime) && Math.abs(stat.mtimeMs - candidateTime) < 1
+      if (sizeMatches && timeMatches) return false
+      if (Number.isFinite(candidateTime) && stat.mtimeMs > candidateTime) return true
+      if (candidateSize && stat.size > candidateSize) return true
+    } catch (_err) {}
+  }
+  if (Number.isFinite(candidateTime) && Number.isFinite(publishedTime)) {
+    if (candidateTime < publishedTime) return true
+    if (candidateTime > publishedTime) return false
+  }
+  if (candidateSize && publishedSize && candidateSize < publishedSize) return true
+  return Number(candidate.eventCount || 0) < Number(published.eventCount || 0)
+}
+
 const writeSessionIndexWithBackend = async ({
   root = DEFAULT_INDEX_DIR,
   ir,
@@ -1166,9 +1350,25 @@ const writeSessionIndexWithBackend = async ({
   ...backendOpts
 }) => {
   if (searchBackend !== 'typesense') throw new Error('--search-backend must be typesense')
-  ir.indexId = indexIdForIR(ir)
+  const requestedIndexId = ir && (ir.indexId || ir.index_id || ir.session && (ir.session.indexId || ir.session.index_id))
+  const startingGeneration = readSessionGeneration({ root, sessionId: ir.session.id })
+  const existingSession = readManifest(root).sessions[ir.session.id]
+  ir.indexId = existingSession && existingSession.indexId || requestedIndexId || indexIdForIR(ir)
   const ownerId = summaryOwnerId()
   const previousSummaryJobs = completedSummaryJobs({ root, sessionId: ir.session.id })
+  const assertSessionGeneration = phase => {
+    if (readSessionGeneration({ root, sessionId: ir.session.id }) !== startingGeneration) {
+      throw new Error(`indexing cancelled because session ${ir.session.id} was reset ${phase}`)
+    }
+  }
+  const guardedReserveSummaryJobs = jobs => withFileLock(manifestLockPath(root), () => {
+    assertSessionGeneration('before summary reservation')
+    return reserveSummaryJobs({
+      root,
+      sessionId: ir.session.id,
+      ownerId
+    })(jobs)
+  })
   const sourceTree = buildMipTree(ir)
   const tree = summaryBatchId
     ? readSessionTree({ root, sessionId: ir.session.id, fallbackIR: ir })
@@ -1198,11 +1398,7 @@ const writeSessionIndexWithBackend = async ({
     summaryBudgetBaselineTargetIds: summaryBudgetBaselineTargetIds || previousSummaryJobs.map(job => job.targetId).filter(Boolean),
     previousSummaryJobs,
     onProgress,
-    reserveSummaryJobs: reserveSummaryJobs({
-      root,
-      sessionId: ir.session.id,
-      ownerId
-    })
+    reserveSummaryJobs: guardedReserveSummaryJobs
   })
   if (typeof onProgress === 'function') {
     onProgress({
@@ -1211,11 +1407,14 @@ const writeSessionIndexWithBackend = async ({
       jobCount: summaryIndex.jobs.length
     })
   }
-  commitSummaryJobs({
-    root,
-    sessionId: ir.session.id,
-    ownerId,
-    jobs: summaryIndex.jobs
+  withFileLock(manifestLockPath(root), () => {
+    assertSessionGeneration('before summary commit')
+    commitSummaryJobs({
+      root,
+      sessionId: ir.session.id,
+      ownerId,
+      jobs: summaryIndex.jobs
+    })
   })
   applyStoredSummaryJobs(tree, completedSummaryJobs({ root, sessionId: ir.session.id }))
   const now = new Date().toISOString()
@@ -1247,63 +1446,188 @@ const writeSessionIndexWithBackend = async ({
     serverIndex
   }
   sessionRecord.indexingStats = indexingStats(sessionRecord)
-  const docs = collectPublishedDocuments({ tree, sourceTree })
-  sessionRecord.docCount = docs.length
-  if (typeof onProgress === 'function') {
-    onProgress({
-      phase: 'index:documents',
-      sessionId: ir.session.id,
-      docCount: docs.length
-    })
-  }
-  writeSessionDocs({ root, sessionId: ir.session.id, docs })
-  const result = await importDocuments({
-    docs,
-    sessionId: ir.session.id,
-    agent: ir.session.agent,
-    onProgress,
-    ...typeOpts
-  })
-  serverIndex.status = 'ready'
-  serverIndex.result = result
-  const config = await resolveTypesenseConfig(typeOpts)
-  serverIndex.config = {
-    ...config,
-    apiKey: backendOpts.typesenseApiKey ? 'set' : config.apiKey ? 'default' : 'unset'
-  }
-  sessionRecord.indexedAt = now
-
-  withFileLock(manifestLockPath(root), () => {
+  let docs
+  let readiness
+  const refreshCandidateState = () => {
     const latestJobs = completedSummaryJobs({ root, sessionId: ir.session.id })
-    if (latestJobs.length) applyStoredSummaryJobs(tree, latestJobs)
-    sessionRecord.summaryJobs = summaryIndex.jobs
+    if (latestJobs.length) {
+      applyStoredSummaryJobs(tree, latestJobs)
+      const latestByTarget = new Map(latestJobs
+        .filter(job => job && job.targetId)
+        .map(job => [job.targetId, job]))
+      summaryIndex.jobs = (summaryIndex.jobs || []).map(job => latestByTarget.get(job.targetId) || job)
+      sessionRecord.summaryJobs = summaryIndex.jobs
+      sessionRecord.compactions = refreshedCompactionAccounting({
+        compactions: sessionRecord.compactions,
+        jobs: latestJobs
+      })
+      if (sessionRecord.summaryIndex) {
+        sessionRecord.summaryIndex = {
+          ...sessionRecord.summaryIndex,
+          ...jobAccounting(summaryIndex.jobs),
+          compactionLog: sessionRecord.compactions
+        }
+        summaryIndex.summary = sessionRecord.summaryIndex
+      }
+    }
+    docs = collectPublishedDocuments({ tree, sourceTree })
+    sessionRecord.docCount = docs.length
+    sessionRecord.shortSummary = preview(tree.root.head || ir.session.title || ir.session.id, 180)
+    sessionRecord.fullTokenCount = tree.root.fullTokenCount
+    sessionRecord.usage = tree.root.usage
     sessionRecord.indexingStats = indexingStats(sessionRecord)
-    const manifest = readManifest(root)
-    manifest.updatedAt = now
-    manifest.sessions[ir.session.id] = sessionRecordForManifest(sessionRecord)
-    writeSessionIR({ root, ir })
-    unlinkIfExists(treePath(root, ir.session.id))
-    writeManifest(root, manifest)
-  })
-  return {
-    sessionId: ir.session.id,
-    indexId: ir.indexId,
-    title: ir.session.title,
-    sourcePath: ir.source.path,
-    sourceFingerprint: ir.source.fingerprint,
-    eventCount: ir.events.length,
-    turnCount: turnCountForIR(ir),
-    docCount: sessionRecord.docCount,
-    rootHandle: tree.root.handle,
-    shortSummary: sessionRecord.shortSummary,
-    fullTokenCount: tree.root.fullTokenCount,
-    usage: tree.root.usage,
-    summaryIndex: summaryIndex.summary,
-    summaryJobs: summaryIndex.jobs,
-    compactions: sessionRecord.compactions,
-    indexingStats: sessionRecord.indexingStats,
-    serverIndex
+    readiness = summaryMode === 'model'
+      ? currentDerivationReadiness({ root, sessionRecord })
+      : {
+          ready: true,
+          hasSource: Boolean(sourceTimestamp(sessionRecord.sourcePath)),
+          failed: false,
+          active: false,
+          pendingTargetCount: 0,
+          completedTargetCount: Number(sessionRecord.indexingStats.completedTargetCount || 0),
+          claimedTargetCount: 0,
+          failedTargetCount: 0
+        }
+    if (summaryMode === 'model') {
+      if (readiness.ready && sessionRecord.summaryIndex) {
+        sessionRecord.summaryIndex.skippedJobCount = 0
+        summaryIndex.summary = sessionRecord.summaryIndex
+      }
+      const currentTargetIds = currentTargetIdsForSession(sessionRecord)
+      sessionRecord.indexingStats = {
+        ...indexingStats(sessionRecord),
+        targetCount: currentTargetIds ? currentTargetIds.size : Number(sessionRecord.indexingStats.targetCount || 0),
+        completedTargetCount: readiness.completedTargetCount,
+        pendingTargetCount: readiness.pendingTargetCount,
+        failedTargetCount: readiness.failedTargetCount,
+        ...(readiness.ready
+          ? {
+              indexedCompactionCount: Number(sessionRecord.indexingStats.compactionCount || 0),
+              pendingCompactionCount: 0,
+              skippedJobCount: 0
+            }
+          : {})
+      }
+    }
   }
+  refreshCandidateState()
+  return withAsyncFileLock(sessionIndexLockPath(root, ir.session.id), async () => {
+    assertSessionGeneration('while the hierarchy was being derived')
+    refreshCandidateState()
+    const indexedSession = readManifest(root).sessions[ir.session.id]
+    const hasIndexedHierarchy = Boolean(indexedSession && indexedSession.indexId)
+    const deferredReason = hasIndexedHierarchy && candidateIsOlderThanIndexed({
+      candidate: sessionRecord,
+      indexed: indexedSession
+    })
+      ? 'stale_source'
+      : hasIndexedHierarchy && summaryMode === 'model' && !readiness.ready
+        ? 'summary_not_ready'
+        : ''
+    if (deferredReason) {
+      const deferredServerIndex = {
+        backend: searchBackend,
+        status: 'deferred',
+        reason: deferredReason,
+        indexedIndexId: indexedSession.indexId,
+        result: {
+          imported: 0,
+          deferred: true
+        }
+      }
+      if (typeof onProgress === 'function') {
+        onProgress({
+          phase: 'index:documents:deferred',
+          reason: deferredReason,
+          sessionId: ir.session.id,
+          docCount: docs.length
+        })
+      }
+      return {
+        sessionId: ir.session.id,
+        indexId: indexedSession.indexId,
+        title: indexedSession.title || ir.session.title,
+        sourcePath: ir.source.path,
+        sourceFingerprint: ir.source.fingerprint,
+        eventCount: ir.events.length,
+        turnCount: turnCountForIR(ir),
+        docCount: indexedSession.docCount,
+        rootHandle: indexedSession.rootHandle || tree.root.handle,
+        shortSummary: indexedSession.shortSummary,
+        fullTokenCount: indexedSession.fullTokenCount,
+        usage: indexedSession.usage,
+        summaryIndex: summaryIndex.summary,
+        summaryJobs: summaryIndex.jobs,
+        compactions: sessionRecord.compactions,
+        indexingStats: sessionRecord.indexingStats,
+        hierarchyDeferred: true,
+        reusedExistingIndex: true,
+        readiness,
+        serverIndex: deferredServerIndex
+      }
+    }
+    if (typeof onProgress === 'function') {
+      onProgress({
+        phase: 'index:documents',
+        sessionId: ir.session.id,
+        docCount: docs.length
+      })
+    }
+    const result = await importDocuments({
+      docs,
+      sessionId: ir.session.id,
+      agent: ir.session.agent,
+      onProgress,
+      ...typeOpts
+    })
+    serverIndex.status = 'ready'
+    serverIndex.result = result
+    const config = await resolveTypesenseConfig(typeOpts)
+    serverIndex.config = {
+      ...config,
+      apiKey: backendOpts.typesenseApiKey ? 'set' : config.apiKey ? 'default' : 'unset'
+    }
+    sessionRecord.indexedAt = now
+    withFileLock(manifestLockPath(root), () => {
+      assertSessionGeneration('before writing the hierarchy')
+      sessionRecord.summaryJobs = summaryIndex.jobs
+      sessionRecord.indexingStats = indexingStats(sessionRecord)
+      const manifest = readManifest(root)
+      writeSessionDocs({ root, sessionId: ir.session.id, docs })
+      writeSessionIR({ root, ir })
+      manifest.updatedAt = now
+      manifest.sessions[ir.session.id] = sessionRecordForManifest(sessionRecord)
+      writeManifest(root, manifest)
+    })
+    try {
+      unlinkIfExists(treePath(root, ir.session.id))
+    } catch (err) {
+      serverIndex.compatibilityCleanup = { error: err.message }
+    }
+    return {
+      sessionId: ir.session.id,
+      indexId: ir.indexId,
+      title: ir.session.title,
+      sourcePath: ir.source.path,
+      sourceFingerprint: ir.source.fingerprint,
+      eventCount: ir.events.length,
+      turnCount: turnCountForIR(ir),
+      docCount: sessionRecord.docCount,
+      rootHandle: tree.root.handle,
+      shortSummary: sessionRecord.shortSummary,
+      fullTokenCount: tree.root.fullTokenCount,
+      usage: tree.root.usage,
+      summaryIndex: summaryIndex.summary,
+      summaryJobs: summaryIndex.jobs,
+      compactions: sessionRecord.compactions,
+      indexingStats: sessionRecord.indexingStats,
+      readiness,
+      serverIndex
+    }
+  }, {
+    timeoutMs: Number(backendOpts.sessionIndexLockTimeoutMs || 5 * 60 * 1000),
+    staleMs: Number(backendOpts.sessionIndexLockStaleMs || 30 * 60 * 1000)
+  })
 }
 
 const readSessionIR = ({ root = DEFAULT_INDEX_DIR, sessionId }) => {
@@ -1342,14 +1666,15 @@ const hydrateModelRef = ({ root = DEFAULT_INDEX_DIR, ref, treeCache }) => {
   delete out.session_id
   if (!sessionId || !handle) return out
   try {
+    if (out.text) return out
     let tree = treeCache && treeCache.get(sessionId)
     if (!tree) {
       tree = readSessionTree({ root, sessionId })
       if (treeCache) treeCache.set(sessionId, tree)
     }
     const node = tree && tree.byHandle && tree.byHandle.get(handle)
-    const text = modelTextForNode(node)
-    if (text) out.text = text
+    const text = navigationTextForNode(node)
+    if (!out.text && text) out.text = text
     const source = nodeSourceFields(node)
     if (!out.line && source.sourceLineNumber) out.line = source.sourceLineNumber
   } catch (err) {
@@ -1373,6 +1698,16 @@ const hydrateModelRefs = ({ root = DEFAULT_INDEX_DIR, value, treeCache = new Map
   return own
 }
 
+const sessionIdFromHandle = handle => {
+  const parts = String(handle || '').split('/')
+  if (parts[0] !== 'session' || !parts[1]) return ''
+  try {
+    return decodeURIComponent(parts[1])
+  } catch (_err) {
+    return parts[1]
+  }
+}
+
 const browseIndexWithBackend = async ({
   indexId,
   sessionId,
@@ -1388,9 +1723,13 @@ const browseIndexWithBackend = async ({
   ...backendOpts
 }) => {
   if (searchBackend !== 'typesense') throw new Error('--search-backend must be typesense')
+  const root = backendOpts.root || backendOpts.indexDir || DEFAULT_INDEX_DIR
+  const parsedTopic = topicId ? parseTopicId(topicId) : null
+  const topicHandle = parsedTopic && parsedTopic.handle
+  const resolvedSessionId = sessionId || sessionIdFromHandle(handle || topicHandle)
   const result = await browseTypesense({
     indexId,
-    sessionId,
+    sessionId: resolvedSessionId || sessionId,
     agent,
     handle,
     topicId,
@@ -1403,7 +1742,6 @@ const browseIndexWithBackend = async ({
     indexDir: backendOpts.indexDir,
     ...backendOpts
   })
-  const root = backendOpts.root || backendOpts.indexDir || DEFAULT_INDEX_DIR
   const config = await resolveTypesenseConfig(backendOpts)
   return {
     backend: {
@@ -1432,10 +1770,12 @@ const openLinkWithBackend = async ({
   const parsed = parseSessionLink(link)
   if (!parsed || !parsed.handle) throw new Error(`Unsupported conversation_history link: ${link}`)
   const root = backendOpts.root || backendOpts.indexDir || DEFAULT_INDEX_DIR
+  const resolvedIndexId = indexId || parsed.indexId
+  const resolvedSessionId = sessionId || parsed.sessionId || sessionIdFromHandle(parsed.handle)
   const result = await openLinkTypesense({
     link,
-    indexId: indexId || parsed.indexId,
-    sessionId: sessionId || parsed.sessionId,
+    indexId: resolvedIndexId,
+    sessionId: resolvedSessionId,
     agent,
     budgetTokens,
     root,
@@ -1471,6 +1811,7 @@ const searchIndexWithBackend = async ({
   ...backendOpts
 }) => {
   if (searchBackend !== 'typesense') throw new Error('--search-backend must be typesense')
+  const root = backendOpts.root || backendOpts.indexDir || DEFAULT_INDEX_DIR
   const search = () => searchTypesense({
     query,
     indexId,
@@ -1488,13 +1829,16 @@ const searchIndexWithBackend = async ({
   const hits = await search()
   return {
     hits: hydrateModelRefs({
-      root: backendOpts.root || backendOpts.indexDir || DEFAULT_INDEX_DIR,
+      root,
       value: hits
     })
   }
 }
 
 module.exports = {
+  __testing: {
+    sessionRecordForManifest
+  },
   DEFAULT_INDEX_DIR,
   DEFAULT_SEARCH_BACKEND,
   DEFAULT_SUMMARY_MODE,

@@ -6,10 +6,8 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const { z } = require('zod')
-const {
-  loadCodexSessionToolsClient
-} = require('./codexSessionTools.js')
-const { connectOrStartCodexSessionServer } = loadCodexSessionToolsClient()
+const { loadCodexSessionTools } = require('./codexSessionTools.js')
+const { resolveCodexSessionForMarker } = loadCodexSessionTools()
 const { createMcpLogger, installMcpProcessLogging } = require('./mcpLog.js')
 
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -29,7 +27,6 @@ const ASYNC_INDEX_POLL_RETRY_MS = 2_000
 const MCP_INDEX_DEBOUNCE_MS = 100
 
 const statusPollMemory = new Map()
-const codexSessionClients = new Map()
 
 const stringArg = value => typeof value === 'string' && value.length ? value : undefined
 
@@ -52,16 +49,6 @@ const defaultSource = () => process.env.SESSION_INDEXER_SOURCE ||
 const defaultSourceRoot = source => source === 'claude'
   ? path.join(os.homedir(), '.claude', 'projects')
   : path.join(os.homedir(), '.codex', 'sessions')
-
-const codexSessionServiceFor = async root => {
-  const resolved = path.resolve(root)
-  if (!codexSessionClients.has(resolved)) {
-    codexSessionClients.set(resolved, connectOrStartCodexSessionServer({
-      sessionRoot: resolved
-    }))
-  }
-  return codexSessionClients.get(resolved)
-}
 
 const shouldResolveThisChat = (args = {}) => (args.this_chat !== false && !args.session && !args.latest && !isAllScope(args)) || args.this_chat
 
@@ -93,12 +80,18 @@ const resolveCurrentMarkerSession = async (args = {}) => {
   }
   try {
     const root = args.source_root || defaultSourceRoot(source)
-    const service = args.codex_session_service || await codexSessionServiceFor(root)
-    const resolved = await service.resolveMarker({
+    const markerSinceMs = Number(args.session_marker_since_ms)
+    const resolveArgs = {
       marker: sessionMarker,
       maxBytes: SESSION_MARKER_SCAN_BYTES,
       limit: SESSION_MARKER_SCAN_LIMIT
-    })
+    }
+    if (Number.isFinite(markerSinceMs) && markerSinceMs > 0) {
+      resolveArgs.sessionMarkerSinceMs = markerSinceMs
+    }
+    const resolved = args.codex_session_service
+      ? await args.codex_session_service.resolveMarker(resolveArgs)
+      : resolveCodexSessionForMarker(root, sessionMarker, resolveArgs)
     if (resolved && resolved.ok === false) {
       return {
         ok: false,
@@ -177,8 +170,15 @@ const currentSessionNotIndexedBrowse = (scope, args = {}) => ({
 
 const defaultToCurrentSessionScope = async (args, lifecycle) => {
   bindLifecycleSessionMarker(args, lifecycle)
+  const sessionMarker = stringArg(args.session_marker) || lifecycle.currentSessionMarker()
+  const cached = lifecycle.resolvedSession(sessionMarker)
+  if (cached && cached.ok) {
+    args.session_id = cached.sessionId
+    return { scoped: true, current: cloneJson(cached) }
+  }
   const current = await resolveCurrentMarkerSession(args)
   if (!current.ok) return { scoped: true, current }
+  lifecycle.rememberResolvedSession(current.sessionMarker, current)
   args.session_id = current.sessionId
   return { scoped: true, current }
 }
@@ -265,12 +265,113 @@ const stripImplementationDetails = (value, scope = {}) => {
   return out
 }
 
+const compactNavigationRef = ref => {
+  if (!ref || typeof ref !== 'object') return ref
+  const out = {}
+  if (ref.handle) out.handle = ref.handle
+  if (ref.text) out.text = ref.text
+  if (ref.openable) out.openable = true
+  else if (Number(ref.child_count || 0) > 0) out.child_count = Number(ref.child_count)
+  return out
+}
+
+const navigationRefKey = ref => {
+  const text = String(ref && ref.text || '').replace(/\s+/g, ' ').trim()
+  const line = Number(ref && ref.line || 0)
+  if (text && line) return `${line}:${text}`
+  return `handle:${ref && ref.handle || ''}:${text}`
+}
+
+const canonicalNavigationRefs = refs => {
+  const byKey = new Map()
+  for (const ref of refs || []) {
+    if (!ref || typeof ref !== 'object') continue
+    const key = navigationRefKey(ref)
+    const previous = byKey.get(key)
+    if (!previous || String(ref.handle || '').length < String(previous.handle || '').length) {
+      byKey.set(key, ref)
+    }
+  }
+  return [...byKey.values()]
+}
+
+const compactRetrievalResult = clean => {
+  const schema = clean && clean.schema
+  if (schema === 'session-indexer.search.v1') {
+    return {
+      schema,
+      hits: canonicalNavigationRefs(clean.hits).map(compactNavigationRef)
+    }
+  }
+  if (schema === 'session-indexer.browse.v1') {
+    const children = canonicalNavigationRefs(clean.children)
+    const ownKey = navigationRefKey(clean)
+    const repeatedByChild = children.some(child => navigationRefKey(child) === ownKey)
+    const out = {
+      schema,
+      ...(clean.status ? { status: clean.status } : {}),
+      ...(clean.reason ? { reason: clean.reason } : {}),
+      ...(clean.message ? { message: clean.message } : {}),
+      ...(clean.handle ? { handle: clean.handle } : {}),
+      ...(!repeatedByChild && clean.text ? { text: clean.text } : {}),
+      ...(clean.openable ? { openable: true } : {}),
+      ...(Number(clean.child_count || 0) > 0 ? { child_count: Number(clean.child_count) } : {}),
+      children: children.map(compactNavigationRef)
+    }
+    if (clean.page && clean.page.next_start !== undefined) out.next_start = clean.page.next_start
+    return out
+  }
+  if (schema === 'session-indexer.openLink.v1') {
+    return {
+      schema,
+      ...(clean.handle ? { handle: clean.handle } : {}),
+      isVerbatim: Boolean(clean.isVerbatim),
+      omittedTokenCount: Number(clean.omittedTokenCount || 0),
+      content: clean.content || ''
+    }
+  }
+  return clean
+}
+
+const renderNavigationRef = ref => {
+  const action = ref.openable ? 'open' : Number(ref.child_count || 0) > 0 ? 'browse' : 'select'
+  const text = String(ref.text || '').trim()
+  const target = ref.handle ? `${action}: ${ref.handle}` : ''
+  return [text, target].filter(Boolean).join('\n  ')
+}
+
+const renderRetrievalResult = result => {
+  if (result.schema === 'session-indexer.search.v1') {
+    const hits = result.hits || []
+    return hits.length
+      ? hits.map(ref => `- ${renderNavigationRef(ref)}`).join('\n')
+      : 'No matching conversation records.'
+  }
+  if (result.schema === 'session-indexer.browse.v1') {
+    if (result.status && result.status !== 'resolved') {
+      return [result.status, result.reason, result.message].filter(Boolean).join(' ')
+    }
+    const lines = []
+    if (result.text) lines.push(result.text)
+    if (result.openable && result.handle) lines.push(`open: ${result.handle}`)
+    for (const child of result.children || []) lines.push(`- ${renderNavigationRef(child)}`)
+    if (result.next_start !== undefined) lines.push(`next: start=${result.next_start}`)
+    return lines.filter(Boolean).join('\n') || 'No conversation records at this level.'
+  }
+  if (result.schema === 'session-indexer.openLink.v1') {
+    const state = `source: ${result.handle || 'unknown'} verbatim=${result.isVerbatim ? 1 : 0} omitted=${result.omittedTokenCount}`
+    return [result.content, state].filter(Boolean).join('\n\n')
+  }
+  return null
+}
+
 const toolResult = (result, scope = {}) => {
-  const clean = stripImplementationDetails(result, scope)
+  const clean = compactRetrievalResult(stripImplementationDetails(result, scope))
+  const rendered = renderRetrievalResult(clean)
   return {
     content: [{
       type: 'text',
-      text: JSON.stringify(clean, null, 2)
+      text: rendered || JSON.stringify(clean, null, 2)
     }],
     structuredContent: {
       result: clean
@@ -286,6 +387,8 @@ Search finds candidate regions. Browse moves through the hierarchy by handle and
 Higher zoom levels are compact navigation. The lowest zoom level is lossless. Trust opened source when isVerbatim is true.
 
 Keep recovery incremental: search or browse first, open the smallest relevant link, and increase budget_tokens on the same link when omittedTokenCount is nonzero. Do not fill gaps from memory when the transcript can be recovered.
+
+Search, browse, openLink, and index status are read-only. If retrieval reports current_session_not_indexed, call start_indexing_session explicitly.
 `.trim()
 
 const preview = value => {
@@ -361,7 +464,7 @@ const asyncOperationId = () => `${ASYNC_OPERATION_PREFIX}${crypto.randomUUID()}`
 
 const pendingMessageFor = reason => {
   if (reason === 'current_session_pending') return 'conversation_history is binding this request to the current Codex session.'
-  if (reason === 'current_session_not_indexed') return 'conversation_history is indexing the current Codex session before answering this request.'
+  if (reason === 'current_session_not_indexed') return 'The current Codex session is not indexed; call start_indexing_session explicitly.'
   if (reason === 'current_session_indexing') return 'conversation_history is waiting for the current Codex session index to become ready.'
   return 'conversation_history is still preparing this request.'
 }
@@ -563,13 +666,14 @@ const createPluginLifecycle = () => {
   const indexRoots = new Set()
   const asyncOperations = new Map()
   const indexingStarts = new Map()
+  const resolvedSessions = new Map()
   let currentSessionMarker = ''
   let cleaned = false
   const rootArgs = root => root ? ['--index-dir', root] : []
   const pruneAsyncOperations = () => {
     const now = Date.now()
     for (const [id, operation] of asyncOperations) {
-      if (now - operation.updatedAtMs > ASYNC_OPERATION_TTL_MS) asyncOperations.delete(id)
+      if (now - operation.createdAtMs > ASYNC_OPERATION_TTL_MS) asyncOperations.delete(id)
     }
   }
   return {
@@ -624,6 +728,15 @@ const createPluginLifecycle = () => {
     indexingStart(marker) {
       return marker ? indexingStarts.get(marker) : null
     },
+    rememberResolvedSession(marker, current) {
+      if (marker && current && current.ok && current.path) {
+        resolvedSessions.set(marker, cloneJson(current))
+      }
+      return current
+    },
+    resolvedSession(marker) {
+      return marker ? resolvedSessions.get(marker) : null
+    },
     rememberIndexRoot(root) {
       indexRoots.add(root || '')
     },
@@ -632,7 +745,7 @@ const createPluginLifecycle = () => {
       cleaned = true
       asyncOperations.clear()
       indexingStarts.clear()
-      codexSessionClients.clear()
+      resolvedSessions.clear()
       for (const root of indexRoots) {
         const args = rootArgs(root)
         runCliSyncQuiet(['typesense_stop', '--timeout-ms', '5000', '--poll-ms', '100', ...args])
@@ -695,35 +808,25 @@ const addSourceArgs = (argv, args = {}) => {
   return sessionMarker
 }
 
+const currentSessionIndexArgv = args => {
+  const argv = ['start_indexing_session']
+  pushFlag(argv, '--scope', 'this_session_only')
+  pushBool(argv, '--wait-for-session-marker', !args.session)
+  pushFlag(argv, '--timeout-ms', 0)
+  pushFlag(argv, '--debounce-ms', MCP_INDEX_DEBOUNCE_MS)
+  if (!args.session) pushFlag(argv, '--session-marker-since-ms', args.session_marker_since_ms)
+  addSourceArgs(argv, args)
+  return argv
+}
+
 const currentResolutionIsRetryable = current => {
   const reason = current && current.reason
   return [
     'missing_current_session_marker',
     'current_session_marker_session_id_missing',
-    'current_session_marker_lookup_failed'
+    'current_session_marker_lookup_failed',
+    'current_session_marker_ambiguous'
   ].includes(reason)
-}
-
-const ensureCurrentSessionIndexing = async ({ lifecycle, marker, force = false }) => {
-  if (!marker) return null
-  const existing = lifecycle.indexingStart(marker)
-  if (existing && !force) return existing
-  const args = {
-    source: defaultSource(),
-    session_marker: marker,
-    wait_for_session_marker: true
-  }
-  const argv = ['start_indexing_session']
-  pushFlag(argv, '--scope', 'this_session_only')
-  pushBool(argv, '--wait-for-session-marker', true)
-  pushFlag(argv, '--timeout-ms', 0)
-  pushFlag(argv, '--summary-mode', 'off')
-  pushFlag(argv, '--debounce-ms', MCP_INDEX_DEBOUNCE_MS)
-  addSourceArgs(argv, args)
-  const result = await callConversationHistory(argv)
-  result.sessionMarker = marker
-  result.generatedSessionMarker = true
-  return lifecycle.rememberIndexingStart(marker, result)
 }
 
 const statusForCurrentSession = async sessionId => withStatusPollHints(await callConversationHistory([
@@ -749,19 +852,16 @@ const readinessForOperation = async ({ name, scope }) => {
   if (!session) {
     return {
       ready: false,
+      terminal: true,
       reason: 'current_session_not_indexed',
-      message: 'The current Codex session does not have a ready conversation_history index yet.',
-      retryAfterMs: ASYNC_INDEX_POLL_RETRY_MS,
+      message: 'The current Codex session is not indexed. Call start_indexing_session explicitly before searching or browsing it.',
       status
     }
   }
   if (session.indexed !== false) {
-    const job = session.indexingJob || {}
-    const needsIndexingWorker = !session.indexingJob || ['stale', 'stopped', 'error', 'suspended'].includes(job.status)
     return {
       ready: true,
-      status,
-      ensureIndexing: needsIndexingWorker
+      status
     }
   }
   if (session.state === 'error' || session.state === 'suspended' || session.state === 'suspended-budget') {
@@ -770,6 +870,16 @@ const readinessForOperation = async ({ name, scope }) => {
       terminal: true,
       reason: session.state === 'error' ? 'current_session_index_error' : 'current_session_index_suspended',
       message: session.errorMessage || session.statusMessage || 'The current Codex session index is blocked.',
+      status
+    }
+  }
+  const jobStatus = session.indexingJob && session.indexingJob.status
+  if (!session.indexingJob || ['not-started', 'stopped', 'stale'].includes(session.state) || ['stopped', 'stale'].includes(jobStatus)) {
+    return {
+      ready: false,
+      terminal: true,
+      reason: 'current_session_not_indexed',
+      message: 'The current Codex session is not indexed. Call start_indexing_session explicitly before searching or browsing it.',
       status
     }
   }
@@ -787,18 +897,25 @@ const operationWithMarker = ({ lifecycle, name, args, operation }) => {
   const sessionMarker = stringArg(args.session_marker) ||
     operation && operation.sessionMarker ||
     lifecycle.ensureCurrentSessionMarker()
+  const markerSinceMs = Number(args.session_marker_since_ms) ||
+    operation && operation.markerSinceMs ||
+    Date.now()
   lifecycle.ensureCurrentSessionMarker(sessionMarker)
   args.session_marker = sessionMarker
+  args.session_marker_since_ms = markerSinceMs
   if (operation) {
     operation.sessionMarker = sessionMarker
+    operation.markerSinceMs = markerSinceMs
     operation.args = cloneJson(args)
     return operation
   }
-  return lifecycle.createAsyncOperation({
+  const created = lifecycle.createAsyncOperation({
     name,
     args,
     sessionMarker
   })
+  created.markerSinceMs = markerSinceMs
+  return created
 }
 
 const pendingForOperation = async ({
@@ -813,20 +930,7 @@ const pendingForOperation = async ({
   status
 }) => {
   const pending = operationWithMarker({ lifecycle, name, args, operation })
-  let indexing = lifecycle.indexingStart(pending.sessionMarker)
-  if (!indexing) {
-    try {
-      indexing = await ensureCurrentSessionIndexing({
-        lifecycle,
-        marker: pending.sessionMarker
-      })
-    } catch (err) {
-      indexing = {
-        status: 'error',
-        error: compactErrorMessage(err)
-      }
-    }
-  }
+  const indexing = lifecycle.indexingStart(pending.sessionMarker)
   return toolResult(pendingOperationPayload({
     operation: pending,
     reason,
@@ -938,6 +1042,9 @@ const runConversationOperation = async ({ name, args, lifecycle, operation = nul
   const workingArgs = cloneJson(args)
   if (operation && operation.sessionMarker) workingArgs.session_marker = operation.sessionMarker
   const scope = await defaultToCurrentSessionScope(workingArgs, lifecycle)
+  if (scope.scoped && scope.current && scope.current.ok) {
+    lifecycle.rememberResolvedSession(scope.current.sessionMarker, scope.current)
+  }
   if (scope.scoped && !scope.current.ok) {
     if (currentResolutionIsRetryable(scope.current)) {
       return pendingForOperation({
@@ -986,14 +1093,6 @@ const runConversationOperation = async ({ name, args, lifecycle, operation = nul
       status: readiness.status
     })
   }
-  if (readiness.ensureIndexing) {
-    await ensureCurrentSessionIndexing({
-      lifecycle,
-      marker: workingArgs.session_marker || lifecycle.currentSessionMarker(),
-      force: true
-    })
-  }
-
   const result = await runConversationOperationNow({ name, args: workingArgs, scope })
   if (operation) lifecycle.deleteAsyncOperation(operation.id)
   return result
@@ -1002,7 +1101,7 @@ const runConversationOperation = async ({ name, args, lifecycle, operation = nul
 const registerTools = (server, lifecycle = createPluginLifecycle()) => {
   server.registerTool('conversation_search', {
     title: 'Search Indexed Conversation',
-    description: 'Search the current Codex session conversation_history index. If the session cannot be bound or no usable published index exists yet, returns a pending operation for conversation_history_poll.',
+    description: 'Search the existing current Codex session conversation_history index without starting indexing. If session binding is pending, returns an operation for conversation_history_poll; if no index exists, call start_indexing_session explicitly.',
     inputSchema: {
       query: z.string().optional().describe('Search query over original user/assistant messages and generated summaries.'),
       agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
@@ -1016,7 +1115,7 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
 
   server.registerTool('conversation_browse', {
     title: 'Browse Indexed Conversation',
-    description: 'Browse the current Codex session conversation_history hierarchy. If the session cannot be bound or no usable published index exists yet, returns a pending operation for conversation_history_poll. Use handles returned by previous browse/search calls to navigate.',
+    description: 'Browse the existing current Codex session conversation_history hierarchy without starting indexing. If session binding is pending, returns an operation for conversation_history_poll; if no index exists, call start_indexing_session explicitly. Use handles returned by previous browse/search calls to navigate.',
     inputSchema: {
       agent: z.string().optional().describe('Optional indexed coding-agent filter, e.g. codex or claude. This is not the speaker role.'),
       handle: z.string().optional().describe('Short handle returned by conversation_search or conversation_browse. Omit for the root.'),
@@ -1084,20 +1183,21 @@ const registerTools = (server, lifecycle = createPluginLifecycle()) => {
   }, async args => {
     lifecycle.rememberIndexRoot()
     args.source = defaultSource()
-    const marker = makeSessionMarker()
+    const marker = lifecycle.currentSessionMarker() || makeSessionMarker()
     lifecycle.setCurrentSessionMarker(marker)
     args.session_marker = marker
-    args.wait_for_session_marker = true
-    const argv = ['start_indexing_session']
-    pushFlag(argv, '--scope', 'this_session_only')
-    pushBool(argv, '--wait-for-session-marker', true)
-    pushFlag(argv, '--timeout-ms', 0)
-    pushFlag(argv, '--summary-mode', 'off')
-    pushFlag(argv, '--debounce-ms', MCP_INDEX_DEBOUNCE_MS)
-    addSourceArgs(argv, args)
+    const resolved = lifecycle.resolvedSession(marker)
+    if (resolved && resolved.path) {
+      args.session = resolved.path
+      args.wait_for_session_marker = false
+    } else {
+      args.session_marker_since_ms = Date.now()
+      args.wait_for_session_marker = true
+    }
+    const argv = currentSessionIndexArgv(args)
     const result = await callConversationHistory(argv)
     result.sessionMarker = marker
-    result.generatedSessionMarker = true
+    result.generatedSessionMarker = !resolved
     lifecycle.rememberIndexingStart(marker, result)
     return toolResult(result)
   })
@@ -1187,6 +1287,8 @@ module.exports = {
   createPluginLifecycle,
   startStdioServer,
   __testing: {
+    currentSessionIndexArgv,
+    defaultToCurrentSessionScope,
     makeSessionMarker,
     resolveCurrentMarkerSession
   }

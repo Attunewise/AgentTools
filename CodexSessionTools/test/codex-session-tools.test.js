@@ -15,6 +15,7 @@ const {
   fileContainsLiteral,
   fileLatestPatternMatch,
   latestCodexSessionFile,
+  primeMarkerLookupCache,
   reconcileThreadRecord,
   renderForTool,
   resolveCodexSessionForMarker,
@@ -421,6 +422,48 @@ test('marker resolver caches verified matches and unchanged misses', () => {
     })
     assert.equal(fork.file, missed)
     assert.equal(fork.reason, 'session_marker_match_fork_descendant')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('primed marker lookup finds only bytes appended after its baseline snapshot', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-session-tools-marker-baseline-'))
+  try {
+    const marker = 'conversation_history-session-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+    const oldTrap = path.join(root, 'old-trap.jsonl')
+    const target = path.join(root, 'target.jsonl')
+    writeJsonl(oldTrap, [
+      { type: 'session_meta', payload: { id: 'old-trap-thread', cwd: root } },
+      { type: 'response_item', payload: { type: 'function_call_output', output: marker } }
+    ])
+    writeJsonl(target, [
+      { type: 'session_meta', payload: { id: 'target-thread', cwd: root } },
+      { type: 'response_item', payload: { type: 'function_call_output', output: 'before handshake' } }
+    ])
+    const baseline = walkJsonlFiles(root)
+    const targetBaseline = baseline.find(item => item.file === target)
+
+    fs.appendFileSync(target, `${JSON.stringify({
+      type: 'response_item',
+      payload: { type: 'custom_tool_call_output', output: marker }
+    })}\n`)
+
+    const markerLookupCache = new Map()
+    primeMarkerLookupCache({
+      markerLookupCache,
+      root,
+      marker,
+      sessionFiles: baseline
+    })
+    const resolved = resolveCodexSessionForMarker(root, marker, {
+      markerLookupCache,
+      sessionMarkerScanLimit: 'all'
+    })
+
+    assert.equal(resolved.file, target)
+    assert.equal(resolved.codex_session_id, 'target-thread')
+    assert.ok(resolved.signals.sessionMarkerMatch.byteOffset >= targetBaseline.size)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

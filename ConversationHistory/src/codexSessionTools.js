@@ -17,12 +17,6 @@ const loadCodexSessionTools = () => requireWithVendorFallback(
   '../vendor/CodexSessionTools'
 )
 
-const loadCodexSessionToolsClient = () => requireWithVendorFallback(
-  'codex-session-tools/src/client.js',
-  '../vendor/CodexSessionTools/src/client.js'
-)
-
 module.exports = {
-  loadCodexSessionTools,
-  loadCodexSessionToolsClient
+  loadCodexSessionTools
 }
